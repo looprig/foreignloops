@@ -32,7 +32,7 @@ type agent struct {
 	wrap     CommandWrapper
 }
 
-func (a *agent) Spawn(ctx context.Context, turn driver.Turn) (driver.Stream, error) {
+func (a *agent) Spawn(_ context.Context, turn driver.Turn) (driver.Stream, error) {
 	if a.execPath == "" {
 		return nil, &SpawnConfigError{Field: "ExecPath", Reason: "empty"}
 	}
@@ -58,9 +58,6 @@ func (a *agent) Spawn(ctx context.Context, turn driver.Turn) (driver.Stream, err
 		cmd:            cmd,
 		decodeErr:      decodeErr,
 		pgid:           cmd.Process.Pid,
-	}
-	if ctx != nil {
-		s.stopContext = context.AfterFunc(ctx, func() { _ = s.Close() })
 	}
 	return s, nil
 }
@@ -104,7 +101,6 @@ type stream struct {
 	cmd            *exec.Cmd
 	decodeErr      func() error
 	pgid           int
-	stopContext    func() bool
 	once           sync.Once
 	closeErr       error
 }
@@ -120,9 +116,6 @@ func (s *stream) History() (driver.History, error) {
 
 func (s *stream) Close() error {
 	s.once.Do(func() {
-		if s.stopContext != nil {
-			s.stopContext()
-		}
 		s.closeErr = s.shutdown()
 	})
 	return s.closeErr
@@ -139,7 +132,7 @@ func (s *stream) shutdown() error {
 	if decodeErr != nil {
 		slog.Warn("claude: foreign stream decode error", "error", decodeErr)
 	}
-	return errors.Join(decodeErr, exitError(waitErr))
+	return exitError(waitErr)
 }
 
 func forwardEvents(source <-chan driver.Event) (<-chan driver.Event, func(), <-chan struct{}) {

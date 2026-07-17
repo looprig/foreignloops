@@ -97,7 +97,7 @@ func TestAgentSpawnResumeUsesResumeSelector(t *testing.T) {
 	}
 }
 
-func TestAgentSpawnContextCancelClosesEvents(t *testing.T) {
+func TestAgentSpawnContextCancelDoesNotCloseEvents(t *testing.T) {
 	t.Parallel()
 	fake := newFakeClaude(t)
 	agent := newFakeAgent(t, fake, Config{Model: "small"}, "FAKE_MODE=long_running")
@@ -106,12 +106,32 @@ func TestAgentSpawnContextCancelClosesEvents(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Spawn() error = %v", err)
 	}
+	defer func() { _ = stream.Close() }()
+	select {
+	case event, ok := <-stream.Events():
+		if !ok || event.Kind != driver.KindInit {
+			t.Fatalf("initial event = (%#v, %v), want open stream with KindInit", event, ok)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for initial event")
+	}
 	cancel()
-	assertEventsClosePromptly(t, stream)
+	select {
+	case event, ok := <-stream.Events():
+		if !ok {
+			t.Fatal("context cancellation closed the stream; Claude Spawn context must remain ignored")
+		}
+		if event.Kind != driver.KindTextDelta || event.Text != "still-running" {
+			t.Fatalf("event after cancellation = %#v, want still-running text delta", event)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for event proving cancellation left the child running")
+	}
 	err1 := stream.Close()
 	if err2 := stream.Close(); err2 != err1 {
-		t.Fatalf("second Close() error = %v, want same error %v", err2, err1)
+		t.Fatalf("second Close() error = %v, want same explicit cleanup error %v", err2, err1)
 	}
+	assertEventsAlreadyClosed(t, stream)
 }
 
 func TestAgentCloseClosesEventsWithoutCallerDrain(t *testing.T) {
@@ -130,7 +150,7 @@ func TestAgentCloseClosesEventsWithoutCallerDrain(t *testing.T) {
 	}
 }
 
-func TestAgentCloseReturnsDecodeError(t *testing.T) {
+func TestAgentCloseIgnoresDecodeError(t *testing.T) {
 	t.Parallel()
 	for _, mode := range []string{"malformed_json", "oversized_line"} {
 		t.Run(mode, func(t *testing.T) {
@@ -143,9 +163,12 @@ func TestAgentCloseReturnsDecodeError(t *testing.T) {
 			}
 			_ = collectEvents(t, stream)
 			err = stream.Close()
+			if err != nil {
+				t.Fatalf("Close() error = %T %v, want nil for clean process exit", err, err)
+			}
 			var decodeErr *driver.DecodeError
-			if !errors.As(err, &decodeErr) {
-				t.Fatalf("Close() error = %T %v, want *driver.DecodeError", err, err)
+			if errors.As(err, &decodeErr) {
+				t.Fatalf("Close() error retained *driver.DecodeError: %v", err)
 			}
 		})
 	}
@@ -167,7 +190,7 @@ func TestAgentCloseReturnsExitError(t *testing.T) {
 	}
 }
 
-func TestAgentCloseJoinsDecodeBeforeExitError(t *testing.T) {
+func TestAgentCloseReturnsOnlyExitErrorWhenDecodeAlsoFails(t *testing.T) {
 	t.Parallel()
 	fake := newFakeClaude(t)
 	agent := newFakeAgent(t, fake, Config{Model: "small"}, "FAKE_MODE=malformed_json", "EXIT_CODE=7")
@@ -179,11 +202,14 @@ func TestAgentCloseJoinsDecodeBeforeExitError(t *testing.T) {
 	err = stream.Close()
 	var decodeErr *driver.DecodeError
 	var exitErr *driver.ExitError
-	if !errors.As(err, &decodeErr) || !errors.As(err, &exitErr) || exitErr.Code != 7 {
-		t.Fatalf("Close() error = %T %v, want joined decode and exit errors", err, err)
+	if errors.As(err, &decodeErr) {
+		t.Fatalf("Close() error retained *driver.DecodeError: %v", err)
 	}
-	if got, want := err.Error(), decodeErr.Error()+"\n"+exitErr.Error(); got != want {
-		t.Fatalf("Close() error = %q, want decode-first ordering %q", got, want)
+	if !errors.As(err, &exitErr) || exitErr.Code != 7 {
+		t.Fatalf("Close() error = %T %v, want only *driver.ExitError code 7", err, err)
+	}
+	if got, want := err.Error(), "foreignloop: agent exited 7"; got != want {
+		t.Fatalf("Close() error = %q, want %q", got, want)
 	}
 }
 
@@ -271,6 +297,8 @@ case "${FAKE_MODE:-happy}" in
   long_running)
     trap 'exit 0' INT TERM
     printf '%s\n' '{"type":"system","subtype":"init","session_id":"fake-session"}'
+    sleep 0.2
+    printf '%s\n' '{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"still-running"}}}'
     sleep 60
     exit 0
     ;;
@@ -352,23 +380,6 @@ func collectEvents(t *testing.T, stream driver.Stream) []driver.Event {
 		case <-timer.C:
 			_ = stream.Close()
 			t.Fatal("timed out waiting for stream events")
-		}
-	}
-}
-
-func assertEventsClosePromptly(t *testing.T, stream driver.Stream) {
-	t.Helper()
-	timer := time.NewTimer(2 * time.Second)
-	defer timer.Stop()
-	for {
-		select {
-		case _, ok := <-stream.Events():
-			if !ok {
-				return
-			}
-		case <-timer.C:
-			_ = stream.Close()
-			t.Fatal("timed out waiting for events to close")
 		}
 	}
 }
