@@ -19,6 +19,12 @@ type transcriptProjectionGolden struct {
 	Snapshot         content.AgenticMessages   `json:"snapshot"`
 }
 
+type missingHistoryGolden struct {
+	Available bool                      `json:"available"`
+	Steps     []content.AgenticMessages `json:"steps"`
+	Cause     string                    `json:"cause"`
+}
+
 func userMessage(text string) *content.UserMessage {
 	return &content.UserMessage{Message: content.Message{
 		Role:   content.RoleUser,
@@ -145,8 +151,20 @@ func TestDecodeTranscriptMissingFileIsHistoryError(t *testing.T) {
 	if !errors.As(err, &historyErr) {
 		t.Fatalf("historyFromPath() error = %T %v, want *driver.HistoryError", err, err)
 	}
+	if !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("errors.Is(history error, os.ErrNotExist) = false: %v", err)
+	}
 	if _, ok := reflect.TypeOf(driver.HistoryError{}).FieldByName("Path"); ok {
 		t.Fatal("driver.HistoryError exposes a provider path field")
+	}
+
+	gotJSON := canonicalJSON(t, missingHistoryGolden{
+		Available: history.Available,
+		Steps:     history.Steps,
+		Cause:     "not_exist",
+	})
+	if wantJSON := readGolden(t, "missing"); !bytes.Equal(gotJSON, wantJSON) {
+		t.Fatalf("canonical missing-history projection differs\ngot:\n%s\nwant:\n%s", gotJSON, wantJSON)
 	}
 }
 
