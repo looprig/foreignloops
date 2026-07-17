@@ -8,6 +8,8 @@ tool (
 	honnef.co/go/tools/cmd/staticcheck
 )
 
+require github.com/looprig/core v0.2.0
+
 require (
 	cloud.google.com/go v0.123.0 // indirect
 	cloud.google.com/go/auth v0.19.0 // indirect
