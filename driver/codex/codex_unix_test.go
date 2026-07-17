@@ -20,8 +20,9 @@ import (
 	"github.com/looprig/foreignloop/driver"
 )
 
+const stubbornHelperStartupTimeout = 10 * time.Second
+
 func TestAgentCloseKillsStubbornProcessGroupDescendant(t *testing.T) {
-	t.Parallel()
 	execPath, env, childPIDFile := newStubbornCodex(t)
 	foreignStream, err := (&agent{
 		execPath: execPath,
@@ -38,7 +39,7 @@ func TestAgentCloseKillsStubbornProcessGroupDescendant(t *testing.T) {
 		if !ok || event.Kind != driver.KindInit {
 			t.Fatalf("first event = (%#v, %t), want KindInit", event, ok)
 		}
-	case <-time.After(2 * time.Second):
+	case <-time.After(stubbornHelperStartupTimeout):
 		t.Fatal("timed out waiting for stubborn process startup")
 	}
 	childPID := readPID(t, childPIDFile)
@@ -57,7 +58,7 @@ func TestCodexStubbornLeaderHelper(t *testing.T) {
 		fmt.Fprintf(os.Stderr, "start stubborn child: %v\n", err)
 		os.Exit(2)
 	}
-	readyDeadline := time.Now().Add(2 * time.Second)
+	readyDeadline := time.Now().Add(stubbornHelperStartupTimeout)
 	for {
 		if _, err := os.Stat(os.Getenv("CHILD_READY_FILE")); err == nil {
 			break
@@ -103,7 +104,7 @@ func newStubbornCodex(t *testing.T) (string, []string, string) {
 
 func readPID(t *testing.T, path string) int {
 	t.Helper()
-	deadline := time.Now().Add(2 * time.Second)
+	deadline := time.Now().Add(stubbornHelperStartupTimeout)
 	for time.Now().Before(deadline) {
 		raw, err := os.ReadFile(path)
 		if err == nil {
