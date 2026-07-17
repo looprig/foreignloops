@@ -37,7 +37,7 @@ func whitelistEnv(parent, allow []string, credential map[string]string) []string
 		out = append(out, key+"="+credential[key])
 	}
 	if len(out) == 0 {
-		return nil
+		return []string{}
 	}
 	return out
 }

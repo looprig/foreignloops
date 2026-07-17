@@ -45,7 +45,7 @@ func TestWhitelistEnv(t *testing.T) {
 			allow:  []string{"BROKEN", "TERM"},
 			want:   []string{"TERM=xterm"},
 		},
-		{name: "empty inputs return nil", allow: []string{"PATH"}},
+		{name: "empty inputs return owned empty slice", allow: []string{"PATH"}, want: []string{}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

@@ -36,6 +36,9 @@ func (a *agent) Spawn(_ context.Context, turn driver.Turn) (driver.Stream, error
 	if a.execPath == "" {
 		return nil, &SpawnConfigError{Field: "ExecPath", Reason: "empty"}
 	}
+	if !cleanAbsoluteExecPath(a.execPath) {
+		return nil, &SpawnConfigError{Field: "ExecPath", Reason: "must be a clean absolute path"}
+	}
 	if a.model == "" {
 		return nil, &SpawnConfigError{Field: "Model", Reason: "empty"}
 	}
@@ -48,11 +51,13 @@ func (a *agent) Spawn(_ context.Context, turn driver.Turn) (driver.Stream, error
 	}
 	decoded, decodeErr := decodeStream(stdout)
 	events, stopEvents, eventsDone := forwardEvents(decoded)
+	historyRoot := transcriptRoot(a.home)
 	historyPath, historyPathErr := transcriptPath(a.home, turn.Cwd, turn.ForeignSID)
 	s := &stream{
 		events:         events,
 		stopEvents:     stopEvents,
 		eventsDone:     eventsDone,
+		historyRoot:    historyRoot,
 		historyPath:    historyPath,
 		historyPathErr: historyPathErr,
 		cmd:            cmd,
@@ -68,7 +73,7 @@ func (a *agent) start(turn driver.Turn) (*exec.Cmd, io.Reader, error) {
 	// list passed positionally; there is no shell and no string splitting.
 	cmd := exec.Command(a.execPath, args...)
 	cmd.Dir = turn.Cwd
-	cmd.Env = append([]string(nil), a.env...)
+	cmd.Env = append(make([]string, 0, len(a.env)), a.env...)
 	cmd.Stdin = strings.NewReader(promptText(turn.Input))
 	cmd.Stderr = io.Discard
 	configureProcessGroup(cmd)
@@ -96,6 +101,7 @@ type stream struct {
 	events         <-chan driver.Event
 	stopEvents     func()
 	eventsDone     <-chan struct{}
+	historyRoot    string
 	historyPath    string
 	historyPathErr error
 	cmd            *exec.Cmd
@@ -111,7 +117,7 @@ func (s *stream) History() (driver.History, error) {
 	if s.historyPathErr != nil {
 		return driver.History{}, &driver.HistoryError{Cause: s.historyPathErr}
 	}
-	return historyFromPath(s.historyPath)
+	return historyFromContainedPath(s.historyRoot, s.historyPath)
 }
 
 func (s *stream) Close() error {
@@ -123,9 +129,14 @@ func (s *stream) Close() error {
 
 func (s *stream) shutdown() error {
 	s.stopEvents()
-	_ = interruptProcessGroup(s.pgid)
-	kill := time.AfterFunc(closeGrace, func() { _ = killProcessGroup(s.pgid) })
-	defer kill.Stop()
+	interruptErr := interruptProcessGroup(s.pgid)
+	if !processGroupMissing(interruptErr) {
+		// Keep the leader unreaped until escalation. Its PID is the process-group
+		// ID, so it cannot be reused while the delayed group signal is pending.
+		timer := time.NewTimer(closeGrace)
+		<-timer.C
+		_ = killProcessGroup(s.pgid)
+	}
 	waitErr := s.cmd.Wait()
 	<-s.eventsDone
 	decodeErr := s.decodeErr()

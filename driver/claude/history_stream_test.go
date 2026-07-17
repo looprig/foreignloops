@@ -109,6 +109,108 @@ func TestStreamHistoryClassifiesDerivationAndReadErrors(t *testing.T) {
 	}
 }
 
+func TestStreamHistoryRejectsSymlinkEscapes(t *testing.T) {
+	t.Parallel()
+	for _, tt := range []struct {
+		name string
+		link func(t *testing.T, root, path, outsidePath string)
+	}{
+		{
+			name: "intermediate project directory symlink",
+			link: func(t *testing.T, root, path, outsidePath string) {
+				t.Helper()
+				if err := os.MkdirAll(root, 0o755); err != nil {
+					t.Fatalf("mkdir projects root: %v", err)
+				}
+				outsideDir := filepath.Dir(outsidePath)
+				if err := os.Rename(outsidePath, filepath.Join(outsideDir, filepath.Base(path))); err != nil {
+					t.Fatalf("rename outside transcript: %v", err)
+				}
+				if err := os.Symlink(outsideDir, filepath.Dir(path)); err != nil {
+					t.Fatalf("symlink project directory: %v", err)
+				}
+			},
+		},
+		{
+			name: "final transcript file symlink",
+			link: func(t *testing.T, _ string, path, outsidePath string) {
+				t.Helper()
+				if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+					t.Fatalf("mkdir project directory: %v", err)
+				}
+				if err := os.Symlink(outsidePath, path); err != nil {
+					t.Fatalf("symlink transcript file: %v", err)
+				}
+			},
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			home := t.TempDir()
+			cwd := t.TempDir()
+			path, err := transcriptPath(home, cwd, testSID)
+			if err != nil {
+				t.Fatalf("transcriptPath() error = %v", err)
+			}
+			root := filepath.Join(home, claudeDir, projectsDir)
+			outsideDir := t.TempDir()
+			outsidePath := filepath.Join(outsideDir, "outside.jsonl")
+			writeHappyTranscript(t, outsidePath)
+			tt.link(t, root, path, outsidePath)
+
+			stream := spawnClosedHistoryStream(t, home, cwd)
+			history, err := stream.History()
+			if !reflect.DeepEqual(history, driver.History{}) {
+				t.Fatalf("History() = %#v, want zero history", history)
+			}
+			var historyErr *driver.HistoryError
+			var pathErr *PathError
+			if !errors.As(err, &historyErr) || !errors.As(err, &pathErr) {
+				t.Fatalf("History() error = %T %v, want HistoryError retaining PathError", err, err)
+			}
+		})
+	}
+}
+
+func spawnClosedHistoryStream(t *testing.T, home, cwd string) driver.Stream {
+	t.Helper()
+	fake := newFakeClaude(t)
+	parent := []string{
+		"PATH=" + os.Getenv("PATH"),
+		"ARGV_FILE=" + fake.argvFile,
+		"ENV_FILE=" + fake.envFile,
+		"CWD_FILE=" + fake.cwdFile,
+		"STDIN_FILE=" + fake.stdinFile,
+	}
+	agent, err := NewAgent(parent, Config{
+		ExecPath: fake.path,
+		Home:     home,
+		Model:    "small",
+		EnvAllow: []string{"PATH", "ARGV_FILE", "ENV_FILE", "CWD_FILE", "STDIN_FILE"},
+	})
+	if err != nil {
+		t.Fatalf("NewAgent() error = %v", err)
+	}
+	stream, err := agent.Spawn(context.Background(), driver.Turn{ForeignSID: testSID, StartNew: true, Cwd: cwd})
+	if err != nil {
+		t.Fatalf("Spawn() error = %v", err)
+	}
+	_ = collectEvents(t, stream)
+	_ = stream.Close()
+	return stream
+}
+
+func writeHappyTranscript(t *testing.T, path string) {
+	t.Helper()
+	fixture, err := os.ReadFile(filepath.Join("testdata", "transcript", "happy.jsonl"))
+	if err != nil {
+		t.Fatalf("read happy fixture: %v", err)
+	}
+	if err := os.WriteFile(path, fixture, 0o600); err != nil {
+		t.Fatalf("write transcript: %v", err)
+	}
+}
+
 func TestStreamHasNoTranscriptPathMethod(t *testing.T) {
 	t.Parallel()
 	if _, ok := reflect.TypeOf((*stream)(nil)).MethodByName("TranscriptPath"); ok {

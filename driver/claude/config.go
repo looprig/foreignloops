@@ -3,6 +3,7 @@ package claude
 import (
 	"fmt"
 	"os/exec"
+	"path/filepath"
 
 	"github.com/looprig/foreignloop/driver"
 )
@@ -50,6 +51,9 @@ func NewAgent(parentEnv []string, cfg Config) (driver.Agent, error) {
 	if cfg.ExecPath == "" {
 		return nil, &ConfigError{Field: "ExecPath", Reason: "required"}
 	}
+	if !cleanAbsoluteExecPath(cfg.ExecPath) {
+		return nil, &ConfigError{Field: "ExecPath", Reason: "must be a clean absolute path"}
+	}
 	if cfg.Model == "" {
 		return nil, &ConfigError{Field: "Model", Reason: "required"}
 	}
@@ -60,4 +64,8 @@ func NewAgent(parentEnv []string, cfg Config) (driver.Agent, error) {
 		env:      whitelistEnv(parentEnv, cfg.EnvAllow, cfg.Credential),
 		wrap:     cfg.Wrap,
 	}, nil
+}
+
+func cleanAbsoluteExecPath(path string) bool {
+	return filepath.IsAbs(path) && filepath.Clean(path) == path
 }

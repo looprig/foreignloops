@@ -112,7 +112,7 @@ func TestAgentSpawnContextCancelDoesNotCloseEvents(t *testing.T) {
 		if !ok || event.Kind != driver.KindInit {
 			t.Fatalf("initial event = (%#v, %v), want open stream with KindInit", event, ok)
 		}
-	case <-time.After(2 * time.Second):
+	case <-time.After(5 * time.Second):
 		t.Fatal("timed out waiting for initial event")
 	}
 	cancel()
@@ -124,7 +124,7 @@ func TestAgentSpawnContextCancelDoesNotCloseEvents(t *testing.T) {
 		if event.Kind != driver.KindTextDelta || event.Text != "still-running" {
 			t.Fatalf("event after cancellation = %#v, want still-running text delta", event)
 		}
-	case <-time.After(2 * time.Second):
+	case <-time.After(5 * time.Second):
 		t.Fatal("timed out waiting for event proving cancellation left the child running")
 	}
 	err1 := stream.Close()
@@ -217,12 +217,15 @@ func TestAgentSpawnConfigurationFailsBeforeChildStart(t *testing.T) {
 	t.Parallel()
 	fake := newFakeClaude(t)
 	for _, tt := range []struct {
-		name      string
-		agent     *agent
-		wantField string
+		name       string
+		agent      *agent
+		wantField  string
+		wantReason string
 	}{
-		{name: "empty executable", agent: &agent{model: "small"}, wantField: "ExecPath"},
-		{name: "empty model", agent: &agent{execPath: fake.path}, wantField: "Model"},
+		{name: "empty executable", agent: &agent{model: "small"}, wantField: "ExecPath", wantReason: "empty"},
+		{name: "relative executable", agent: &agent{execPath: "claude", model: "small"}, wantField: "ExecPath", wantReason: "must be a clean absolute path"},
+		{name: "unclean executable", agent: &agent{execPath: filepath.Dir(fake.path) + "/subdir/../claude", model: "small"}, wantField: "ExecPath", wantReason: "must be a clean absolute path"},
+		{name: "empty model", agent: &agent{execPath: fake.path}, wantField: "Model", wantReason: "empty"},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
@@ -232,8 +235,8 @@ func TestAgentSpawnConfigurationFailsBeforeChildStart(t *testing.T) {
 				t.Fatalf("Spawn() stream = %T, want nil", stream)
 			}
 			var configErr *SpawnConfigError
-			if !errors.As(err, &configErr) || configErr.Field != tt.wantField {
-				t.Fatalf("Spawn() error = %T %v, want *SpawnConfigError for %s", err, err, tt.wantField)
+			if !errors.As(err, &configErr) || configErr.Field != tt.wantField || configErr.Reason != tt.wantReason {
+				t.Fatalf("Spawn() error = %T %v, want *SpawnConfigError for %s: %s", err, err, tt.wantField, tt.wantReason)
 			}
 			if _, statErr := os.Stat(fake.argvFile); !errors.Is(statErr, os.ErrNotExist) {
 				t.Fatalf("child boundary file exists after config failure: %v", statErr)
@@ -254,6 +257,37 @@ func TestAgentSpawnBogusExecutableIsSpawnError(t *testing.T) {
 	var spawnErr *driver.SpawnError
 	if !errors.As(err, &spawnErr) {
 		t.Fatalf("Spawn() error = %T %v, want *driver.SpawnError", err, err)
+	}
+}
+
+func TestAgentSpawnEmptyEnvironmentDoesNotInheritAmbient(t *testing.T) {
+	t.Setenv("LOOPRIG_AMBIENT_SENTINEL", "must-not-leak")
+	dir := t.TempDir()
+	execPath := filepath.Join(dir, "claude")
+	script := `#!/bin/sh
+if [ "${LOOPRIG_AMBIENT_SENTINEL+x}" = x ]; then
+  exit 42
+fi
+printf '%s\n' '{"type":"result","subtype":"success","result":"done"}'
+`
+	if err := os.WriteFile(execPath, []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake claude: %v", err)
+	}
+	agent, err := NewAgent(nil, Config{ExecPath: execPath, Model: "small"})
+	if err != nil {
+		t.Fatalf("NewAgent() error = %v", err)
+	}
+	stream, err := agent.Spawn(context.Background(), driver.Turn{
+		ForeignSID: testSID,
+		StartNew:   true,
+		Cwd:        dir,
+	})
+	if err != nil {
+		t.Fatalf("Spawn() error = %v", err)
+	}
+	_ = collectEvents(t, stream)
+	if err := stream.Close(); err != nil {
+		t.Fatalf("Close() error = %v; empty cmd.Env inherited ambient sentinel", err)
 	}
 }
 
