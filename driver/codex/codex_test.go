@@ -9,6 +9,7 @@ import (
 	"reflect"
 	"runtime"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -18,6 +19,8 @@ import (
 
 // Agent must satisfy the foreign-agent port.
 var _ driver.Agent = (*agent)(nil)
+
+const fakeCodexSID = "0199a213-81c0-7800-8aa1-bbab2a035a53"
 
 func TestAgentSpawnFirstTurnExecJSONL(t *testing.T) {
 	t.Parallel()
@@ -91,6 +94,38 @@ func TestAgentSpawnFirstTurnExecJSONL(t *testing.T) {
 	assertCodexEvents(t, events)
 }
 
+func TestAgentSpawnEmptyEnvironmentDoesNotInheritAmbient(t *testing.T) {
+	const sentinel = "LOOPRIG_CODEX_AMBIENT_SENTINEL"
+	t.Setenv(sentinel, "must-not-leak")
+	dir := t.TempDir()
+	execPath := filepath.Join(dir, "codex")
+	resultPath := filepath.Join(dir, "result")
+	script := "#!/bin/sh\n" +
+		"if /usr/bin/env | /usr/bin/grep -q '^" + sentinel + "='; then\n" +
+		"  printf leaked > " + shellQuote(resultPath) + "\n" +
+		"else\n" +
+		"  printf clean > " + shellQuote(resultPath) + "\n" +
+		"fi\n"
+	if err := os.WriteFile(execPath, []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake codex: %v", err)
+	}
+	agent, err := NewAgent(os.Environ(), Config{ExecPath: execPath})
+	if err != nil {
+		t.Fatalf("NewAgent() error = %v", err)
+	}
+	stream, err := agent.Spawn(context.Background(), driver.Turn{Cwd: dir, StartNew: true})
+	if err != nil {
+		t.Fatalf("Spawn() error = %v", err)
+	}
+	_ = collectEvents(t, stream)
+	if err := stream.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+	if got := readFile(t, resultPath); got != "clean" {
+		t.Fatalf("child ambient result = %q, want clean", got)
+	}
+}
+
 func TestAgentSpawnResumeTurnExecJSONL(t *testing.T) {
 	t.Parallel()
 	fake := newFakeCodex(t)
@@ -109,7 +144,7 @@ func TestAgentSpawnResumeTurnExecJSONL(t *testing.T) {
 	}
 	turn := driver.Turn{
 		Cwd:          cwd,
-		ForeignSID:   "codex-thread-previous",
+		ForeignSID:   "11111111-2222-3333-4444-555555555555",
 		StartNew:     false,
 		SystemPrompt: "resume system",
 		Input:        []content.Block{&content.TextBlock{Text: "continue"}},
@@ -129,17 +164,42 @@ func TestAgentSpawnResumeTurnExecJSONL(t *testing.T) {
 		"exec",
 		"resume",
 		"--json",
-		"codex-thread-previous",
 		"--model", "gpt-5",
 		"--ignore-user-config",
 		"--ignore-rules",
 		"--skip-git-repo-check",
+		"--",
+		"11111111-2222-3333-4444-555555555555",
 		wantPrompt,
 	}
 	if got := fake.argv(t); !reflect.DeepEqual(got, wantArgv) {
 		t.Fatalf("argv = %#v, want %#v", got, wantArgv)
 	}
 	assertCodexEvents(t, events)
+}
+
+func TestAgentSpawnRejectsInvalidResumeSIDBeforeProcessStart(t *testing.T) {
+	t.Parallel()
+	fake := newFakeCodex(t)
+	stream, err := (&agent{execPath: fake.path, env: fake.env()}).Spawn(context.Background(), driver.Turn{
+		Cwd:        t.TempDir(),
+		ForeignSID: "--dangerously-bypass-approvals-and-sandbox",
+		StartNew:   false,
+	})
+	if stream != nil {
+		_ = stream.Close()
+		t.Fatalf("Spawn() stream = %T, want nil", stream)
+	}
+	var configErr *SpawnConfigError
+	if !errors.As(err, &configErr) {
+		t.Fatalf("Spawn() error = %T %v, want *SpawnConfigError", err, err)
+	}
+	if configErr.Field != "ForeignSID" || configErr.Reason != "must be a UUID" {
+		t.Fatalf("SpawnConfigError = %#v, want ForeignSID UUID rejection", configErr)
+	}
+	if _, statErr := os.Stat(fake.argvFile); !os.IsNotExist(statErr) {
+		t.Fatalf("fake argv file stat error = %v, want process not started", statErr)
+	}
 }
 
 func TestAgentSpawnContextCancelClosesEvents(t *testing.T) {
@@ -163,6 +223,62 @@ func TestAgentSpawnContextCancelClosesEvents(t *testing.T) {
 	err1 := stream.Close()
 	if err2 := stream.Close(); err2 != err1 {
 		t.Fatalf("second Close() error = %v, want same error %v", err2, err1)
+	}
+}
+
+func TestAgentSpawnPreCanceledContextClosesEvents(t *testing.T) {
+	t.Parallel()
+	fake := newFakeCodex(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	stream, err := (&agent{
+		execPath: fake.path,
+		env:      fake.env("FAKE_MODE=long_running"),
+	}).Spawn(ctx, driver.Turn{Cwd: t.TempDir(), StartNew: true})
+	if err != nil {
+		t.Fatalf("Spawn() error = %v", err)
+	}
+	assertEventsClosePromptly(t, stream)
+	err1 := stream.Close()
+	if err2 := stream.Close(); err2 != err1 {
+		t.Fatalf("second Close() error = %v, want same error %v", err2, err1)
+	}
+}
+
+func TestAgentSpawnConcurrentCancelAndClose(t *testing.T) {
+	t.Parallel()
+	fake := newFakeCodex(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	stream, err := (&agent{
+		execPath: fake.path,
+		env:      fake.env("FAKE_MODE=long_running"),
+	}).Spawn(ctx, driver.Turn{Cwd: t.TempDir(), StartNew: true})
+	if err != nil {
+		t.Fatalf("Spawn() error = %v", err)
+	}
+	start := make(chan struct{})
+	closeResult := make(chan error, 1)
+	cancelDone := make(chan struct{})
+	var ready sync.WaitGroup
+	ready.Add(2)
+	go func() {
+		ready.Done()
+		<-start
+		cancel()
+		close(cancelDone)
+	}()
+	go func() {
+		ready.Done()
+		<-start
+		closeResult <- stream.Close()
+	}()
+	ready.Wait()
+	close(start)
+	err1 := <-closeResult
+	<-cancelDone
+	assertEventsAlreadyClosed(t, stream)
+	if err2 := stream.Close(); err2 != err1 {
+		t.Fatalf("final Close() error = %v, want same error %v", err2, err1)
 	}
 }
 
@@ -323,6 +439,21 @@ func TestAgentSpawnErrorPaths(t *testing.T) {
 			t.Fatalf("Spawn() error = %T %[1]v, want *driver.SpawnError", err)
 		}
 	})
+	t.Run("relative exec path fails before ambient lookup", func(t *testing.T) {
+		t.Parallel()
+		stream, err := (&agent{execPath: "codex"}).Spawn(context.Background(), driver.Turn{StartNew: true})
+		if stream != nil {
+			_ = stream.Close()
+			t.Fatalf("Spawn() stream = %T, want nil", stream)
+		}
+		var configErr *SpawnConfigError
+		if !errors.As(err, &configErr) {
+			t.Fatalf("Spawn() error = %T %v, want *SpawnConfigError", err, err)
+		}
+		if configErr.Field != "ExecPath" || configErr.Reason != "must be a clean absolute path" {
+			t.Fatalf("SpawnConfigError = %#v, want ExecPath clean-absolute rejection", configErr)
+		}
+	})
 }
 
 func assertCodexEvents(t *testing.T, got []driver.Event) {
@@ -333,8 +464,8 @@ func assertCodexEvents(t *testing.T, got []driver.Event) {
 	if got[0].Kind != driver.KindInit {
 		t.Fatalf("event[0].Kind = %v, want KindInit", got[0].Kind)
 	}
-	if got[0].SessionID != "codex-thread-from-jsonl" {
-		t.Fatalf("event[0].SessionID = %q, want codex-thread-from-jsonl", got[0].SessionID)
+	if got[0].SessionID != fakeCodexSID {
+		t.Fatalf("event[0].SessionID = %q, want %s", got[0].SessionID, fakeCodexSID)
 	}
 	assertStepText(t, got[1], "decoded assistant text")
 	if got[2].Kind != driver.KindTerminalOK {
@@ -461,13 +592,13 @@ case "${FAKE_MODE:-happy}" in
     ;;
   long_running)
     trap 'exit 0' INT TERM
-    printf '%s\n' '{"type":"thread.started","thread_id":"codex-thread-from-jsonl"}'
+    printf '%s\n' '{"type":"thread.started","thread_id":"0199a213-81c0-7800-8aa1-bbab2a035a53"}'
     sleep 60
     exit 0
     ;;
   block_on_event)
     trap 'exit 0' INT TERM
-    printf '%s\n' '{"type":"thread.started","thread_id":"codex-thread-from-jsonl"}'
+    printf '%s\n' '{"type":"thread.started","thread_id":"0199a213-81c0-7800-8aa1-bbab2a035a53"}'
     sleep 60
     exit 0
     ;;
@@ -477,7 +608,7 @@ while [ "$i" -lt "${STDERR_LINES:-0}" ]; do
   printf 'stderr line %s abcdefghijklmnopqrstuvwxyz abcdefghijklmnopqrstuvwxyz abcdefghijklmnopqrstuvwxyz\n' "$i" >&2
   i=$((i + 1))
 done
-printf '%s\n' '{"type":"thread.started","thread_id":"codex-thread-from-jsonl"}'
+printf '%s\n' '{"type":"thread.started","thread_id":"0199a213-81c0-7800-8aa1-bbab2a035a53"}'
 printf '%s\n' '{"type":"turn.started"}'
 printf '%s\n' '{"type":"item.completed","item":{"type":"agent_message","text":"decoded assistant text"}}'
 printf '%s\n' '{"type":"turn.completed"}'
@@ -533,4 +664,8 @@ func cleanPath(t *testing.T, path string) string {
 		t.Fatalf("eval symlinks for %s: %v", path, err)
 	}
 	return clean
+}
+
+func shellQuote(value string) string {
+	return "'" + strings.ReplaceAll(value, "'", "'\"'\"'") + "'"
 }

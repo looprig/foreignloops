@@ -5,6 +5,7 @@ package codex
 import (
 	"context"
 	"errors"
+	"path/filepath"
 	"runtime"
 	"testing"
 
@@ -12,7 +13,11 @@ import (
 )
 
 func TestUnsupportedPlatformFailsBeforeSpawn(t *testing.T) {
-	agent, err := NewAgent(nil, Config{ExecPath: "codex"})
+	execPath, err := filepath.Abs("codex")
+	if err != nil {
+		t.Fatalf("absolute executable path: %v", err)
+	}
+	agent, err := NewAgent(nil, Config{ExecPath: execPath})
 	if err != nil {
 		t.Fatalf("NewAgent() error = %v", err)
 	}

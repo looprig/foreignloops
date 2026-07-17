@@ -23,6 +23,26 @@ func TestNewAgentRequiredFields(t *testing.T) {
 	}
 }
 
+func TestNewAgentRejectsNonAbsoluteOrUncleanExecPath(t *testing.T) {
+	t.Parallel()
+	for _, execPath := range []string{"codex", "/usr/local/../bin/codex"} {
+		t.Run(execPath, func(t *testing.T) {
+			t.Parallel()
+			got, err := NewAgent(nil, Config{ExecPath: execPath})
+			if got != nil {
+				t.Fatalf("NewAgent() = %T, want nil", got)
+			}
+			var configErr *ConfigError
+			if !errors.As(err, &configErr) {
+				t.Fatalf("NewAgent() error = %T %v, want *ConfigError", err, err)
+			}
+			if configErr.Field != "ExecPath" || configErr.Reason != "must be a clean absolute path" {
+				t.Fatalf("ConfigError = %#v, want ExecPath clean-absolute rejection", configErr)
+			}
+		})
+	}
+}
+
 func TestNewAgentRetainsOwnedConfiguration(t *testing.T) {
 	t.Parallel()
 	parent := []string{"PATH=/usr/bin", "HOME=/home/u", "SECRET_TOKEN=shh"}

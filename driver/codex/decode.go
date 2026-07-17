@@ -3,6 +3,7 @@ package codex
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"strings"
 
 	"github.com/looprig/core/content"
@@ -52,6 +53,9 @@ func decodeLine(line []byte) ([]driver.Event, error) {
 	case eventThreadStarted:
 		if el.ThreadID == "" {
 			return nil, nil
+		}
+		if !validSessionID(el.ThreadID) {
+			return nil, &driver.DecodeError{Cause: errors.New("codex: thread.started thread_id must be a UUID")}
 		}
 		return []driver.Event{{Kind: driver.KindInit, SessionID: el.ThreadID}}, nil
 	case eventTurnStarted:

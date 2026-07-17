@@ -199,13 +199,7 @@ func TestIntegrationCodexCLIContract(t *testing.T) {
 		t.Fatalf("codex exec did not emit %s; stdout:\n%s\nstderr:\n%s", eventThreadStarted, start.stdout, start.stderr)
 	}
 
-	resume := runCodex(t, ctx, codexPath, []string{
-		"exec",
-		"resume",
-		start.threadID,
-		"--json",
-		"Reply with exactly: continued",
-	})
+	resume := runCodex(t, ctx, codexPath, buildResumeArgs(driver.Turn{ForeignSID: start.threadID}, runConfig{}, "Reply with exactly: continued"))
 	if !resumeConfirmsContinuation(resume, start.threadID) {
 		t.Fatalf("codex exec resume did not resume or clearly confirm continuation of thread %q; stdout:\n%s\nstderr:\n%s", start.threadID, resume.stdout, resume.stderr)
 	}

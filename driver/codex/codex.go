@@ -40,6 +40,12 @@ func (a *agent) Spawn(ctx context.Context, turn driver.Turn) (driver.Stream, err
 	if a.execPath == "" {
 		return nil, &SpawnConfigError{Field: "ExecPath", Reason: "empty"}
 	}
+	if !cleanAbsoluteExecPath(a.execPath) {
+		return nil, &SpawnConfigError{Field: "ExecPath", Reason: "must be a clean absolute path"}
+	}
+	if (!turn.StartNew || turn.ForeignSID != "") && !validSessionID(turn.ForeignSID) {
+		return nil, &SpawnConfigError{Field: "ForeignSID", Reason: "must be a UUID"}
+	}
 	if err := platformSupported(); err != nil {
 		return nil, err
 	}
@@ -56,9 +62,16 @@ func (a *agent) Spawn(ctx context.Context, turn driver.Turn) (driver.Stream, err
 		cmd:        cmd,
 		decodeErr:  decodeErr,
 		pgid:       cmd.Process.Pid,
+		closed:     make(chan struct{}),
 	}
 	if ctx != nil {
-		s.stopContext = context.AfterFunc(ctx, func() { _ = s.Close() })
+		go func() {
+			select {
+			case <-ctx.Done():
+				_ = s.Close()
+			case <-s.closed:
+			}
+		}()
 	}
 	return s, nil
 }
@@ -88,7 +101,7 @@ func (a *agent) start(turn driver.Turn) (*exec.Cmd, io.Reader, error) {
 	// list passed positionally; there is no shell and no string splitting.
 	cmd := exec.Command(a.execPath, args...)
 	cmd.Dir = turn.Cwd
-	cmd.Env = append([]string(nil), a.env...)
+	cmd.Env = append(make([]string, 0, len(a.env)), a.env...)
 	cmd.Stderr = io.Discard
 	configureProcessGroup(cmd)
 	stdout, err := cmd.StdoutPipe()
@@ -102,15 +115,15 @@ func (a *agent) start(turn driver.Turn) (*exec.Cmd, io.Reader, error) {
 }
 
 type stream struct {
-	events      <-chan driver.Event
-	stopEvents  func()
-	eventsDone  <-chan struct{}
-	cmd         *exec.Cmd
-	decodeErr   func() error
-	pgid        int
-	stopContext func() bool
-	once        sync.Once
-	closeErr    error
+	events     <-chan driver.Event
+	stopEvents func()
+	eventsDone <-chan struct{}
+	cmd        *exec.Cmd
+	decodeErr  func() error
+	pgid       int
+	closed     chan struct{}
+	once       sync.Once
+	closeErr   error
 }
 
 func (s *stream) Events() <-chan driver.Event { return s.events }
@@ -123,9 +136,7 @@ func (s *stream) History() (driver.History, error) {
 // reaps the child. Repeat calls return the first result.
 func (s *stream) Close() error {
 	s.once.Do(func() {
-		if s.stopContext != nil {
-			s.stopContext()
-		}
+		close(s.closed)
 		s.closeErr = s.shutdown()
 	})
 	return s.closeErr
@@ -133,9 +144,14 @@ func (s *stream) Close() error {
 
 func (s *stream) shutdown() error {
 	s.stopEvents()
-	_ = interruptProcessGroup(s.pgid)
-	kill := time.AfterFunc(closeGrace, func() { _ = killProcessGroup(s.pgid) })
-	defer kill.Stop()
+	interruptErr := interruptProcessGroup(s.pgid)
+	if !processGroupMissing(interruptErr) {
+		// Keep the leader unreaped until escalation. Its PID is the process-group
+		// ID, so it cannot be reused while the delayed group signal is pending.
+		timer := time.NewTimer(closeGrace)
+		<-timer.C
+		_ = killProcessGroup(s.pgid)
+	}
 	waitErr := s.cmd.Wait()
 	<-s.eventsDone
 	decodeErr := s.decodeErr()

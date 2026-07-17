@@ -2,6 +2,7 @@ package codex
 
 import (
 	"fmt"
+	"path/filepath"
 
 	"github.com/looprig/foreignloop/driver"
 )
@@ -68,6 +69,9 @@ func NewAgent(parentEnv []string, cfg Config) (driver.Agent, error) {
 	if cfg.ExecPath == "" {
 		return nil, &ConfigError{Field: "ExecPath", Reason: "required"}
 	}
+	if !cleanAbsoluteExecPath(cfg.ExecPath) {
+		return nil, &ConfigError{Field: "ExecPath", Reason: "must be a clean absolute path"}
+	}
 	return &agent{
 		execPath:         cfg.ExecPath,
 		model:            cfg.Model,
@@ -80,4 +84,8 @@ func NewAgent(parentEnv []string, cfg Config) (driver.Agent, error) {
 		ignoreRules:      cfg.IgnoreRules,
 		skipGitRepoCheck: cfg.SkipGitRepoCheck,
 	}, nil
+}
+
+func cleanAbsoluteExecPath(path string) bool {
+	return filepath.IsAbs(path) && filepath.Clean(path) == path
 }

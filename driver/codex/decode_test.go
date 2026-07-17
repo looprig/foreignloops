@@ -128,6 +128,18 @@ func TestDecodeLineMalformedJSONReturnsDecodeError(t *testing.T) {
 	}
 }
 
+func TestDecodeLineRejectsInvalidThreadID(t *testing.T) {
+	t.Parallel()
+	got, err := decodeLine([]byte(`{"type":"thread.started","thread_id":"--dangerously-bypass-approvals-and-sandbox"}`))
+	if len(got) != 0 {
+		t.Fatalf("decodeLine() events = %#v, want none", got)
+	}
+	var decodeErr *driver.DecodeError
+	if !errors.As(err, &decodeErr) {
+		t.Fatalf("decodeLine() error = %T %v, want *driver.DecodeError", err, err)
+	}
+}
+
 func assertStepText(t *testing.T, ev driver.Event, want string) {
 	t.Helper()
 	if ev.Kind != driver.KindStepComplete {

@@ -50,7 +50,6 @@ func buildResumeArgs(t driver.Turn, c runConfig, prompt string) []string {
 		"exec",
 		"resume",
 		"--json",
-		t.ForeignSID,
 	}
 	if c.model != "" {
 		args = append(args, "--model", c.model)
@@ -64,7 +63,7 @@ func buildResumeArgs(t driver.Turn, c runConfig, prompt string) []string {
 	if c.skipGitRepoCheck {
 		args = append(args, "--skip-git-repo-check")
 	}
-	return append(args, prompt)
+	return append(args, "--", t.ForeignSID, prompt)
 }
 
 func sandboxString(mode SandboxMode) string {

@@ -48,7 +48,7 @@ func TestBuildStartArgs(t *testing.T) {
 
 func TestBuildResumeArgs(t *testing.T) {
 	t.Parallel()
-	turn := driver.Turn{ForeignSID: "codex-session-123"}
+	turn := driver.Turn{ForeignSID: "11111111-2222-3333-4444-555555555555"}
 	cfg := runConfig{
 		cwd:              "/work/repo",
 		model:            "gpt-5",
@@ -66,11 +66,12 @@ func TestBuildResumeArgs(t *testing.T) {
 		"exec",
 		"resume",
 		"--json",
-		"codex-session-123",
 		"--model", "gpt-5",
 		"--ignore-user-config",
 		"--ignore-rules",
 		"--skip-git-repo-check",
+		"--",
+		"11111111-2222-3333-4444-555555555555",
 		"continue",
 	}
 	if !reflect.DeepEqual(got, want) {
@@ -83,6 +84,26 @@ func TestBuildResumeArgs(t *testing.T) {
 		if containsArg(got, absent) {
 			t.Fatalf("%s present in conservative resume argv: %v", absent, got)
 		}
+	}
+}
+
+func TestBuildResumeArgsTerminatesOptionsBeforeUntrustedSID(t *testing.T) {
+	t.Parallel()
+	const dangerous = "--dangerously-bypass-approvals-and-sandbox"
+	got := buildResumeArgs(driver.Turn{ForeignSID: dangerous}, runConfig{
+		model:            "gpt-5",
+		ignoreUserConfig: true,
+	}, "continue")
+	want := []string{
+		"exec", "resume", "--json",
+		"--model", "gpt-5",
+		"--ignore-user-config",
+		"--",
+		dangerous,
+		"continue",
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("buildResumeArgs() = %#v, want option-terminated %#v", got, want)
 	}
 }
 
