@@ -6,9 +6,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -186,6 +188,57 @@ func TestTypedHistoryFailureUsesFallbackAndPreservesSuccessfulTerminal(t *testin
 		t.Fatalf("events = %v", got)
 	}
 	shutdown(t, state)
+}
+
+func TestHistoryFallbackWarningParity(t *testing.T) {
+	oldLogger := slog.Default()
+	var logs bytes.Buffer
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logs, nil)))
+	t.Cleanup(func() { slog.SetDefault(oldLogger) })
+
+	tests := []struct {
+		name        string
+		history     driver.History
+		err         error
+		wantWarning bool
+	}{
+		{
+			name: "missing transcript stays silent",
+			err: &driver.HistoryError{Cause: &os.PathError{
+				Op:   "open",
+				Path: "/missing/session.jsonl",
+				Err:  os.ErrNotExist,
+			}},
+		},
+		{name: "non-missing history failure warns", err: &driver.HistoryError{Cause: errors.New("malformed authoritative history")}, wantWarning: true},
+		{name: "deliberately unavailable history stays silent", history: driver.History{Available: false}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			logs.Reset()
+			stream := &fakeStream{history: tt.history, historyErr: tt.err}
+			var published []event.Event
+			committed := (&Loop{}).commitTurn(stream, []*content.AIMessage{aiMessage("fallback")}, func(input event.Event) {
+				published = append(published, input)
+			})
+			if got := strings.Contains(logs.String(), "level=WARN"); got != tt.wantWarning {
+				t.Fatalf("warning present = %v, want %v; logs=%q", got, tt.wantWarning, logs.String())
+			}
+			if tt.wantWarning && !strings.Contains(logs.String(), "foreignloop: transcript decode failed; degrading to stream assistant") {
+				t.Fatalf("warning message drifted from predecessor: %q", logs.String())
+			}
+			if len(committed) != 1 || firstText(t, committed[0]) != "fallback" {
+				t.Fatalf("committed fallback = %v", committed)
+			}
+			if len(published) != 1 {
+				t.Fatalf("published events = %v, want one fallback StepDone", eventKinds(published))
+			}
+			step, ok := published[0].(event.StepDone)
+			if !ok || len(step.Messages) != 1 || firstText(t, step.Messages[0]) != "fallback" {
+				t.Fatalf("published fallback = %T %+v", published[0], published[0])
+			}
+		})
+	}
 }
 
 func TestHistoryGroupingMatchesClaudeGoldenProjection(t *testing.T) {
@@ -574,6 +627,155 @@ func TestLateBoundLockLifecycleAndResume(t *testing.T) {
 	shutdown(t, state)
 }
 
+type orderedLock struct {
+	name  string
+	held  bool
+	trace *[]string
+}
+
+func (lock *orderedLock) release() {
+	*lock.trace = append(*lock.trace, "release "+lock.name)
+	lock.held = false
+}
+
+type orderedStream struct {
+	events  chan driver.Event
+	durable *orderedLock
+	trace   *[]string
+	once    sync.Once
+}
+
+func (stream *orderedStream) Events() <-chan driver.Event { return stream.events }
+
+func (stream *orderedStream) History() (driver.History, error) {
+	if stream.durable.held {
+		*stream.trace = append(*stream.trace, "history while durable held")
+	} else {
+		*stream.trace = append(*stream.trace, "history after durable release")
+	}
+	return driver.History{Available: false}, nil
+}
+
+func (stream *orderedStream) Close() error {
+	stream.once.Do(func() {
+		if stream.durable.held {
+			*stream.trace = append(*stream.trace, "close stream while durable held")
+		} else {
+			*stream.trace = append(*stream.trace, "close stream after durable release")
+		}
+	})
+	return nil
+}
+
+type orderedAgent struct{ stream driver.Stream }
+
+func (agent orderedAgent) Spawn(context.Context, driver.Turn) (driver.Stream, error) {
+	return agent.stream, nil
+}
+
+func TestLateBoundTurnLockLifecycleOrderMatchesPredecessor(t *testing.T) {
+	t.Parallel()
+	var trace []string
+	temporary := &orderedLock{name: "temporary", held: true, trace: &trace}
+	durable := &orderedLock{name: "durable", trace: &trace}
+	locks := turnLockOps{
+		acquireTemporary: func(string, string) (turnLock, error) {
+			trace = append(trace, "acquire temporary")
+			return temporary, nil
+		},
+		acquireDurable: func(string, string) (turnLock, error) {
+			trace = append(trace, "acquire durable")
+			durable.held = true
+			return durable, nil
+		},
+	}
+	events := make(chan driver.Event, 2)
+	events <- driver.Event{Kind: driver.KindInit, SessionID: "foreign-session"}
+	events <- driver.Event{Kind: driver.KindTerminalOK}
+	close(events)
+	stream := &orderedStream{events: events, durable: durable, trace: &trace}
+	state := &Loop{backendCfg: Config{Agent: orderedAgent{stream: stream}, Cwd: t.TempDir()}}
+	result := make(chan turnOutcome, 1)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	pub := func(input event.Event) {
+		if _, ok := input.(event.ForeignSessionBound); ok {
+			trace = append(trace, "publish ForeignSessionBound")
+		}
+	}
+
+	go state.driveTurnWithLocks(ctx, cancel, driver.Turn{}, 1, false, pub, result, locks)
+	select {
+	case <-result:
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for turn outcome")
+	}
+	trace = append(trace, "actor receives outcome")
+
+	want := []string{
+		"acquire temporary",
+		"acquire durable",
+		"release temporary",
+		"publish ForeignSessionBound",
+		"close stream while durable held",
+		"history while durable held",
+		"release durable",
+		"actor receives outcome",
+	}
+	if !reflect.DeepEqual(trace, want) {
+		t.Fatalf("lifecycle trace = %v, want %v", trace, want)
+	}
+}
+
+func TestLateBoundSessionBoundSequenceHeaderAndResumeParity(t *testing.T) {
+	t.Parallel()
+	agent := &fakeAgent{events: []driver.Event{
+		{Kind: driver.KindInit, SessionID: "codex-thread-1"},
+		{Kind: driver.KindStepComplete, Message: aiMessage("ok")},
+		{Kind: driver.KindTerminalOK},
+	}}
+	pub := &fakePublisher{}
+	state, sid := newTestLoop(t, Config{Agent: agent, Cwd: t.TempDir(), SIDMode: SIDLateBound}, pub)
+	if sid != "" {
+		t.Fatalf("initial sid = %q, want empty", sid)
+	}
+
+	submit(t, state, "first")
+	waitTurnIndex(t, state, 1)
+	wantFirst := []string{"event.TurnStarted", "event.ForeignSessionBound", "event.StepDone", "event.TurnDone"}
+	if got := eventKinds(pub.snapshot()); !reflect.DeepEqual(got, wantFirst) {
+		t.Fatalf("first-turn events = %v, want %v", got, wantFirst)
+	}
+	bound := pub.snapshot()[1].(event.ForeignSessionBound)
+	if bound.ForeignSID != "codex-thread-1" {
+		t.Fatalf("ForeignSID = %q", bound.ForeignSID)
+	}
+	if err := event.ValidateEvent(bound); err != nil {
+		t.Fatalf("ForeignSessionBound validation: %v", err)
+	}
+	header := bound.EventHeader()
+	if header.SessionID != state.sessionID || header.LoopID != state.loopID || !header.TurnID.IsZero() || !header.StepID.IsZero() {
+		t.Fatalf("ForeignSessionBound coordinates = %+v", header.Coordinates)
+	}
+
+	submit(t, state, "second")
+	waitTurnIndex(t, state, 2)
+	turn := agent.lastForeignTurn()
+	if turn.StartNew || turn.ForeignSID != "codex-thread-1" {
+		t.Fatalf("resume turn = {StartNew:%v ForeignSID:%q}", turn.StartNew, turn.ForeignSID)
+	}
+	boundCount := 0
+	for _, input := range pub.snapshot() {
+		if _, ok := input.(event.ForeignSessionBound); ok {
+			boundCount++
+		}
+	}
+	if boundCount != 1 {
+		t.Fatalf("ForeignSessionBound count = %d, want 1", boundCount)
+	}
+	shutdown(t, state)
+}
+
 func TestLateBoundFirstTurnsUseIndependentTemporaryLocks(t *testing.T) {
 	t.Parallel()
 	cwd := t.TempDir()
@@ -597,14 +799,32 @@ func TestLateBoundTransitionFailurePersistsSIDForBusyResume(t *testing.T) {
 	state, _ := newTestLoop(t, Config{Agent: agent, Cwd: cwd, SIDMode: SIDLateBound}, pub)
 	submit(t, state, "first")
 	waitFor(t, pub, func(input event.Event) bool { _, ok := input.(event.TurnFailed); return ok })
+	wantFirst := []string{"event.TurnStarted", "event.ForeignSessionBound", "event.TurnFailed"}
+	if got := eventKinds(pub.snapshot()); !reflect.DeepEqual(got, wantFirst) {
+		t.Fatalf("first-turn events = %v, want %v", got, wantFirst)
+	}
+	firstFailed := pub.snapshot()[2].(event.TurnFailed)
+	var firstBusy *ForeignSessionBusyError
+	if !errors.As(firstFailed.Err, &firstBusy) || firstBusy.SID != "busy" || firstBusy.Cwd != cwd || firstBusy.PID != os.Getpid() {
+		t.Fatalf("first TurnFailed.Err = %T %v, want joined ForeignSessionBusyError", firstFailed.Err, firstFailed.Err)
+	}
 	waitLoopIdle(t, state)
 	submit(t, state, "resume")
 	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
-		if len(pub.snapshot()) >= 4 {
+		if len(pub.snapshot()) >= 5 {
 			break
 		}
 		time.Sleep(time.Millisecond)
+	}
+	wantAll := []string{"event.TurnStarted", "event.ForeignSessionBound", "event.TurnFailed", "event.TurnStarted", "event.TurnFailed"}
+	if got := eventKinds(pub.snapshot()); !reflect.DeepEqual(got, wantAll) {
+		t.Fatalf("all events = %v, want %v", got, wantAll)
+	}
+	secondFailed := pub.snapshot()[4].(event.TurnFailed)
+	var secondBusy *ForeignSessionBusyError
+	if !errors.As(secondFailed.Err, &secondBusy) || secondBusy.SID != "busy" || secondBusy.Cwd != cwd || secondBusy.PID != os.Getpid() {
+		t.Fatalf("second TurnFailed.Err = %T %v, want ForeignSessionBusyError", secondFailed.Err, secondFailed.Err)
 	}
 	if agent.calls() != 1 {
 		t.Fatalf("spawns = %d, want 1", agent.calls())

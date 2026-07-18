@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"os"
 
 	"github.com/looprig/core/content"
 	"github.com/looprig/core/uuid"
@@ -341,7 +342,9 @@ func (l *Loop) publishMapped(mapper *mapper, input driver.Event, pub func(event.
 func (l *Loop) commitTurn(stream driver.Stream, assistant []*content.AIMessage, pub func(event.Event)) content.AgenticMessages {
 	history, err := stream.History()
 	if err != nil {
-		slog.Warn("foreignloop: authoritative history failed; degrading to stream assistant", "error", err)
+		if !errors.Is(err, os.ErrNotExist) {
+			slog.Warn("foreignloop: transcript decode failed; degrading to stream assistant", "error", err)
+		}
 		return commitFromAssistant(assistant, pub)
 	}
 	if !history.Available {
