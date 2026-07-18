@@ -36,7 +36,7 @@ func TestAgentCloseCooperativeSIGINTReturnsPromptly(t *testing.T) {
 		if !ok || event.Kind != driver.KindInit {
 			t.Fatalf("first event = (%#v, %t), want KindInit", event, ok)
 		}
-	case <-time.After(2 * time.Second):
+	case <-time.After(stubbornHelperStartupTimeout):
 		t.Fatal("timed out waiting for cooperative process startup")
 	}
 	assertClosePromptly(t, foreignStream)
