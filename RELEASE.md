@@ -39,21 +39,27 @@ GOWORK=off go mod vendor
 GOWORK=off go test -count=1 -race ./...
 GOWORK=off go test -count=1 -tags integration -race ./...
 CGO_ENABLED=0 GOWORK=off go build -trimpath ./...
-make secure
+make lint
+go mod verify
+# Requires explicit approval for dependency-metadata network disclosure, or an
+# approved offline Go vulnerability database:
+go tool govulncheck ./...
 git diff --check
 git add go.mod go.sum vendor
 git commit -m 'build: prepare Harness release metadata'
 test -z "$(git status --short)"
 ```
 
-`make secure` is a release gate. Task 20 reproduced its current 13 staticcheck
-diagnostics unchanged at the clean pre-extraction baseline. Resolve them and
-rerun the gate, or record an explicit waiver from the authorized release owner,
-before tagging. Passing race, integration, and build checks does not implicitly
-waive this blocker.
+Harness commit `f4406c2` fixes the 13 staticcheck and two gosec findings found
+during secure-gate remediation. The full race suite, integration race suite,
+CGO-disabled trimpath build, lint gate, and `go mod verify` pass at that commit.
+The official `govulncheck` remains a release gate: it was not run because its
+network request can disclose private module, package, and dependency metadata,
+and that disclosure was not approved. Run it only after explicit privacy
+approval, or configure and use an approved offline vulnerability database.
 
-Only after those checks pass, or the baseline secure blocker is explicitly
-waived, may an authorized operator run:
+Only after every command above, including the approved vulnerability scan,
+passes may an authorized operator run:
 
 ```sh
 git tag "$HARNESS_TAG"
@@ -162,13 +168,15 @@ and pushes require separate authorization.
 ## Task 20 evidence
 
 The verification record at
-`/private/tmp/foreignloop-extraction-verification.txt` was completed on
-2026-07-18 against Harness `d390ccc`, foreignloop `7080f51`, and tests
-`e02c8e7`:
+`/private/tmp/foreignloop-extraction-verification.txt` was started on 2026-07-18
+against Harness `d390ccc`, foreignloop `7080f51`, and tests `e02c8e7`, then
+updated after Harness remediation commit `f4406c2`:
 
-- Harness full race, integration race, and CGO-disabled trimpath build passed.
-- Harness `make secure` remained blocked by the exact 13-diagnostic
-  pre-extraction staticcheck baseline described above.
+- Harness full race, integration race, CGO-disabled trimpath build, lint, and
+  module verification passed after all 13 staticcheck and two gosec findings
+  were fixed.
+- Harness official `govulncheck` remains unexecuted pending explicit privacy
+  approval for network metadata disclosure or an approved offline database.
 - foreignloop root/build/fresh race/integration, three 30-second fuzz targets,
   secure checks, and supported/unsupported cross-builds passed.
 - tests `make check GOFLAGS='-count=1'` passed.
