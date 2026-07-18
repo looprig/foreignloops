@@ -21,6 +21,7 @@ import (
 var _ driver.Agent = (*agent)(nil)
 
 const fakeCodexSID = "0199a213-81c0-7800-8aa1-bbab2a035a53"
+const promptCloseLimit = 1250 * time.Millisecond
 
 func TestAgentSpawnFirstTurnExecJSONL(t *testing.T) {
 	t.Parallel()
@@ -92,6 +93,20 @@ func TestAgentSpawnFirstTurnExecJSONL(t *testing.T) {
 		t.Fatalf("stdin = %q, want empty", stdin)
 	}
 	assertCodexEvents(t, events)
+}
+
+func TestAgentCloseAlreadyCompletedReturnsPromptly(t *testing.T) {
+	t.Parallel()
+	fake := newFakeCodex(t)
+	foreignStream, err := (&agent{execPath: fake.path, env: fake.env()}).Spawn(context.Background(), driver.Turn{
+		Cwd:      t.TempDir(),
+		StartNew: true,
+	})
+	if err != nil {
+		t.Fatalf("Spawn() error = %v", err)
+	}
+	_ = collectEvents(t, foreignStream)
+	assertClosePromptly(t, foreignStream)
 }
 
 func TestAgentSpawnEmptyEnvironmentDoesNotInheritAmbient(t *testing.T) {
@@ -484,6 +499,17 @@ func assertHistoryUnavailable(t *testing.T, stream driver.Stream) {
 	}
 	if history.Steps != nil {
 		t.Fatalf("History().Steps = %#v, want nil", history.Steps)
+	}
+}
+
+func assertClosePromptly(t *testing.T, stream driver.Stream) {
+	t.Helper()
+	started := time.Now()
+	if err := stream.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+	if elapsed := time.Since(started); elapsed >= promptCloseLimit {
+		t.Fatalf("Close() took %v, want less than %v", elapsed, promptCloseLimit)
 	}
 }
 

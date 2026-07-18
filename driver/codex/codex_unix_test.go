@@ -1,4 +1,4 @@
-//go:build darwin || linux
+//go:build darwin || (linux && !android)
 
 package codex
 
@@ -22,6 +22,37 @@ import (
 
 const stubbornHelperStartupTimeout = 10 * time.Second
 
+func TestAgentCloseCooperativeSIGINTReturnsPromptly(t *testing.T) {
+	execPath, env := newCooperativeCodex(t)
+	foreignStream, err := (&agent{
+		execPath: execPath,
+		env:      env,
+	}).Spawn(context.Background(), driver.Turn{Cwd: t.TempDir(), StartNew: true})
+	if err != nil {
+		t.Fatalf("Spawn() error = %v", err)
+	}
+	select {
+	case event, ok := <-foreignStream.Events():
+		if !ok || event.Kind != driver.KindInit {
+			t.Fatalf("first event = (%#v, %t), want KindInit", event, ok)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for cooperative process startup")
+	}
+	assertClosePromptly(t, foreignStream)
+}
+
+func TestCodexCooperativeLeaderHelper(t *testing.T) {
+	if os.Getenv("GO_WANT_CODEX_COOPERATIVE_HELPER") != "1" {
+		return
+	}
+	interrupt := make(chan os.Signal, 1)
+	signal.Notify(interrupt, os.Interrupt)
+	fmt.Printf("%s\n", `{"type":"thread.started","thread_id":"0199a213-81c0-7800-8aa1-bbab2a035a53"}`)
+	<-interrupt
+	os.Exit(0)
+}
+
 func TestAgentCloseKillsStubbornProcessGroupDescendant(t *testing.T) {
 	execPath, env, childPIDFile := newStubbornCodex(t)
 	foreignStream, err := (&agent{
@@ -32,7 +63,12 @@ func TestAgentCloseKillsStubbornProcessGroupDescendant(t *testing.T) {
 		t.Fatalf("Spawn() error = %v", err)
 	}
 	impl := foreignStream.(*stream)
-	t.Cleanup(func() { _ = syscall.Kill(-impl.pgid, syscall.SIGKILL) })
+	leaderUnreaped := true
+	t.Cleanup(func() {
+		if leaderUnreaped {
+			_ = syscall.Kill(-impl.pgid, syscall.SIGKILL)
+		}
+	})
 
 	select {
 	case event, ok := <-foreignStream.Events():
@@ -43,7 +79,13 @@ func TestAgentCloseKillsStubbornProcessGroupDescendant(t *testing.T) {
 		t.Fatal("timed out waiting for stubborn process startup")
 	}
 	childPID := readPID(t, childPIDFile)
-	_ = foreignStream.Close()
+	closeErr := foreignStream.Close()
+	// Close has reaped the leader, so its numeric PGID is no longer safe to
+	// target from cleanup even when Close reported a decode or exit error.
+	leaderUnreaped = false
+	if closeErr != nil {
+		t.Fatalf("Close() error = %v", closeErr)
+	}
 	assertProcessGone(t, childPID)
 }
 
@@ -100,6 +142,24 @@ func newStubbornCodex(t *testing.T) (string, []string, string) {
 		"CHILD_PID_FILE=" + childPIDFile,
 		"CHILD_READY_FILE=" + childReadyFile,
 	}, childPIDFile
+}
+
+func newCooperativeCodex(t *testing.T) (string, []string) {
+	t.Helper()
+	testBinary, err := os.Executable()
+	if err != nil {
+		t.Fatalf("test executable: %v", err)
+	}
+	dir := t.TempDir()
+	execPath := filepath.Join(dir, "codex")
+	script := "#!/bin/sh\nexec \"$TEST_BINARY\" -test.run='^TestCodexCooperativeLeaderHelper$' --\n"
+	if err := os.WriteFile(execPath, []byte(script), 0o755); err != nil {
+		t.Fatalf("write cooperative codex wrapper: %v", err)
+	}
+	return execPath, []string{
+		"GO_WANT_CODEX_COOPERATIVE_HELPER=1",
+		"TEST_BINARY=" + testBinary,
+	}
 }
 
 func readPID(t *testing.T, path string) int {
