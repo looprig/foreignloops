@@ -42,7 +42,7 @@ func validateRuntimeWiring(
 		return &ConfigError{Field: "idGen", Reason: "required"}
 	case fac == nil:
 		return &ConfigError{Field: "fac", Reason: "required"}
-	case pub == nil:
+	case nilLike(pub):
 		return &ConfigError{Field: "pub", Reason: "required"}
 	default:
 		return nil

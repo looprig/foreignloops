@@ -18,6 +18,14 @@ func (stubAgent) Spawn(context.Context, driver.Turn) (driver.Stream, error) {
 	panic("stubAgent.Spawn must not be called while validating configuration")
 }
 
+type typedNilAgent struct{}
+
+func (*typedNilAgent) Spawn(context.Context, driver.Turn) (driver.Stream, error) {
+	panic("typedNilAgent.Spawn must never be called")
+}
+
+var _ driver.Agent = (*typedNilAgent)(nil)
+
 func validConfig() backend.Config {
 	return backend.Config{
 		Agent:   stubAgent{},
@@ -77,6 +85,26 @@ func TestBuildWithEagerlyValidatesConfig(t *testing.T) {
 				t.Fatalf("ConfigError.Field = %q, want %q", cfgErr.Field, tt.wantField)
 			}
 		})
+	}
+}
+
+func TestBuildWithRejectsTypedNilAgent(t *testing.T) {
+	t.Parallel()
+
+	var agent *typedNilAgent
+	cfg := validConfig()
+	cfg.Agent = agent
+
+	got, sid, err := backend.BuildWith(cfg)(context.Background(), uuid.UUID{}, uuid.UUID{}, loop.Provenance{}, nil, nil, nil, nil)
+	if got != nil {
+		t.Fatalf("BuildWith typed-nil agent returned non-nil Backend %T", got)
+	}
+	if sid != "" {
+		t.Fatalf("BuildWith typed-nil agent sid = %q, want empty", sid)
+	}
+	var cfgErr *backend.ConfigError
+	if !errors.As(err, &cfgErr) || cfgErr.Field != "Config.Agent" || cfgErr.Reason != "required" {
+		t.Fatalf("BuildWith typed-nil agent error = %T %v, want ConfigError Config.Agent required", err, err)
 	}
 }
 

@@ -8,6 +8,7 @@ import (
 	"github.com/looprig/core/content"
 	"github.com/looprig/core/uuid"
 	"github.com/looprig/foreignloop/driver"
+	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/harness/pkg/foreign"
 	"github.com/looprig/harness/pkg/loop"
 )
@@ -29,6 +30,18 @@ func validRestoredSeed() foreign.RestoredForeign {
 		Msgs:       content.AgenticMessages{aiMessage("first"), aiMessage("second")},
 	}
 }
+
+type typedNilPublisher struct{}
+
+func (*typedNilPublisher) PublishEvent(context.Context, event.Event) error {
+	panic("typedNilPublisher.PublishEvent must never be called")
+}
+
+func (*typedNilPublisher) PublishEventChecked(context.Context, event.Event) error {
+	panic("typedNilPublisher.PublishEventChecked must never be called")
+}
+
+var _ foreign.EventPublisher = (*typedNilPublisher)(nil)
 
 func TestBuildRestoredWithReturnsHarnessBuilder(t *testing.T) {
 	t.Parallel()
@@ -125,6 +138,30 @@ func TestRestoreConstructionValidation(t *testing.T) {
 				t.Fatalf("ConfigError.Field = %q, want %q", configErr.Field, tt.wantField)
 			}
 		})
+	}
+}
+
+func TestBuildRestoredWithRejectsTypedNilPublisher(t *testing.T) {
+	t.Parallel()
+
+	var pub *typedNilPublisher
+	got, err := BuildRestoredWith(restoredValidConfig(t))(
+		context.Background(),
+		mustID(t),
+		mustID(t),
+		loop.Provenance{},
+		pub,
+		validBoundDefinition(),
+		seqIDGen(),
+		workingFac(),
+		validRestoredSeed(),
+	)
+	if got != nil {
+		t.Fatalf("BuildRestoredWith typed-nil publisher returned non-nil Backend %T", got)
+	}
+	var configErr *ConfigError
+	if !errors.As(err, &configErr) || configErr.Field != "pub" || configErr.Reason != "required" {
+		t.Fatalf("BuildRestoredWith typed-nil publisher error = %T %v, want ConfigError pub required", err, err)
 	}
 }
 
