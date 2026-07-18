@@ -71,9 +71,9 @@ require (
 	honnef.co/go/tools v0.7.0 // indirect
 )
 
-// Development-only mappings for the untagged public Harness seam and Harness's
-// unpublished inference dependency. Remove local replaces and require tagged
-// module versions before release.
+// Development-only mappings for the untagged public Harness seam and inference,
+// which is used directly by backend parity tests and provider fakes. Remove local
+// replaces and require tagged module versions before release.
 replace github.com/looprig/harness => ../harness
 
 replace github.com/looprig/inference => ../inference
