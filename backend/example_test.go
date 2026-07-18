@@ -11,12 +11,17 @@ import (
 
 func ExampleBuildWith() {
 	workspace := "/srv/agent-workspace"
-	parentEnv := []string{"PATH=/usr/local/bin:/usr/bin"}
+	// The product provisions this private directory writable by the provider.
+	providerHome := "/srv/looprig/provider-home"
+	parentEnv := []string{
+		"HOME=" + providerHome,
+		"PATH=/usr/local/bin:/usr/bin",
+	}
 	agent, err := claude.NewAgent(parentEnv, claude.Config{
 		ExecPath: "/usr/local/bin/claude",
-		Home:     "/var/empty",
+		Home:     providerHome,
 		Model:    "claude-sonnet-4-20250514",
-		EnvAllow: []string{"PATH"},
+		EnvAllow: []string{"HOME", "PATH"},
 	})
 	if err != nil {
 		fmt.Printf("configure Claude agent: %v\n", err)
