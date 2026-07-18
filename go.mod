@@ -76,8 +76,8 @@ require (
 // module versions before release.
 replace github.com/looprig/harness => ../harness
 
-replace github.com/looprig/inference => ../../../../inference
+replace github.com/looprig/inference => ../inference
 
 // Test-only development mapping used by the compiling Harness composition
 // example. The released module resolves Harness's tagged storage dependency.
-replace github.com/looprig/storage => ../../../../storage
+replace github.com/looprig/storage => ../storage

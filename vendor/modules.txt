@@ -161,7 +161,7 @@ github.com/looprig/harness/pkg/session
 github.com/looprig/harness/pkg/sessionstore
 github.com/looprig/harness/pkg/tool
 github.com/looprig/harness/pkg/workspacestore
-# github.com/looprig/inference v0.3.0 => ../../../../inference
+# github.com/looprig/inference v0.3.0 => ../inference
 ## explicit; go 1.26.4
 github.com/looprig/inference
 github.com/looprig/inference/codec
@@ -176,7 +176,7 @@ github.com/looprig/inference/stream
 github.com/looprig/inference/usage
 github.com/looprig/inference/wire/jsonbody
 github.com/looprig/inference/wire/sse
-# github.com/looprig/storage v0.2.0 => ../../../../storage
+# github.com/looprig/storage v0.2.0 => ../storage
 ## explicit; go 1.25.0
 github.com/looprig/storage
 # github.com/mailru/easyjson v0.9.2
@@ -717,5 +717,5 @@ honnef.co/go/tools/stylecheck/st1022
 honnef.co/go/tools/stylecheck/st1023
 honnef.co/go/tools/unused
 # github.com/looprig/harness => ../harness
-# github.com/looprig/inference => ../../../../inference
-# github.com/looprig/storage => ../../../../storage
+# github.com/looprig/inference => ../inference
+# github.com/looprig/storage => ../storage

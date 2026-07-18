@@ -56,6 +56,37 @@ import _ "github.com/looprig/harness/internal/sessionruntime"
 	}
 }
 
+func TestScanModuleBoundariesRejectsHarnessInternalImportsFromInactiveTests(t *testing.T) {
+	root := t.TempDir()
+	writeBoundaryFixture(t, filepath.Join(root, "backend", "nested", "bad_plan9_test.go"), `//go:build plan9
+
+package nested
+
+import _ "github.com/looprig/harness/internal/sessionruntime"
+`)
+	writeBoundaryFixture(t, filepath.Join(root, "nested-module", "go.mod"), "module example.com/nested\n")
+	writeBoundaryFixture(t, filepath.Join(root, "nested-module", "ignored_test.go"), `package nested
+
+import _ "github.com/looprig/harness/internal/sessionruntime"
+`)
+	writeBoundaryFixture(t, filepath.Join(root, "vendor", "ignored_test.go"), `package vendor
+
+import _ "github.com/looprig/harness/internal/sessionruntime"
+`)
+
+	violations, err := scanModuleBoundaries(root)
+	if err != nil {
+		t.Fatalf("scan synthetic module: %v", err)
+	}
+	wantFile := filepath.Join("backend", "nested", "bad_plan9_test.go")
+	if !hasBoundaryViolation(violations, boundaryHarnessInternalImport, wantFile, "github.com/looprig/harness/internal/sessionruntime") {
+		t.Errorf("violations = %#v, want inactive test Harness-internal import rejection", violations)
+	}
+	if len(violations) != 1 {
+		t.Errorf("len(violations) = %d, want 1: %#v", len(violations), violations)
+	}
+}
+
 func TestModuleBoundaries(t *testing.T) {
 	root := filepath.Clean(filepath.Join("..", ".."))
 	violations, err := scanModuleBoundaries(root)
@@ -108,9 +139,6 @@ func scanModuleBoundaries(root string) ([]boundaryViolation, error) {
 		}
 		if filepath.Dir(rel) == "." {
 			violations = append(violations, boundaryViolation{Kind: boundaryRootGoFile, File: rel})
-			return nil
-		}
-		if strings.HasSuffix(path, "_test.go") {
 			return nil
 		}
 		parsed, err := parser.ParseFile(fset, path, nil, parser.ImportsOnly)
