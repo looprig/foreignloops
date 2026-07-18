@@ -8,7 +8,10 @@ tool (
 	honnef.co/go/tools/cmd/staticcheck
 )
 
-require github.com/looprig/core v0.2.0
+require (
+	github.com/looprig/core v0.2.0
+	github.com/looprig/harness v0.0.0-00010101000000-000000000000
+)
 
 require (
 	cloud.google.com/go v0.123.0 // indirect
@@ -31,6 +34,7 @@ require (
 	github.com/gookit/color v1.6.1 // indirect
 	github.com/gorilla/websocket v1.5.3 // indirect
 	github.com/invopop/jsonschema v0.13.0 // indirect
+	github.com/looprig/inference v0.3.0 // indirect
 	github.com/mailru/easyjson v0.9.2 // indirect
 	github.com/openai/openai-go/v3 v3.37.0 // indirect
 	github.com/securego/gosec/v2 v2.27.1 // indirect
@@ -66,6 +70,9 @@ require (
 	honnef.co/go/tools v0.7.0 // indirect
 )
 
-// Development-only mapping to the untagged public seam in the sibling worktree.
-// Remove this replace and require a tagged Harness version before release.
+// Development-only mappings for the untagged public Harness seam and Harness's
+// unpublished inference dependency. Remove local replaces and require tagged
+// module versions before release.
 replace github.com/looprig/harness => ../harness
+
+replace github.com/looprig/inference => ../../../../inference
