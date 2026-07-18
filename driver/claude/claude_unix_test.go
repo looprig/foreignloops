@@ -121,7 +121,7 @@ func TestClaudeStubbornLeaderHelper(t *testing.T) {
 		fmt.Fprintf(os.Stderr, "start stubborn child: %v\n", err)
 		os.Exit(2)
 	}
-	readyDeadline := time.Now().Add(2 * time.Second)
+	readyDeadline := time.Now().Add(stubbornHelperStartupTimeout)
 	for {
 		if _, err := os.Stat(os.Getenv("CHILD_READY_FILE")); err == nil {
 			break
