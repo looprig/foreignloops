@@ -448,6 +448,9 @@ func TestSnapshotPreservesTopLevelNilAndEmptyMessages(t *testing.T) {
 				t.Fatalf("first snapshot nil = %v, want %v", gotNil, tt.wantNil)
 			}
 			first = append(first, aiMessage("caller mutation"))
+			if len(first) != 1 || firstText(t, first[0]) != "caller mutation" {
+				t.Fatalf("caller append = %#v, want one caller-owned message", first)
+			}
 
 			second, _, err := state.Snapshot(context.Background())
 			if err != nil {
