@@ -24,6 +24,7 @@ var backendAllowedImports = map[string]struct{}{
 	"github.com/looprig/harness/pkg/foreign":  {},
 	"github.com/looprig/harness/pkg/identity": {},
 	"github.com/looprig/harness/pkg/loop":     {},
+	"golang.org/x/sys/unix":                   {},
 }
 
 type backendDependencyViolation struct {

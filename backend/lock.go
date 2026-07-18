@@ -3,31 +3,66 @@ package backend
 import (
 	"crypto/sha256"
 	"encoding/hex"
-	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
-	"syscall"
+	"sync"
 )
 
+const (
+	lockDirectoryName          = "looprig-foreign"
+	durableForeignLockPrefix   = "durable-"
+	temporaryForeignLockPrefix = "temporary-"
+)
+
+// foreignLock owns one kernel lock through its open file description. The
+// stable lock file is never unlinked during normal operation: ownership ends
+// only when release closes the locked descriptor or the process exits.
 type foreignLock struct {
-	path string
+	path        string
+	file        *os.File
+	releaseOnce sync.Once
 }
 
-const temporaryForeignLockPrefix = "unbound-"
+func lockRootPath() string {
+	return filepath.Clean(filepath.Join(os.TempDir(), lockDirectoryName))
+}
 
 func temporaryForeignLockPath(loopID, cwd string) string {
-	return filepath.Join(os.TempDir(), "looprig-foreign", "temporary", hash12(cwd)+"-"+loopID+".lock")
+	return foreignLockPathFor(temporaryForeignLockPrefix, loopID, cwd)
 }
 
 func foreignLockPath(sid, cwd string) string {
-	return filepath.Join(os.TempDir(), "looprig-foreign", hash12(cwd)+"-"+sid+".lock")
+	return foreignLockPathFor(durableForeignLockPrefix, sid, cwd)
 }
 
-func hash12(cwd string) string {
-	sum := sha256.Sum256([]byte(filepath.Clean(cwd)))
-	return hex.EncodeToString(sum[:])[:12]
+// foreignLockPathFor hashes the complete opaque identifier and cleaned
+// workspace path. Neither value can add a path separator or grow the filename.
+func foreignLockPathFor(namespace, identifier, cwd string) string {
+	filename := namespace + digest(filepath.Clean(cwd)) + "-" + digest(identifier) + ".lock"
+	return filepath.Join(lockRootPath(), filename)
+}
+
+func digest(value string) string {
+	sum := sha256.Sum256([]byte(value))
+	return hex.EncodeToString(sum[:])
+}
+
+func validateForeignLockPath(path string) error {
+	root := lockRootPath()
+	cleaned := filepath.Clean(path)
+	relative, err := filepath.Rel(root, cleaned)
+	if err != nil {
+		return err
+	}
+	if relative == "." || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) || filepath.Dir(cleaned) != root {
+		return fmt.Errorf("path %q is outside lock root %q", cleaned, root)
+	}
+	if filepath.Base(cleaned) != relative {
+		return fmt.Errorf("path %q is not an immediate lock-root child", cleaned)
+	}
+	return nil
 }
 
 func acquireForeignLock(sid, cwd string) (*foreignLock, error) {
@@ -43,76 +78,17 @@ func acquireTemporaryForeignLock(loopID, cwd string) (*foreignLock, error) {
 }
 
 func acquireForeignLockPath(path, sid, cwd string) (*foreignLock, error) {
-	dir := filepath.Dir(path)
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return nil, &LockError{Op: "mkdir", Path: dir, Cause: err}
+	if err := validateForeignLockPath(path); err != nil {
+		return nil, &LockError{Op: "validate", Path: path, Cause: err}
 	}
-	lock, err := tryCreateLock(path)
-	if err == nil {
-		return lock, nil
-	}
-	if !errors.Is(err, os.ErrExist) {
-		return nil, err
-	}
-	if pid := readLockPID(path); pid > 0 && processAlive(pid) {
-		return nil, &ForeignSessionBusyError{SID: sid, Cwd: cwd, PID: pid}
-	}
-	_ = os.Remove(path)
-	lock, err = tryCreateLock(path)
-	if err == nil {
-		return lock, nil
-	}
-	if errors.Is(err, os.ErrExist) {
-		return nil, &ForeignSessionBusyError{SID: sid, Cwd: cwd, PID: readLockPID(path)}
-	}
-	return nil, err
+	return acquirePlatformForeignLock(path, sid, cwd)
 }
 
-func tryCreateLock(path string) (*foreignLock, error) {
-	// #nosec G304 -- path is an app-controlled deterministic lock path under
-	// os.TempDir, derived from a hash of the cleaned workspace path.
-	file, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
-	if err != nil {
-		if errors.Is(err, os.ErrExist) {
-			return nil, err
-		}
-		return nil, &LockError{Op: "create", Path: path, Cause: err}
-	}
-	if _, err := file.WriteString(strconv.Itoa(os.Getpid())); err != nil {
-		_ = file.Close()
-		_ = os.Remove(path)
-		return nil, &LockError{Op: "write", Path: path, Cause: err}
-	}
-	if err := file.Close(); err != nil {
-		_ = os.Remove(path)
-		return nil, &LockError{Op: "close", Path: path, Cause: err}
-	}
-	return &foreignLock{path: path}, nil
-}
-
-func readLockPID(path string) int {
-	// #nosec G304 -- deterministic, app-owned lock path; see tryCreateLock.
-	contents, err := os.ReadFile(path)
-	if err != nil {
-		return 0
-	}
-	pid, err := strconv.Atoi(strings.TrimSpace(string(contents)))
-	if err != nil {
-		return 0
-	}
-	return pid
-}
-
-func (l *foreignLock) release() {
-	if err := os.Remove(l.path); err != nil && !errors.Is(err, os.ErrNotExist) {
+func (lock *foreignLock) release() {
+	if lock == nil {
 		return
 	}
-}
-
-func processAlive(pid int) bool {
-	if pid <= 0 {
-		return false
-	}
-	err := syscall.Kill(pid, 0)
-	return err == nil || errors.Is(err, syscall.EPERM)
+	lock.releaseOnce.Do(func() {
+		releasePlatformForeignLock(lock.file)
+	})
 }

@@ -168,7 +168,11 @@ func TestBusyAndStaleDurableLocksAtActorBoundary(t *testing.T) {
 		agent := &fakeAgent{events: []driver.Event{{Kind: driver.KindTerminalOK}}}
 		pub := &fakePublisher{}
 		state, sid := newTestLoop(t, Config{Agent: agent, Cwd: cwd, SIDMode: SIDPrebound}, pub)
-		preWriteLock(t, sid, cwd, strconv.Itoa(os.Getpid()))
+		held, err := acquireForeignLock(sid, cwd)
+		if err != nil {
+			t.Fatalf("hold durable lock: %v", err)
+		}
+		t.Cleanup(func() { cleanupForeignLock(t, held) })
 		submit(t, state, "go")
 		waitFor(t, pub, func(input event.Event) bool { _, ok := input.(event.TurnFailed); return ok })
 		failed := pub.snapshot()[1].(event.TurnFailed)
@@ -186,7 +190,7 @@ func TestBusyAndStaleDurableLocksAtActorBoundary(t *testing.T) {
 		shutdown(t, state)
 	})
 
-	t.Run("stale holder is reclaimed and released", func(t *testing.T) {
+	t.Run("unlocked metadata is reclaimed and kernel lock released", func(t *testing.T) {
 		t.Parallel()
 		cwd := t.TempDir()
 		agent := &fakeAgent{events: []driver.Event{{Kind: driver.KindTerminalOK}}}
@@ -197,17 +201,11 @@ func TestBusyAndStaleDurableLocksAtActorBoundary(t *testing.T) {
 		if agent.calls() != 1 {
 			t.Fatalf("agent spawn calls = %d, want 1", agent.calls())
 		}
-		deadline := time.Now().Add(3 * time.Second)
-		for {
-			_, err := os.Stat(foreignLockPath(sid, cwd))
-			if errors.Is(err, os.ErrNotExist) {
-				break
-			}
-			if time.Now().After(deadline) {
-				t.Fatalf("durable lock was not released: %v", err)
-			}
-			time.Sleep(time.Millisecond)
+		contender, err := acquireForeignLock(sid, cwd)
+		if err != nil {
+			t.Fatalf("durable kernel lock was not released: %v", err)
 		}
+		cleanupForeignLock(t, contender)
 		shutdown(t, state)
 	})
 }

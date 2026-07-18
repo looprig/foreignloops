@@ -2,7 +2,9 @@ package backend
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"sync"
 	"testing"
 
 	"github.com/looprig/core/content"
@@ -220,6 +222,207 @@ func TestRestoreConstructionClonesSnapshotSeed(t *testing.T) {
 	if cloneMessages(nil) != nil {
 		t.Fatal("cloneMessages(nil) must preserve nil")
 	}
+}
+
+func richMessages() content.AgenticMessages {
+	return content.AgenticMessages{
+		&content.UserMessage{Message: content.Message{
+			Role: content.RoleUser,
+			Blocks: []content.Block{
+				&content.TextBlock{Text: "original-text"},
+				&content.ImageBlock{MediaType: content.MediaTypeImagePNG, Source: content.ImageSource{URL: "https://example.test/image", Data: []byte{1, 2, 3}}},
+				&content.AudioBlock{MediaType: content.MediaTypeAudioWAV, Data: []byte{4, 5, 6}},
+				&content.DocumentBlock{MediaType: content.MediaTypeDocumentPDF, Name: "original.pdf", Data: []byte{7, 8, 9}, Text: "original-document"},
+				&content.ThinkingBlock{Thinking: "original-thinking", Signature: "original-signature"},
+				&content.ToolUseBlock{ID: "tool-1", Name: "original-tool", Input: json.RawMessage(`{"map":{"nested":"original"}}`)},
+				&content.ToolResultBlock{ToolUseID: "tool-1", Content: []content.Block{
+					&content.TextBlock{Text: "original-result"},
+					&content.ImageBlock{Source: content.ImageSource{Data: []byte{10, 11}}},
+					&content.ToolUseBlock{ID: "nested-tool", Input: json.RawMessage(`{"nested":true}`)},
+				}, IsError: true},
+			},
+		}},
+		&content.AIMessage{
+			Message: content.Message{Role: content.RoleAssistant, Blocks: []content.Block{&content.TextBlock{Text: "original-ai"}}},
+			Usage: &content.Usage{
+				InputTokens:         11,
+				OutputTokens:        7,
+				CacheReadTokens:     3,
+				CacheCreationTokens: 2,
+				ReasoningTokens:     5,
+			},
+		},
+		&content.SystemMessage{Message: content.Message{Role: content.RoleSystem, Blocks: []content.Block{&content.TextBlock{Text: "original-system"}}}},
+		&content.ToolResultMessage{
+			Message:   content.Message{Role: content.RoleTool, Blocks: []content.Block{&content.TextBlock{Text: "original-tool-message"}}},
+			ToolUseID: "tool-message-1",
+			IsError:   true,
+		},
+	}
+}
+
+func mutateRichMessages(messages content.AgenticMessages) {
+	user := messages[0].(*content.UserMessage)
+	user.Role = content.RoleSystem
+	user.Blocks[0].(*content.TextBlock).Text = "mutated-text"
+	user.Blocks[1].(*content.ImageBlock).Source.Data[0] = 99
+	user.Blocks[2].(*content.AudioBlock).Data[0] = 99
+	user.Blocks[3].(*content.DocumentBlock).Data[0] = 99
+	user.Blocks[3].(*content.DocumentBlock).Text = "mutated-document"
+	user.Blocks[4].(*content.ThinkingBlock).Thinking = "mutated-thinking"
+	user.Blocks[5].(*content.ToolUseBlock).Input[0] = '['
+	result := user.Blocks[6].(*content.ToolResultBlock)
+	result.Content[0].(*content.TextBlock).Text = "mutated-result"
+	result.Content[1].(*content.ImageBlock).Source.Data[0] = 99
+	result.Content[2].(*content.ToolUseBlock).Input[0] = '['
+
+	ai := messages[1].(*content.AIMessage)
+	ai.Blocks[0].(*content.TextBlock).Text = "mutated-ai"
+	ai.Usage.InputTokens = 999
+	messages[2].(*content.SystemMessage).Blocks[0].(*content.TextBlock).Text = "mutated-system"
+	toolMessage := messages[3].(*content.ToolResultMessage)
+	toolMessage.Blocks[0].(*content.TextBlock).Text = "mutated-tool-message"
+	toolMessage.ToolUseID = "mutated-tool-id"
+}
+
+func assertRichMessagesOriginal(t *testing.T, messages content.AgenticMessages) {
+	t.Helper()
+	if len(messages) != 4 {
+		t.Fatalf("messages len = %d, want 4", len(messages))
+	}
+	user := messages[0].(*content.UserMessage)
+	if user.Role != content.RoleUser || user.Blocks[0].(*content.TextBlock).Text != "original-text" {
+		t.Fatalf("user message mutated: %#v", user)
+	}
+	if user.Blocks[1].(*content.ImageBlock).Source.Data[0] != 1 || user.Blocks[2].(*content.AudioBlock).Data[0] != 4 {
+		t.Fatal("binary image/audio data mutated")
+	}
+	document := user.Blocks[3].(*content.DocumentBlock)
+	if document.Data[0] != 7 || document.Text != "original-document" {
+		t.Fatalf("document mutated: %#v", document)
+	}
+	if user.Blocks[4].(*content.ThinkingBlock).Thinking != "original-thinking" {
+		t.Fatal("thinking block mutated")
+	}
+	if got := string(user.Blocks[5].(*content.ToolUseBlock).Input); got != `{"map":{"nested":"original"}}` {
+		t.Fatalf("tool input mutated: %s", got)
+	}
+	result := user.Blocks[6].(*content.ToolResultBlock)
+	if result.Content[0].(*content.TextBlock).Text != "original-result" || result.Content[1].(*content.ImageBlock).Source.Data[0] != 10 || string(result.Content[2].(*content.ToolUseBlock).Input) != `{"nested":true}` {
+		t.Fatalf("nested tool result mutated: %#v", result)
+	}
+	ai := messages[1].(*content.AIMessage)
+	if ai.Blocks[0].(*content.TextBlock).Text != "original-ai" || ai.Usage == nil || ai.Usage.InputTokens != 11 {
+		t.Fatalf("AI message or usage mutated: %#v", ai)
+	}
+	if messages[2].(*content.SystemMessage).Blocks[0].(*content.TextBlock).Text != "original-system" {
+		t.Fatal("system message mutated")
+	}
+	toolMessage := messages[3].(*content.ToolResultMessage)
+	if toolMessage.Blocks[0].(*content.TextBlock).Text != "original-tool-message" || toolMessage.ToolUseID != "tool-message-1" {
+		t.Fatalf("tool result message mutated: %#v", toolMessage)
+	}
+}
+
+func TestRestoreConstructionDeepClonesSeed(t *testing.T) {
+	t.Parallel()
+	seed := foreign.RestoredForeign{ForeignSID: "deep-seed", TurnIndex: 9, Msgs: richMessages()}
+	state, err := newRestoredState(context.Background(), mustID(t), mustID(t), loop.Provenance{}, &fakePublisher{}, validBoundDefinition(), restoredValidConfig(t), seqIDGen(), workingFac(), seed)
+	if err != nil {
+		t.Fatalf("newRestoredState: %v", err)
+	}
+	mutateRichMessages(seed.Msgs)
+	assertRichMessagesOriginal(t, state.msgs)
+}
+
+func TestDeepClonePreservesNilAndEmptyShape(t *testing.T) {
+	t.Parallel()
+	emptyBlocks := []content.Block{}
+	emptyRaw := json.RawMessage{}
+	emptyBytes := []byte{}
+	messages := content.AgenticMessages{
+		nil,
+		&content.UserMessage{Message: content.Message{Role: content.RoleUser, Blocks: emptyBlocks}},
+		&content.AIMessage{Message: content.Message{Role: content.RoleAssistant, Blocks: []content.Block{
+			&content.ToolUseBlock{Input: emptyRaw},
+			&content.AudioBlock{Data: emptyBytes},
+		}}},
+	}
+	cloned := cloneMessages(messages)
+	if cloned[0] != nil {
+		t.Fatalf("nil conversation cloned as %T", cloned[0])
+	}
+	if cloned[1].(*content.UserMessage).Blocks == nil {
+		t.Fatal("non-nil empty block slice became nil")
+	}
+	blocks := cloned[2].(*content.AIMessage).Blocks
+	if blocks[0].(*content.ToolUseBlock).Input == nil {
+		t.Fatal("non-nil empty json.RawMessage became nil")
+	}
+	if blocks[1].(*content.AudioBlock).Data == nil {
+		t.Fatal("non-nil empty byte slice became nil")
+	}
+}
+
+func TestSnapshotDeepClonesActorStateAndOtherSnapshots(t *testing.T) {
+	t.Parallel()
+	seed := foreign.RestoredForeign{ForeignSID: "deep-snapshot", TurnIndex: 9, Msgs: richMessages()}
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	built, err := BuildRestoredWith(restoredValidConfig(t))(ctx, mustID(t), mustID(t), loop.Provenance{}, &fakePublisher{}, validBoundDefinition(), seqIDGen(), workingFac(), seed)
+	if err != nil {
+		t.Fatalf("BuildRestoredWith: %v", err)
+	}
+	state := built.(*Loop)
+	t.Cleanup(func() { shutdown(t, state) })
+
+	first, _, err := state.Snapshot(context.Background())
+	if err != nil {
+		t.Fatalf("first Snapshot: %v", err)
+	}
+	mutateRichMessages(first)
+	second, _, err := state.Snapshot(context.Background())
+	if err != nil {
+		t.Fatalf("second Snapshot: %v", err)
+	}
+	assertRichMessagesOriginal(t, second)
+	assertRichMessagesOriginal(t, state.msgs)
+}
+
+func TestSnapshotMutationDoesNotRaceActorState(t *testing.T) {
+	seed := foreign.RestoredForeign{ForeignSID: "deep-race", TurnIndex: 9, Msgs: richMessages()}
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	built, err := BuildRestoredWith(restoredValidConfig(t))(ctx, mustID(t), mustID(t), loop.Provenance{}, &fakePublisher{}, validBoundDefinition(), seqIDGen(), workingFac(), seed)
+	if err != nil {
+		t.Fatalf("BuildRestoredWith: %v", err)
+	}
+	state := built.(*Loop)
+	t.Cleanup(func() { shutdown(t, state) })
+
+	first, _, err := state.Snapshot(context.Background())
+	if err != nil {
+		t.Fatalf("Snapshot: %v", err)
+	}
+	start := make(chan struct{})
+	var mutator sync.WaitGroup
+	mutator.Add(1)
+	go func() {
+		defer mutator.Done()
+		<-start
+		for range 200 {
+			mutateRichMessages(first)
+		}
+	}()
+	close(start)
+	for range 50 {
+		snapshot, _, err := state.Snapshot(context.Background())
+		if err != nil {
+			t.Fatalf("concurrent Snapshot: %v", err)
+		}
+		assertRichMessagesOriginal(t, snapshot)
+	}
+	mutator.Wait()
 }
 
 func TestUnstartedRestoredStateSnapshotFailsOnCallerContext(t *testing.T) {

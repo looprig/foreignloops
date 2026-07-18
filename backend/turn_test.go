@@ -793,7 +793,11 @@ func TestLateBoundFirstTurnsUseIndependentTemporaryLocks(t *testing.T) {
 func TestLateBoundTransitionFailurePersistsSIDForBusyResume(t *testing.T) {
 	t.Parallel()
 	cwd := t.TempDir()
-	preWriteLock(t, "busy", cwd, fmt.Sprint(os.Getpid()))
+	held, err := acquireForeignLock("busy", cwd)
+	if err != nil {
+		t.Fatalf("hold durable lock: %v", err)
+	}
+	t.Cleanup(func() { cleanupForeignLock(t, held) })
 	agent := &fakeAgent{events: []driver.Event{{Kind: driver.KindInit, SessionID: "busy"}}}
 	pub := &fakePublisher{}
 	state, _ := newTestLoop(t, Config{Agent: agent, Cwd: cwd, SIDMode: SIDLateBound}, pub)

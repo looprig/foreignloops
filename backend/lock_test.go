@@ -1,12 +1,16 @@
 package backend
 
 import (
+	"bufio"
 	"errors"
+	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -29,6 +33,14 @@ func preWriteLock(t *testing.T, sid, cwd, contents string) {
 		t.Fatalf("pre-write lock: %v", err)
 	}
 	t.Cleanup(func() { _ = os.Remove(path) })
+}
+
+func cleanupForeignLock(t *testing.T, lock *foreignLock) {
+	t.Helper()
+	lock.release()
+	if err := os.Remove(lock.path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("remove stable lock file: %v", err)
+	}
 }
 
 func TestForeignLockPath(t *testing.T) {
@@ -55,8 +67,136 @@ func TestForeignLockPath(t *testing.T) {
 			if !strings.HasPrefix(a, filepath.Join(os.TempDir(), "looprig-foreign")) {
 				t.Fatalf("lock path %q not under looprig-foreign tempdir", a)
 			}
-			if !strings.HasSuffix(a, ".lock") || !strings.Contains(a, tt.sidA) {
-				t.Fatalf("lock path %q missing .lock suffix or sid", a)
+			if !strings.HasSuffix(a, ".lock") || !strings.HasPrefix(filepath.Base(a), durableForeignLockPrefix) {
+				t.Fatalf("lock path %q missing durable namespace or .lock suffix", a)
+			}
+		})
+	}
+}
+
+func TestForeignLockPathContainsHashedOpaqueIdentifiers(t *testing.T) {
+	t.Parallel()
+	cwd := t.TempDir()
+	root := filepath.Clean(filepath.Join(os.TempDir(), "looprig-foreign"))
+	identifiers := []string{
+		"benign-session",
+		"contains/separators\\and-more",
+		"../parent/../../escape",
+		"/absolute/looking/session",
+		strings.Repeat("very-long-session-", 1024),
+		"セッション-🔒-данные",
+	}
+	seen := make(map[string]string)
+	for _, identifier := range identifiers {
+		identifier := identifier
+		t.Run(fmt.Sprintf("length_%d", len(identifier)), func(t *testing.T) {
+			path := filepath.Clean(foreignLockPath(identifier, cwd))
+			rel, err := filepath.Rel(root, path)
+			if err != nil || rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+				t.Fatalf("lock path %q escaped root %q (rel=%q err=%v)", path, root, rel, err)
+			}
+			if filepath.Dir(path) != root {
+				t.Fatalf("lock path %q is not an immediate child of %q", path, root)
+			}
+			base := filepath.Base(path)
+			if strings.Contains(base, identifier) {
+				t.Fatalf("lock filename embeds opaque identifier %q", identifier)
+			}
+			if previous, exists := seen[path]; exists {
+				t.Fatalf("distinct identifiers %q and %q collided at %q", previous, identifier, path)
+			}
+			seen[path] = identifier
+		})
+	}
+
+	if foreignLockPath("benign-a", cwd) == foreignLockPath("benign-b", cwd) {
+		t.Fatal("distinct benign identifiers collided")
+	}
+	if foreignLockPath("same", cwd) != foreignLockPath("same", cwd+string(filepath.Separator)) {
+		t.Fatal("clean-equivalent workspaces must produce the same path")
+	}
+	if foreignLockPath("same", cwd) == temporaryForeignLockPath("same", cwd) {
+		t.Fatal("durable and temporary namespaces collided")
+	}
+}
+
+func TestForeignLockOpaqueIdentifierCannotCreateOutsideRoot(t *testing.T) {
+	t.Parallel()
+	cwd := t.TempDir()
+	outside := t.TempDir()
+	root := filepath.Join(os.TempDir(), "looprig-foreign")
+	legacyPrefixDir := filepath.Join(root, "legacy-prefix")
+	rel, err := filepath.Rel(legacyPrefixDir, filepath.Join(outside, "owned"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	maliciousID := "prefix/" + rel
+	target := filepath.Join(outside, "owned.lock")
+
+	lock, err := acquireForeignLock(maliciousID, cwd)
+	if err != nil {
+		t.Fatalf("acquire hashed malicious identifier: %v", err)
+	}
+	t.Cleanup(func() { cleanupForeignLock(t, lock) })
+	if _, err := os.Stat(target); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("opaque identifier created outside lock root at %q: %v", target, err)
+	}
+	if filepath.Dir(lock.path) != filepath.Clean(root) {
+		t.Fatalf("lock path = %q, want immediate child of %q", lock.path, root)
+	}
+}
+
+func TestForeignLockRejectsSymlinkAndHardlinkFiles(t *testing.T) {
+	t.Parallel()
+	if err := os.MkdirAll(lockRootPath(), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	tests := []struct {
+		name  string
+		stage func(*testing.T, string, string)
+	}{
+		{
+			name: "symlink",
+			stage: func(t *testing.T, target, path string) {
+				if err := os.Symlink(target, path); err != nil {
+					t.Fatalf("create symlink: %v", err)
+				}
+			},
+		},
+		{
+			name: "hardlink",
+			stage: func(t *testing.T, target, path string) {
+				if err := os.Link(target, path); err != nil {
+					t.Fatalf("create hardlink: %v", err)
+				}
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			cwd := t.TempDir()
+			path := foreignLockPath("link-"+tt.name, cwd)
+			t.Cleanup(func() { _ = os.Remove(path) })
+			target := filepath.Join(t.TempDir(), "outside-target")
+			const sentinel = "must remain unchanged"
+			if err := os.WriteFile(target, []byte(sentinel), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			tt.stage(t, target, path)
+
+			lock, err := acquireForeignLock("link-"+tt.name, cwd)
+			if lock != nil {
+				cleanupForeignLock(t, lock)
+				t.Fatal("acquired through linked lock file")
+			}
+			var lockErr *LockError
+			if !errors.As(err, &lockErr) {
+				t.Fatalf("error = %T %v, want LockError", err, err)
+			}
+			contents, readErr := os.ReadFile(target)
+			if readErr != nil || string(contents) != sentinel {
+				t.Fatalf("outside target changed: %q (%v)", contents, readErr)
 			}
 		})
 	}
@@ -72,41 +212,18 @@ func TestTemporaryForeignLockNamespaceDoesNotCollideWithDurableSID(t *testing.T)
 	if err != nil {
 		t.Fatalf("acquire temporary lock: %v", err)
 	}
-	t.Cleanup(temporary.release)
+	t.Cleanup(func() { cleanupForeignLock(t, temporary) })
 	durable, err := acquireForeignLock(foreignSID, cwd)
 	if err != nil {
 		t.Fatalf("acquire durable lock: %v", err)
 	}
-	t.Cleanup(durable.release)
+	t.Cleanup(func() { cleanupForeignLock(t, durable) })
 
 	if temporary.path == durable.path {
 		t.Fatalf("temporary and durable lock paths collide at %q", temporary.path)
 	}
 	if got, want := durable.path, foreignLockPath(foreignSID, cwd); got != want {
 		t.Fatalf("durable path = %q, want %q", got, want)
-	}
-}
-
-func TestProcessAlive(t *testing.T) {
-	t.Parallel()
-	dead := deadPID(t)
-	tests := []struct {
-		name string
-		pid  int
-		want bool
-	}{
-		{name: "self is alive", pid: os.Getpid(), want: true},
-		{name: "zero pid not alive", pid: 0},
-		{name: "negative pid not alive", pid: -1},
-		{name: "reaped child not alive", pid: dead},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
-			if got := processAlive(tt.pid); got != tt.want {
-				t.Fatalf("processAlive(%d) = %v, want %v", tt.pid, got, tt.want)
-			}
-		})
 	}
 }
 
@@ -120,7 +237,7 @@ func TestAcquireForeignLock(t *testing.T) {
 	}{
 		{name: "fresh path acquires"},
 		{name: "second acquire while held is busy", acquireFirst: true, wantBusy: true},
-		{name: "live holder is busy", pre: func(t *testing.T, sid, cwd string) { preWriteLock(t, sid, cwd, strconv.Itoa(os.Getpid())) }, wantBusy: true},
+		{name: "unlocked live pid metadata is reclaimable", pre: func(t *testing.T, sid, cwd string) { preWriteLock(t, sid, cwd, strconv.Itoa(os.Getpid())) }},
 		{name: "stale dead holder reclaimed", pre: func(t *testing.T, sid, cwd string) { preWriteLock(t, sid, cwd, strconv.Itoa(deadPID(t))) }},
 		{name: "malformed pid reclaimed", pre: func(t *testing.T, sid, cwd string) { preWriteLock(t, sid, cwd, "not-a-pid") }},
 		{name: "empty lock reclaimed", pre: func(t *testing.T, sid, cwd string) { preWriteLock(t, sid, cwd, "") }},
@@ -138,7 +255,7 @@ func TestAcquireForeignLock(t *testing.T) {
 				if err != nil {
 					t.Fatalf("first acquire: %v", err)
 				}
-				t.Cleanup(first.release)
+				t.Cleanup(func() { cleanupForeignLock(t, first) })
 			}
 
 			lock, err := acquireForeignLock(sid, cwd)
@@ -155,7 +272,7 @@ func TestAcquireForeignLock(t *testing.T) {
 			if err != nil {
 				t.Fatalf("acquire: %v", err)
 			}
-			t.Cleanup(lock.release)
+			t.Cleanup(func() { cleanupForeignLock(t, lock) })
 			contents, err := os.ReadFile(lock.path)
 			if err != nil {
 				t.Fatalf("read lock: %v", err)
@@ -169,27 +286,169 @@ func TestAcquireForeignLock(t *testing.T) {
 
 func TestForeignLockReleaseIdempotent(t *testing.T) {
 	t.Parallel()
-	for _, acquire := range []bool{true, false} {
-		acquire := acquire
-		t.Run(strconv.FormatBool(acquire), func(t *testing.T) {
-			t.Parallel()
-			sid := "00000000-0000-0000-0000-000000000001"
-			cwd := t.TempDir()
-			var lock *foreignLock
-			if acquire {
-				var err error
-				lock, err = acquireForeignLock(sid, cwd)
-				if err != nil {
-					t.Fatalf("acquire: %v", err)
-				}
-			} else {
-				lock = &foreignLock{path: foreignLockPath(sid, cwd)}
-			}
-			lock.release()
-			lock.release()
-			if _, err := os.Stat(lock.path); !errors.Is(err, os.ErrNotExist) {
-				t.Fatalf("lock file still present after release: %v", err)
-			}
-		})
+	sid := "00000000-0000-0000-0000-000000000001"
+	cwd := t.TempDir()
+	lock, err := acquireForeignLock(sid, cwd)
+	if err != nil {
+		t.Fatalf("acquire: %v", err)
 	}
+	lock.release()
+	lock.release()
+	t.Cleanup(func() { cleanupForeignLock(t, lock) })
+	if info, err := os.Stat(lock.path); err != nil || !info.Mode().IsRegular() {
+		t.Fatalf("stable lock inode removed or replaced after release: %v (%v)", info, err)
+	}
+}
+
+func TestForeignLockOldReleaseCannotAffectSuccessor(t *testing.T) {
+	t.Parallel()
+	sid := "successor-safe"
+	cwd := t.TempDir()
+	first, err := acquireForeignLock(sid, cwd)
+	if err != nil {
+		t.Fatalf("first acquire: %v", err)
+	}
+	first.release()
+
+	successor, err := acquireForeignLock(sid, cwd)
+	if err != nil {
+		t.Fatalf("successor acquire: %v", err)
+	}
+	defer cleanupForeignLock(t, successor)
+
+	var releases sync.WaitGroup
+	for range 32 {
+		releases.Add(1)
+		go func() {
+			defer releases.Done()
+			first.release()
+		}()
+	}
+	releases.Wait()
+
+	contender, err := acquireForeignLock(sid, cwd)
+	if contender != nil {
+		contender.release()
+		t.Fatal("old release unlocked or removed the successor lock")
+	}
+	var busy *ForeignSessionBusyError
+	if !errors.As(err, &busy) {
+		t.Fatalf("contender error = %T %v, want ForeignSessionBusyError", err, err)
+	}
+}
+
+func TestForeignLockOnlyOneConcurrentOwner(t *testing.T) {
+	t.Parallel()
+	const contenders = 32
+	cwd := t.TempDir()
+	start := make(chan struct{})
+	releaseWinner := make(chan struct{})
+	type result struct {
+		lock *foreignLock
+		err  error
+	}
+	results := make(chan result, contenders)
+	for range contenders {
+		go func() {
+			<-start
+			lock, err := acquireForeignLock("concurrent", cwd)
+			results <- result{lock: lock, err: err}
+			if lock != nil {
+				<-releaseWinner
+				lock.release()
+			}
+		}()
+	}
+	close(start)
+	winners := 0
+	for range contenders {
+		result := <-results
+		if result.lock != nil {
+			winners++
+			continue
+		}
+		var busy *ForeignSessionBusyError
+		if !errors.As(result.err, &busy) {
+			t.Fatalf("loser error = %T %v, want ForeignSessionBusyError", result.err, result.err)
+		}
+	}
+	close(releaseWinner)
+	if winners != 1 {
+		t.Fatalf("concurrent winners = %d, want exactly 1", winners)
+	}
+}
+
+func TestForeignLockHelperProcess(t *testing.T) {
+	if os.Getenv("FOREIGNLOOP_LOCK_HELPER") != "1" {
+		return
+	}
+	sid := os.Getenv("FOREIGNLOOP_LOCK_SID")
+	cwd := os.Getenv("FOREIGNLOOP_LOCK_CWD")
+	lock, err := acquireForeignLock(sid, cwd)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "acquire: %v\n", err)
+		os.Exit(2)
+	}
+	defer lock.release()
+	fmt.Printf("locked %d\n", os.Getpid())
+	_, _ = io.Copy(io.Discard, os.Stdin)
+}
+
+func TestForeignLockCrashIsNaturallyReclaimable(t *testing.T) {
+	if os.Getenv("FOREIGNLOOP_LOCK_HELPER") == "1" {
+		return
+	}
+	cwd := t.TempDir()
+	sid := "crash-reclaim"
+	executable, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	command := exec.Command(executable, "-test.run=^TestForeignLockHelperProcess$")
+	command.Env = append(os.Environ(),
+		"FOREIGNLOOP_LOCK_HELPER=1",
+		"FOREIGNLOOP_LOCK_SID="+sid,
+		"FOREIGNLOOP_LOCK_CWD="+cwd,
+	)
+	stdout, err := command.StdoutPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	stdin, err := command.StdinPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stdin.Close()
+	command.Stderr = os.Stderr
+	if err := command.Start(); err != nil {
+		t.Fatal(err)
+	}
+	scanner := bufio.NewScanner(stdout)
+	if !scanner.Scan() || !strings.HasPrefix(scanner.Text(), "locked ") {
+		_ = command.Process.Kill()
+		_ = command.Wait()
+		t.Fatalf("helper did not report lock acquisition: %q (%v)", scanner.Text(), scanner.Err())
+	}
+
+	contender, err := acquireForeignLock(sid, cwd)
+	if contender != nil {
+		contender.release()
+		t.Fatal("parent acquired while helper held lock")
+	}
+	var busy *ForeignSessionBusyError
+	if !errors.As(err, &busy) || busy.PID != command.Process.Pid {
+		t.Fatalf("busy error = %#v (%v), want helper pid %d", busy, err, command.Process.Pid)
+	}
+	if err := command.Process.Kill(); err != nil {
+		t.Fatalf("kill helper: %v", err)
+	}
+	if err := command.Wait(); err == nil {
+		t.Fatal("killed helper exited successfully")
+	}
+
+	reclaimed, err := acquireForeignLock(sid, cwd)
+	if err != nil {
+		t.Fatalf("reclaim after helper crash: %v", err)
+	}
+	cleanupForeignLock(t, reclaimed)
 }
