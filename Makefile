@@ -1,4 +1,6 @@
-.PHONY: build test boundary fmt fmt-check root-check vendor vendor-scrub vendor-check lint vuln secure fuzz
+.PHONY: build test boundary fmt fmt-check root-check vendor vendor-scrub vendor-check staticcheck lint vuln secure fuzz
+
+GO ?= go
 
 # Module package directories only. go list skips vendor and nested modules, so
 # gofmt and gosec do not descend into copied dependencies or worktrees.
@@ -56,8 +58,11 @@ vendor-check:
 
 lint: boundary fmt-check
 	go vet ./...
-	go tool staticcheck ./...
+	$(MAKE) staticcheck
 	go tool gosec $(GO_DIRS)
+
+staticcheck:
+	@GO="$(GO)" ./scripts/run-staticcheck.sh
 
 vuln: vendor-check
 	go mod verify
