@@ -224,6 +224,35 @@ func TestRestoreConstructionClonesSnapshotSeed(t *testing.T) {
 	}
 }
 
+func TestRestoreConstructionPreservesTopLevelNilAndEmptyMessages(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		msgs    content.AgenticMessages
+		wantNil bool
+	}{
+		{name: "nil", msgs: nil, wantNil: true},
+		{name: "non-nil empty", msgs: make(content.AgenticMessages, 0)},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			seed := validRestoredSeed()
+			seed.Msgs = tt.msgs
+			state, err := newRestoredState(context.Background(), mustID(t), mustID(t), loop.Provenance{}, &fakePublisher{}, validBoundDefinition(), restoredValidConfig(t), seqIDGen(), workingFac(), seed)
+			if err != nil {
+				t.Fatalf("newRestoredState: %v", err)
+			}
+			if gotNil := state.msgs == nil; gotNil != tt.wantNil {
+				t.Fatalf("restored messages nil = %v, want %v", gotNil, tt.wantNil)
+			}
+			if len(state.msgs) != 0 {
+				t.Fatalf("restored messages len = %d, want 0", len(state.msgs))
+			}
+		})
+	}
+}
+
 func richMessages() content.AgenticMessages {
 	return content.AgenticMessages{
 		&content.UserMessage{Message: content.Message{
@@ -387,6 +416,51 @@ func TestSnapshotDeepClonesActorStateAndOtherSnapshots(t *testing.T) {
 	}
 	assertRichMessagesOriginal(t, second)
 	assertRichMessagesOriginal(t, state.msgs)
+}
+
+func TestSnapshotPreservesTopLevelNilAndEmptyMessages(t *testing.T) {
+	tests := []struct {
+		name    string
+		msgs    content.AgenticMessages
+		wantNil bool
+	}{
+		{name: "nil", msgs: nil, wantNil: true},
+		{name: "non-nil empty", msgs: make(content.AgenticMessages, 0)},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			seed := validRestoredSeed()
+			seed.Msgs = tt.msgs
+			ctx, cancel := context.WithCancel(context.Background())
+			t.Cleanup(cancel)
+			built, err := BuildRestoredWith(restoredValidConfig(t))(ctx, mustID(t), mustID(t), loop.Provenance{}, &fakePublisher{}, validBoundDefinition(), seqIDGen(), workingFac(), seed)
+			if err != nil {
+				t.Fatalf("BuildRestoredWith: %v", err)
+			}
+			state := built.(*Loop)
+			t.Cleanup(func() { shutdown(t, state) })
+
+			first, _, err := state.Snapshot(context.Background())
+			if err != nil {
+				t.Fatalf("first Snapshot: %v", err)
+			}
+			if gotNil := first == nil; gotNil != tt.wantNil {
+				t.Fatalf("first snapshot nil = %v, want %v", gotNil, tt.wantNil)
+			}
+			first = append(first, aiMessage("caller mutation"))
+
+			second, _, err := state.Snapshot(context.Background())
+			if err != nil {
+				t.Fatalf("second Snapshot: %v", err)
+			}
+			if gotNil := second == nil; gotNil != tt.wantNil {
+				t.Fatalf("second snapshot nil = %v, want %v", gotNil, tt.wantNil)
+			}
+			if len(second) != 0 || len(state.msgs) != 0 {
+				t.Fatalf("caller append mutated snapshot/actor lengths to %d/%d", len(second), len(state.msgs))
+			}
+		})
+	}
 }
 
 func TestSnapshotMutationDoesNotRaceActorState(t *testing.T) {

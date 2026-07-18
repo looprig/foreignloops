@@ -19,7 +19,7 @@ type snapshotResult struct {
 }
 
 func cloneMessages(messages content.AgenticMessages) content.AgenticMessages {
-	if len(messages) == 0 {
+	if messages == nil {
 		return nil
 	}
 	cloned := make(content.AgenticMessages, len(messages))
