@@ -1,4 +1,4 @@
-.PHONY: build test fmt fmt-check root-check vendor vendor-scrub vendor-check lint vuln secure fuzz
+.PHONY: build test boundary fmt fmt-check root-check vendor vendor-scrub vendor-check lint vuln secure fuzz
 
 # Module package directories only. go list skips vendor and nested modules, so
 # gofmt and gosec do not descend into copied dependencies or worktrees.
@@ -13,11 +13,14 @@ ifneq ($(wildcard $(VENDOR_DIR)/modules.txt),)
 export GOFLAGS := -mod=vendor
 endif
 
-build: root-check vendor-check
+build: boundary
 	CGO_ENABLED=0 go build -trimpath ./...
 
-test: root-check vendor-check
+test: boundary
 	go test -race ./...
+
+boundary: root-check vendor-check
+	go test ./internal/boundary ./driver/... ./backend -run 'Dependencies|Boundaries|Public|Scan'
 
 fmt:
 	gofmt -w $(GO_DIRS)
@@ -51,7 +54,7 @@ vendor-check:
 		echo "forbidden VCS metadata in $(VENDOR_DIR):"; echo "$$metadata"; exit 1; \
 	fi
 
-lint: root-check fmt-check vendor-check
+lint: boundary fmt-check
 	go vet ./...
 	go tool staticcheck ./...
 	go tool gosec $(GO_DIRS)
