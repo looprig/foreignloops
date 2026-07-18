@@ -26,8 +26,7 @@ func cloneMessages(messages content.AgenticMessages) content.AgenticMessages {
 	return cloned
 }
 
-// Snapshot requests a consistent view from the backend actor. Task 13 starts
-// that actor; until then the public builders continue to fail closed.
+// Snapshot requests a consistent defensive view from the backend actor.
 func (l *Loop) Snapshot(ctx context.Context) (content.AgenticMessages, event.TurnIndex, error) {
 	reply := make(chan snapshotResult, 1)
 	select {

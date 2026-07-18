@@ -12,8 +12,7 @@ import (
 )
 
 // Loop holds the backend actor's immutable dependencies and actor-owned state.
-// Task 12 moves and tests its restore seed construction; Task 13 adds the command
-// channels, actor lifecycle, and loop.Backend methods.
+// Only the run goroutine mutates messages, turn state, binding, and the queue.
 type Loop struct {
 	Commands  chan command.Command
 	Done      chan struct{}
@@ -33,6 +32,7 @@ type Loop struct {
 	turnIndex  event.TurnIndex
 	hasSpawned bool
 	sidBound   bool
+	pending    []preparedInput
 }
 
 func newRestoredState(
@@ -75,30 +75,25 @@ func newRestoredState(
 	}, nil
 }
 
-// BuildRestoredWith adapts restored backend construction to the Harness-owned
-// seam. It preserves true-nil-on-error behavior while the actor and restored
-// state mechanics are moved in the following extraction tasks.
+// BuildRestoredWith constructs and starts an actor from Harness-folded state. It
+// preserves true-nil-on-error behavior at the Harness-owned seam.
 func BuildRestoredWith(backendCfg Config) foreign.RestoredBuilder {
 	return func(
-		_ context.Context,
-		_, _ uuid.UUID,
-		_ loop.Provenance,
+		loopCtx context.Context,
+		sessionID, loopID uuid.UUID,
+		parent loop.Provenance,
 		pub foreign.EventPublisher,
 		loopCfg loop.BoundDefinition,
 		idGen func() (uuid.UUID, error),
 		fac *event.Factory,
 		seed foreign.RestoredForeign,
 	) (loop.Backend, error) {
-		if err := validateConfig(backendCfg); err != nil {
+		state, err := newRestoredState(loopCtx, sessionID, loopID, parent, pub, loopCfg, backendCfg, idGen, fac, seed)
+		if err != nil {
 			return nil, err
 		}
-		if err := validateRuntimeWiring(loopCfg, idGen, fac, pub); err != nil {
-			return nil, err
-		}
-		if err := validateRestoredSeed(seed); err != nil {
-			return nil, err
-		}
-		return nil, errBackendImplementationPending
+		go state.run(loopCtx)
+		return state, nil
 	}
 }
 

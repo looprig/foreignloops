@@ -2,7 +2,6 @@ package backend
 
 import (
 	"context"
-	"errors"
 
 	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/event"
@@ -10,28 +9,23 @@ import (
 	"github.com/looprig/harness/pkg/loop"
 )
 
-var errBackendImplementationPending = errors.New("foreignloop: backend implementation pending")
-
-// BuildWith adapts backend construction to the narrow Harness-owned seam. The
-// concrete actor is added in the following extraction tasks; until then a fully
-// valid invocation fails closed instead of returning a placeholder Backend.
+// BuildWith adapts actor construction to the narrow Harness-owned seam. On
+// construction failure it returns a true nil loop.Backend interface.
 func BuildWith(backendCfg Config) foreign.Builder {
 	return func(
-		_ context.Context,
-		_, _ uuid.UUID,
-		_ loop.Provenance,
+		loopCtx context.Context,
+		sessionID, loopID uuid.UUID,
+		parent loop.Provenance,
 		pub foreign.EventPublisher,
 		loopCfg loop.BoundDefinition,
 		idGen func() (uuid.UUID, error),
 		fac *event.Factory,
 	) (loop.Backend, string, error) {
-		if err := validateConfig(backendCfg); err != nil {
+		state, sid, err := New(loopCtx, sessionID, loopID, parent, pub, loopCfg, backendCfg, idGen, fac)
+		if err != nil {
 			return nil, "", err
 		}
-		if err := validateRuntimeWiring(loopCfg, idGen, fac, pub); err != nil {
-			return nil, "", err
-		}
-		return nil, "", errBackendImplementationPending
+		return state, sid, nil
 	}
 }
 

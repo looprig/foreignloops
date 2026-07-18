@@ -185,7 +185,7 @@ func TestRestoreConstructionClonesSnapshotSeed(t *testing.T) {
 	}
 }
 
-func TestSnapshotBeforeActorMoveFailsOnCallerContext(t *testing.T) {
+func TestUnstartedRestoredStateSnapshotFailsOnCallerContext(t *testing.T) {
 	t.Parallel()
 	state, err := newRestoredState(context.Background(), mustID(t), mustID(t), loop.Provenance{}, &fakePublisher{}, validBoundDefinition(), restoredValidConfig(t), seqIDGen(), workingFac(), validRestoredSeed())
 	if err != nil {
@@ -203,14 +203,47 @@ func TestSnapshotBeforeActorMoveFailsOnCallerContext(t *testing.T) {
 	}
 }
 
-func TestBuildRestoredWithRemainsFailClosedUntilActorMoves(t *testing.T) {
+func TestBuildRestoredWithStartsRestoredActor(t *testing.T) {
 	t.Parallel()
 	build := BuildRestoredWith(restoredValidConfig(t))
-	got, err := build(context.Background(), mustID(t), mustID(t), loop.Provenance{}, &fakePublisher{}, validBoundDefinition(), seqIDGen(), workingFac(), validRestoredSeed())
-	if got != nil {
-		t.Fatalf("BuildRestoredWith before actor move returned non-nil Backend %T", got)
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	got, err := build(ctx, mustID(t), mustID(t), loop.Provenance{}, &fakePublisher{}, validBoundDefinition(), seqIDGen(), workingFac(), validRestoredSeed())
+	if err != nil || got == nil {
+		t.Fatalf("BuildRestoredWith = %T %v, want backend", got, err)
 	}
-	if !errors.Is(err, errBackendImplementationPending) {
-		t.Fatalf("BuildRestoredWith error = %v, want pending sentinel", err)
+	state := got.(*Loop)
+	msgs, turnIndex, err := state.Snapshot(context.Background())
+	if err != nil || turnIndex != validRestoredSeed().TurnIndex || len(msgs) != len(validRestoredSeed().Msgs) {
+		t.Fatalf("restored Snapshot = %v/%d/%v", msgs, turnIndex, err)
 	}
+	shutdown(t, state)
+}
+
+func TestRestoredActorResumesSIDAndAppendsAfterSeed(t *testing.T) {
+	t.Parallel()
+	agent := &fakeAgent{
+		history: driver.History{Available: true, Steps: []content.AgenticMessages{{aiMessage("restored reply")}}},
+		events:  []driver.Event{{Kind: driver.KindTerminalOK, Message: aiMessage("restored reply")}},
+	}
+	cfg := restoredValidConfig(t)
+	cfg.Agent = agent
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	built, err := BuildRestoredWith(cfg)(ctx, mustID(t), mustID(t), loop.Provenance{}, &fakePublisher{}, validBoundDefinition(), seqIDGen(), workingFac(), validRestoredSeed())
+	if err != nil {
+		t.Fatalf("BuildRestoredWith: %v", err)
+	}
+	state := built.(*Loop)
+	submit(t, state, "resume")
+	waitTurnIndex(t, state, validRestoredSeed().TurnIndex+1)
+	turn := agent.lastForeignTurn()
+	if turn.StartNew || turn.ForeignSID != validRestoredSeed().ForeignSID {
+		t.Fatalf("restored turn = {StartNew:%v ForeignSID:%q}", turn.StartNew, turn.ForeignSID)
+	}
+	msgs, _, err := state.Snapshot(context.Background())
+	if err != nil || len(msgs) != len(validRestoredSeed().Msgs)+1 || firstText(t, msgs[len(msgs)-1]) != "restored reply" {
+		t.Fatalf("restored snapshot = %v err %v", msgs, err)
+	}
+	shutdown(t, state)
 }

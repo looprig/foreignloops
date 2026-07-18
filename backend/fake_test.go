@@ -51,8 +51,9 @@ func aiMessage(text string) *content.AIMessage {
 }
 
 type fakePublisher struct {
-	mu     sync.Mutex
-	events []event.Event
+	mu         sync.Mutex
+	events     []event.Event
+	checkedErr error
 }
 
 func (p *fakePublisher) PublishEvent(_ context.Context, ev event.Event) error {
@@ -63,13 +64,154 @@ func (p *fakePublisher) PublishEvent(_ context.Context, ev event.Event) error {
 }
 
 func (p *fakePublisher) PublishEventChecked(ctx context.Context, ev event.Event) error {
+	p.mu.Lock()
+	err := p.checkedErr
+	p.mu.Unlock()
+	if err != nil {
+		return err
+	}
 	return p.PublishEvent(ctx, ev)
 }
 
-type fakeAgent struct{}
+func (p *fakePublisher) snapshot() []event.Event {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return append([]event.Event(nil), p.events...)
+}
 
-func (*fakeAgent) Spawn(context.Context, driver.Turn) (driver.Stream, error) {
-	panic("fakeAgent.Spawn must not be called before Task 13 moves the actor")
+func (p *fakePublisher) count() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return len(p.events)
+}
+
+type fakeStream struct {
+	events     []driver.Event
+	history    driver.History
+	historyErr error
+	closeErr   error
+	block      bool
+	ctx        context.Context
+
+	mu      sync.Mutex
+	order   []string
+	ch      chan driver.Event
+	stop    chan struct{}
+	start   sync.Once
+	closeCh sync.Once
+}
+
+func (s *fakeStream) Events() <-chan driver.Event {
+	s.start.Do(func() {
+		s.ch = make(chan driver.Event)
+		go func() {
+			defer close(s.ch)
+			for _, input := range s.events {
+				select {
+				case s.ch <- input:
+				case <-s.stop:
+					return
+				case <-s.ctx.Done():
+					return
+				}
+			}
+			if s.block {
+				select {
+				case <-s.stop:
+				case <-s.ctx.Done():
+				}
+			}
+		}()
+	})
+	return s.ch
+}
+
+func (s *fakeStream) History() (driver.History, error) {
+	s.mu.Lock()
+	s.order = append(s.order, "history")
+	s.mu.Unlock()
+	return s.history, s.historyErr
+}
+
+func (s *fakeStream) Close() error {
+	s.mu.Lock()
+	s.order = append(s.order, "close")
+	s.mu.Unlock()
+	s.closeCh.Do(func() { close(s.stop) })
+	return s.closeErr
+}
+
+func (s *fakeStream) lifecycle() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]string(nil), s.order...)
+}
+
+type fakeAgent struct {
+	mu sync.Mutex
+
+	spawnErr   error
+	events     []driver.Event
+	history    driver.History
+	historyErr error
+	closeErr   error
+	block      bool
+	onSpawn    func()
+
+	spawnCalls int
+	lastTurn   driver.Turn
+	streams    []*fakeStream
+}
+
+func (a *fakeAgent) Spawn(ctx context.Context, turn driver.Turn) (driver.Stream, error) {
+	a.mu.Lock()
+	a.spawnCalls++
+	a.lastTurn = turn
+	callback := a.onSpawn
+	err := a.spawnErr
+	if err != nil {
+		a.mu.Unlock()
+		if callback != nil {
+			callback()
+		}
+		return nil, err
+	}
+	stream := &fakeStream{
+		events:     append([]driver.Event(nil), a.events...),
+		history:    a.history,
+		historyErr: a.historyErr,
+		closeErr:   a.closeErr,
+		block:      a.block,
+		ctx:        ctx,
+		stop:       make(chan struct{}),
+	}
+	a.streams = append(a.streams, stream)
+	a.mu.Unlock()
+	if callback != nil {
+		callback()
+	}
+	return stream, nil
+}
+
+func (a *fakeAgent) calls() int {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.spawnCalls
+}
+
+func (a *fakeAgent) lastForeignTurn() driver.Turn {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.lastTurn
+}
+
+func (a *fakeAgent) lastStream() *fakeStream {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if len(a.streams) == 0 {
+		return nil
+	}
+	return a.streams[len(a.streams)-1]
 }
 
 type boundTestClient struct{}
