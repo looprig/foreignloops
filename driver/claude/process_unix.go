@@ -1,9 +1,8 @@
-//go:build darwin || linux
+//go:build darwin || (linux && !android)
 
 package claude
 
 import (
-	"errors"
 	"os/exec"
 	"syscall"
 )
@@ -16,4 +15,3 @@ func configureProcessGroup(cmd *exec.Cmd) {
 
 func interruptProcessGroup(pgid int) error { return syscall.Kill(-pgid, syscall.SIGINT) }
 func killProcessGroup(pgid int) error      { return syscall.Kill(-pgid, syscall.SIGKILL) }
-func processGroupMissing(err error) bool   { return errors.Is(err, syscall.ESRCH) }

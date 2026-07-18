@@ -1,4 +1,4 @@
-//go:build darwin || linux
+//go:build darwin || (linux && !android)
 
 package claude
 
@@ -17,6 +17,24 @@ import (
 	"github.com/looprig/core/content"
 	"github.com/looprig/foreignloop/driver"
 )
+
+const promptCloseLimit = 1250 * time.Millisecond
+
+func TestAgentCloseAlreadyCompletedReturnsPromptly(t *testing.T) {
+	t.Parallel()
+	fake := newFakeClaude(t)
+	foreignStream := newFakeAgent(t, fake, Config{Model: "small"})
+	stream, err := foreignStream.Spawn(context.Background(), driver.Turn{
+		Cwd:        t.TempDir(),
+		ForeignSID: testSID,
+		StartNew:   true,
+	})
+	if err != nil {
+		t.Fatalf("Spawn() error = %v", err)
+	}
+	_ = collectEvents(t, stream)
+	assertClosePromptly(t, stream)
+}
 
 func TestAgentSpawnStartExecutesExactProcessBoundary(t *testing.T) {
 	t.Parallel()
@@ -415,6 +433,17 @@ func collectEvents(t *testing.T, stream driver.Stream) []driver.Event {
 			_ = stream.Close()
 			t.Fatal("timed out waiting for stream events")
 		}
+	}
+}
+
+func assertClosePromptly(t *testing.T, stream driver.Stream) {
+	t.Helper()
+	started := time.Now()
+	if err := stream.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+	if elapsed := time.Since(started); elapsed >= promptCloseLimit {
+		t.Fatalf("Close() took %v, want less than %v", elapsed, promptCloseLimit)
 	}
 }
 

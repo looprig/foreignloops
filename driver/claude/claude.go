@@ -129,14 +129,30 @@ func (s *stream) Close() error {
 
 func (s *stream) shutdown() error {
 	s.stopEvents()
-	interruptErr := interruptProcessGroup(s.pgid)
-	if !processGroupMissing(interruptErr) {
-		// Keep the leader unreaped until escalation. Its PID is the process-group
-		// ID, so it cannot be reused while the delayed group signal is pending.
-		timer := time.NewTimer(closeGrace)
-		<-timer.C
+	exited := make(chan struct{})
+	go func() {
+		// A failed observer cannot safely distinguish a running leader from an
+		// exited one, so treat failure as a request for immediate escalation.
+		_ = waitProcessExit(s.pgid)
+		close(exited)
+	}()
+
+	_ = interruptProcessGroup(s.pgid)
+	timer := time.NewTimer(closeGrace)
+	select {
+	case <-exited:
+		if !timer.Stop() {
+			<-timer.C
+		}
+		// The leader has exited but remains unreaped, so its PID still reserves
+		// the process-group ID while any surviving descendants are killed.
 		_ = killProcessGroup(s.pgid)
+	case <-timer.C:
+		// Escalate before waiting: the live leader still owns the numeric PGID.
+		_ = killProcessGroup(s.pgid)
+		<-exited
 	}
+	// This is the only reap, and no process-group signal can occur after it.
 	waitErr := s.cmd.Wait()
 	<-s.eventsDone
 	decodeErr := s.decodeErr()

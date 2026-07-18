@@ -1,4 +1,4 @@
-//go:build darwin || linux
+//go:build darwin || (linux && !android)
 
 package claude
 
@@ -20,6 +20,40 @@ import (
 	"github.com/looprig/foreignloop/driver"
 )
 
+const stubbornHelperStartupTimeout = 10 * time.Second
+
+func TestAgentCloseCooperativeSIGINTReturnsPromptly(t *testing.T) {
+	execPath, env := newCooperativeClaude(t)
+	foreignStream, err := (&agent{
+		execPath: execPath,
+		model:    "small",
+		env:      env,
+	}).Spawn(context.Background(), driver.Turn{Cwd: t.TempDir(), ForeignSID: testSID, StartNew: true})
+	if err != nil {
+		t.Fatalf("Spawn() error = %v", err)
+	}
+	select {
+	case event, ok := <-foreignStream.Events():
+		if !ok || event.Kind != driver.KindInit {
+			t.Fatalf("first event = (%#v, %t), want KindInit", event, ok)
+		}
+	case <-time.After(stubbornHelperStartupTimeout):
+		t.Fatal("timed out waiting for cooperative process startup")
+	}
+	assertClosePromptly(t, foreignStream)
+}
+
+func TestClaudeCooperativeLeaderHelper(t *testing.T) {
+	if os.Getenv("GO_WANT_CLAUDE_COOPERATIVE_HELPER") != "1" {
+		return
+	}
+	interrupt := make(chan os.Signal, 1)
+	signal.Notify(interrupt, os.Interrupt)
+	fmt.Printf("%s\n", `{"type":"system","subtype":"init","session_id":"fake-session"}`)
+	<-interrupt
+	os.Exit(0)
+}
+
 func TestAgentCloseKillsStubbornProcessGroupDescendant(t *testing.T) {
 	t.Parallel()
 	execPath, env, childPIDFile := newStubbornClaude(t)
@@ -32,19 +66,48 @@ func TestAgentCloseKillsStubbornProcessGroupDescendant(t *testing.T) {
 		t.Fatalf("Spawn() error = %v", err)
 	}
 	impl := foreignStream.(*stream)
-	t.Cleanup(func() { _ = syscall.Kill(-impl.pgid, syscall.SIGKILL) })
+	leaderUnreaped := true
+	t.Cleanup(func() {
+		if leaderUnreaped {
+			_ = syscall.Kill(-impl.pgid, syscall.SIGKILL)
+		}
+	})
 
 	select {
 	case event, ok := <-foreignStream.Events():
 		if !ok || event.Kind != driver.KindInit {
 			t.Fatalf("first event = (%#v, %t), want KindInit", event, ok)
 		}
-	case <-time.After(2 * time.Second):
+	case <-time.After(stubbornHelperStartupTimeout):
 		t.Fatal("timed out waiting for stubborn process startup")
 	}
 	childPID := readStubbornPID(t, childPIDFile)
-	_ = foreignStream.Close()
+	closeErr := foreignStream.Close()
+	// Close has reaped the leader, so its numeric PGID is no longer safe to
+	// target from cleanup even when Close reported a decode or exit error.
+	leaderUnreaped = false
+	if closeErr != nil {
+		t.Fatalf("Close() error = %v", closeErr)
+	}
 	assertStubbornProcessGone(t, childPID)
+}
+
+func newCooperativeClaude(t *testing.T) (string, []string) {
+	t.Helper()
+	testBinary, err := os.Executable()
+	if err != nil {
+		t.Fatalf("test executable: %v", err)
+	}
+	dir := t.TempDir()
+	execPath := filepath.Join(dir, "claude")
+	script := "#!/bin/sh\nexec \"$TEST_BINARY\" -test.run='^TestClaudeCooperativeLeaderHelper$' --\n"
+	if err := os.WriteFile(execPath, []byte(script), 0o755); err != nil {
+		t.Fatalf("write cooperative claude wrapper: %v", err)
+	}
+	return execPath, []string{
+		"GO_WANT_CLAUDE_COOPERATIVE_HELPER=1",
+		"TEST_BINARY=" + testBinary,
+	}
 }
 
 func TestClaudeStubbornLeaderHelper(t *testing.T) {
@@ -104,7 +167,7 @@ func newStubbornClaude(t *testing.T) (string, []string, string) {
 
 func readStubbornPID(t *testing.T, path string) int {
 	t.Helper()
-	deadline := time.Now().Add(2 * time.Second)
+	deadline := time.Now().Add(stubbornHelperStartupTimeout)
 	for time.Now().Before(deadline) {
 		raw, err := os.ReadFile(path)
 		if err == nil {

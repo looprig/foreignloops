@@ -1,10 +1,11 @@
-//go:build !darwin && !linux
+//go:build !darwin && (!linux || android)
 
 package claude
 
 import (
 	"context"
 	"errors"
+	"path/filepath"
 	"runtime"
 	"testing"
 
@@ -12,7 +13,11 @@ import (
 )
 
 func TestUnsupportedPlatformFailsBeforeSpawn(t *testing.T) {
-	agent, err := NewAgent(nil, Config{ExecPath: "claude", Model: "small"})
+	execPath, err := filepath.Abs("claude")
+	if err != nil {
+		t.Fatalf("absolute executable path: %v", err)
+	}
+	agent, err := NewAgent(nil, Config{ExecPath: execPath, Model: "small"})
 	if err != nil {
 		t.Fatalf("NewAgent() error = %v", err)
 	}
