@@ -1,4 +1,10 @@
 // Package driver defines provider-neutral contracts for foreign agents.
+//
+// A concrete provider constructor returns an Agent. The product composition
+// root combines that agent with backend configuration and installs the resulting
+// builders through Harness. Per-turn prompts, workspace, permission posture,
+// session selection, normalized events, and authoritative history cross this
+// package boundary; provider wire formats and transcript paths do not.
 package driver
 
 import (

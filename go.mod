@@ -11,6 +11,7 @@ tool (
 require (
 	github.com/looprig/core v0.2.0
 	github.com/looprig/harness v0.0.0-00010101000000-000000000000
+	github.com/looprig/inference v0.3.0
 	golang.org/x/sys v0.45.0
 )
 
@@ -35,7 +36,7 @@ require (
 	github.com/gookit/color v1.6.1 // indirect
 	github.com/gorilla/websocket v1.5.3 // indirect
 	github.com/invopop/jsonschema v0.13.0 // indirect
-	github.com/looprig/inference v0.3.0 // indirect
+	github.com/looprig/storage v0.2.0 // indirect
 	github.com/mailru/easyjson v0.9.2 // indirect
 	github.com/openai/openai-go/v3 v3.37.0 // indirect
 	github.com/securego/gosec/v2 v2.27.1 // indirect
@@ -76,3 +77,7 @@ require (
 replace github.com/looprig/harness => ../harness
 
 replace github.com/looprig/inference => ../../../../inference
+
+// Test-only development mapping used by the compiling Harness composition
+// example. The released module resolves Harness's tagged storage dependency.
+replace github.com/looprig/storage => ../../../../storage

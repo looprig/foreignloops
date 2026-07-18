@@ -1,0 +1,37 @@
+package backend_test
+
+import (
+	"fmt"
+
+	"github.com/looprig/foreignloop/backend"
+	"github.com/looprig/foreignloop/driver"
+	"github.com/looprig/foreignloop/driver/claude"
+	"github.com/looprig/harness/pkg/rig"
+)
+
+func ExampleBuildWith() {
+	workspace := "/srv/agent-workspace"
+	parentEnv := []string{"PATH=/usr/local/bin:/usr/bin"}
+	agent, err := claude.NewAgent(parentEnv, claude.Config{
+		ExecPath: "/usr/local/bin/claude",
+		Home:     "/var/empty",
+		Model:    "claude-sonnet-4-20250514",
+		EnvAllow: []string{"PATH"},
+	})
+	if err != nil {
+		fmt.Printf("configure Claude agent: %v\n", err)
+		return
+	}
+
+	cfg := backend.Config{
+		Agent:   agent,
+		Cwd:     workspace,
+		Posture: driver.PostureAcceptEdits,
+		SIDMode: backend.SIDPrebound,
+	}
+	option := rig.WithForeignBuilders(
+		backend.BuildWith(cfg),
+		backend.BuildRestoredWith(cfg),
+	)
+	_ = option // Apply this option at the product's Harness composition root.
+}

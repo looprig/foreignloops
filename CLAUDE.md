@@ -17,6 +17,8 @@ The only approved external packages are:
 
 - `github.com/looprig/core` — shared content and UUID values
 - `github.com/looprig/harness` — public foreign, loop, command, event, and identity contracts
+- `github.com/looprig/storage` — test-only transitive dependency of the compiling
+  Harness rig composition example
 - `golang.org/x/sys` — supported Darwin/Linux no-follow, open-relative, and
   advisory `flock` primitives for backend lock ownership
 - `github.com/securego/gosec/v2` — security static analysis (development tool only)
