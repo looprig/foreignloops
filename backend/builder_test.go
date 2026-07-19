@@ -6,7 +6,7 @@ import (
 	"testing"
 
 	"github.com/looprig/core/uuid"
-	"github.com/looprig/foreignloop/backend"
+	"github.com/looprig/foreignloops/backend"
 	"github.com/looprig/harness/pkg/foreign"
 	"github.com/looprig/harness/pkg/loop"
 )

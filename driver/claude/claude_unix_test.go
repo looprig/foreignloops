@@ -17,7 +17,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/looprig/foreignloop/driver"
+	"github.com/looprig/foreignloops/driver"
 )
 
 const stubbornHelperStartupTimeout = 10 * time.Second

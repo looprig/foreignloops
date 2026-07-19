@@ -5,7 +5,7 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/looprig/foreignloop/backend"
+	"github.com/looprig/foreignloops/backend"
 )
 
 func TestBackendErrorMessagesAndUnwrap(t *testing.T) {

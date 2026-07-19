@@ -14,7 +14,7 @@ import (
 	"time"
 
 	"github.com/looprig/core/content"
-	"github.com/looprig/foreignloop/driver"
+	"github.com/looprig/foreignloops/driver"
 )
 
 // Agent must satisfy the foreign-agent port.
@@ -570,7 +570,7 @@ func waitForBlockedDecoderSend(t *testing.T) {
 	for time.Now().Before(deadline) {
 		n := runtime.Stack(buf, true)
 		stacks := string(buf[:n])
-		if strings.Contains(stacks, "github.com/looprig/foreignloop/driver/codex.decodeJSONL.func") &&
+		if strings.Contains(stacks, "github.com/looprig/foreignloops/driver/codex.decodeJSONL.func") &&
 			(strings.Contains(stacks, "[chan send]") || strings.Contains(stacks, "[select]")) {
 			return
 		}

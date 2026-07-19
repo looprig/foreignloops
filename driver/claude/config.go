@@ -5,7 +5,7 @@ import (
 	"os/exec"
 	"path/filepath"
 
-	"github.com/looprig/foreignloop/driver"
+	"github.com/looprig/foreignloops/driver"
 )
 
 // CommandWrapper confines a fully configured child command before pipe

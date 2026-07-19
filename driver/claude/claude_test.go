@@ -15,7 +15,7 @@ import (
 	"time"
 
 	"github.com/looprig/core/content"
-	"github.com/looprig/foreignloop/driver"
+	"github.com/looprig/foreignloops/driver"
 )
 
 const promptCloseLimit = 1250 * time.Millisecond
@@ -466,7 +466,7 @@ func waitForForwarderBlock(t *testing.T) {
 	for time.Now().Before(deadline) {
 		n := runtime.Stack(buf, true)
 		stacks := string(buf[:n])
-		if strings.Contains(stacks, "github.com/looprig/foreignloop/driver/claude.forwardEvents") && strings.Contains(stacks, "[select]") {
+		if strings.Contains(stacks, "github.com/looprig/foreignloops/driver/claude.forwardEvents") && strings.Contains(stacks, "[select]") {
 			return
 		}
 		time.Sleep(10 * time.Millisecond)

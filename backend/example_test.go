@@ -3,9 +3,9 @@ package backend_test
 import (
 	"fmt"
 
-	"github.com/looprig/foreignloop/backend"
-	"github.com/looprig/foreignloop/driver"
-	"github.com/looprig/foreignloop/driver/claude"
+	"github.com/looprig/foreignloops/backend"
+	"github.com/looprig/foreignloops/driver"
+	"github.com/looprig/foreignloops/driver/claude"
 	"github.com/looprig/harness/pkg/rig"
 )
 

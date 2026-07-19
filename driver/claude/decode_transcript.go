@@ -9,7 +9,7 @@ import (
 	"path/filepath"
 
 	"github.com/looprig/core/content"
-	"github.com/looprig/foreignloop/driver"
+	"github.com/looprig/foreignloops/driver"
 )
 
 type transcriptRecord struct {

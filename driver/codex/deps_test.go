@@ -17,7 +17,7 @@ func TestCodexProductionDependencies(t *testing.T) {
 	}
 	allowed := map[string]bool{
 		"github.com/looprig/core/content":       true,
-		"github.com/looprig/foreignloop/driver": true,
+		"github.com/looprig/foreignloops/driver": true,
 	}
 	fset := token.NewFileSet()
 	for _, file := range files {

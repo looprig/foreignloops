@@ -14,7 +14,7 @@ integrated.
 
 The Harness release must contain `pkg/foreign` and must not contain
 `pkg/foreignloop`, a concrete foreign backend, or a dependency on
-`github.com/looprig/foreignloop`.
+`github.com/looprig/foreignloops`.
 
 ```sh
 HARNESS_DIR=/Users/ipotter/code/looprig/harness/.worktrees/foreignloop-extraction/harness
@@ -24,7 +24,7 @@ HARNESS_REMOTE=...    # required: authorized push remote
 cd "$HARNESS_DIR"
 test -d pkg/foreign
 test ! -e pkg/foreignloop
-! rg -n 'github.com/looprig/foreignloop' --glob '*.go' --glob 'go.mod' .
+! rg -n 'github.com/looprig/foreignloops' --glob '*.go' --glob 'go.mod' .
 
 # Prepare release metadata from the already tagged dependency versions. These
 # development replacements are removed on the release branch, not in the
@@ -125,12 +125,12 @@ TESTS_DIR=/Users/ipotter/code/looprig/harness/.worktrees/foreignloop-extraction/
 cd "$TESTS_DIR"
 cp go.mod go.release.mod
 go mod edit -modfile=go.release.mod -require="github.com/looprig/harness@$HARNESS_TAG"
-go mod edit -modfile=go.release.mod -require="github.com/looprig/foreignloop@$FOREIGNLOOP_TAG"
+go mod edit -modfile=go.release.mod -require="github.com/looprig/foreignloops@$FOREIGNLOOP_TAG"
 go mod edit -modfile=go.release.mod -dropreplace=github.com/looprig/core
 go mod edit -modfile=go.release.mod -dropreplace=github.com/looprig/inference
 go mod edit -modfile=go.release.mod -dropreplace=github.com/looprig/storage
 go mod edit -modfile=go.release.mod -dropreplace=github.com/looprig/harness
-go mod edit -modfile=go.release.mod -dropreplace=github.com/looprig/foreignloop
+go mod edit -modfile=go.release.mod -dropreplace=github.com/looprig/foreignloops
 go mod edit -modfile=go.release.mod -dropreplace=github.com/looprig/fsstore
 go mod edit -modfile=go.release.mod -dropreplace=github.com/looprig/mcp
 GOWORK=off go mod tidy -modfile=go.release.mod

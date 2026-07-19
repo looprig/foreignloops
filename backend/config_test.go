@@ -7,8 +7,8 @@ import (
 	"testing"
 
 	"github.com/looprig/core/uuid"
-	"github.com/looprig/foreignloop/backend"
-	"github.com/looprig/foreignloop/driver"
+	"github.com/looprig/foreignloops/backend"
+	"github.com/looprig/foreignloops/driver"
 	"github.com/looprig/harness/pkg/loop"
 )
 

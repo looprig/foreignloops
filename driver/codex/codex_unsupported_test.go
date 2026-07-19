@@ -9,7 +9,7 @@ import (
 	"runtime"
 	"testing"
 
-	"github.com/looprig/foreignloop/driver"
+	"github.com/looprig/foreignloops/driver"
 )
 
 func TestUnsupportedPlatformFailsBeforeSpawn(t *testing.T) {

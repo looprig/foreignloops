@@ -1,4 +1,4 @@
-module github.com/looprig/foreignloop
+module github.com/looprig/foreignloops
 
 go 1.26.4
 

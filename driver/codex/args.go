@@ -1,6 +1,6 @@
 package codex
 
-import "github.com/looprig/foreignloop/driver"
+import "github.com/looprig/foreignloops/driver"
 
 type runConfig struct {
 	cwd              string

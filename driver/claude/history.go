@@ -3,7 +3,7 @@ package claude
 import (
 	"errors"
 
-	"github.com/looprig/foreignloop/driver"
+	"github.com/looprig/foreignloops/driver"
 )
 
 func historyFromContainedPath(root, path string) (driver.History, error) {

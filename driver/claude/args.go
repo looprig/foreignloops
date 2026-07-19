@@ -1,6 +1,6 @@
 package claude
 
-import "github.com/looprig/foreignloop/driver"
+import "github.com/looprig/foreignloops/driver"
 
 const (
 	flagPrint           = "-p"

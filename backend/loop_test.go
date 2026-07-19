@@ -7,7 +7,7 @@ import (
 	"time"
 
 	"github.com/looprig/core/uuid"
-	"github.com/looprig/foreignloop/driver"
+	"github.com/looprig/foreignloops/driver"
 	"github.com/looprig/harness/pkg/command"
 	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/harness/pkg/loop"

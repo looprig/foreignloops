@@ -15,9 +15,9 @@ import (
 )
 
 const (
-	backendImportRoot = "github.com/looprig/foreignloop/backend"
+	backendImportRoot = "github.com/looprig/foreignloops/backend"
 	coreContentImport = "github.com/looprig/core/content"
-	driverImportRoot  = "github.com/looprig/foreignloop/driver"
+	driverImportRoot  = "github.com/looprig/foreignloops/driver"
 	harnessImportRoot = "github.com/looprig/harness"
 )
 
@@ -37,9 +37,9 @@ func TestForbiddenDriverImport(t *testing.T) {
 		path      string
 		forbidden bool
 	}{
-		{path: "github.com/looprig/foreignloop/backend", forbidden: true},
-		{path: "github.com/looprig/foreignloop/backend/internal", forbidden: true},
-		{path: "github.com/looprig/foreignloop/backendish", forbidden: false},
+		{path: "github.com/looprig/foreignloops/backend", forbidden: true},
+		{path: "github.com/looprig/foreignloops/backend/internal", forbidden: true},
+		{path: "github.com/looprig/foreignloops/backendish", forbidden: false},
 		{path: "github.com/looprig/harness", forbidden: true},
 		{path: "github.com/looprig/harness/pkg/event", forbidden: true},
 		{path: "github.com/looprig/harness/pkg/event/testing", forbidden: true},
@@ -54,13 +54,13 @@ func TestForbiddenDriverImport(t *testing.T) {
 		{path: "github.com/looprig/harness/internal", forbidden: true},
 		{path: "github.com/looprig/harness/internal/runtimecontract", forbidden: true},
 		{path: "github.com/looprig/harness/internals", forbidden: true},
-		{path: "github.com/looprig/foreignloop/driver/claude", forbidden: true},
-		{path: "github.com/looprig/foreignloop/driver/claude/wire", forbidden: true},
-		{path: "github.com/looprig/foreignloop/driver/claudette", forbidden: true},
-		{path: "github.com/looprig/foreignloop/driver/codex", forbidden: true},
-		{path: "github.com/looprig/foreignloop/driver/codex/wire", forbidden: true},
-		{path: "github.com/looprig/foreignloop/driver/future", forbidden: true},
-		{path: "github.com/looprig/foreignloop/driverish/claude", forbidden: false},
+		{path: "github.com/looprig/foreignloops/driver/claude", forbidden: true},
+		{path: "github.com/looprig/foreignloops/driver/claude/wire", forbidden: true},
+		{path: "github.com/looprig/foreignloops/driver/claudette", forbidden: true},
+		{path: "github.com/looprig/foreignloops/driver/codex", forbidden: true},
+		{path: "github.com/looprig/foreignloops/driver/codex/wire", forbidden: true},
+		{path: "github.com/looprig/foreignloops/driver/future", forbidden: true},
+		{path: "github.com/looprig/foreignloops/driverish/claude", forbidden: false},
 		{path: "github.com/looprig/core/content", forbidden: false},
 		{path: "context", forbidden: false},
 	}
@@ -84,16 +84,16 @@ func TestDriverImportAllowedForFile(t *testing.T) {
 		{name: "base stdlib", file: "driver.go", importPath: "context", allowed: true},
 		{name: "base dotless external", file: "driver.go", importPath: "example/local", allowed: false},
 		{name: "base Core", file: "history.go", importPath: "github.com/looprig/core/content", allowed: true},
-		{name: "base root driver", file: "driver.go", importPath: "github.com/looprig/foreignloop/driver", allowed: false},
-		{name: "base concrete provider", file: "driver.go", importPath: "github.com/looprig/foreignloop/driver/claude", allowed: false},
+		{name: "base root driver", file: "driver.go", importPath: "github.com/looprig/foreignloops/driver", allowed: false},
+		{name: "base concrete provider", file: "driver.go", importPath: "github.com/looprig/foreignloops/driver/claude", allowed: false},
 		{name: "claude nested stdlib", file: "claude/wire/decode.go", importPath: "encoding/json", allowed: true},
 		{name: "claude nested Core", file: "claude/wire/decode.go", importPath: "github.com/looprig/core/content", allowed: true},
-		{name: "claude nested root driver", file: "claude/wire/decode.go", importPath: "github.com/looprig/foreignloop/driver", allowed: true},
-		{name: "claude nested codex", file: "claude/wire/decode.go", importPath: "github.com/looprig/foreignloop/driver/codex", allowed: false},
-		{name: "codex nested root driver", file: "codex/wire/decode.go", importPath: "github.com/looprig/foreignloop/driver", allowed: true},
-		{name: "codex nested claude", file: "codex/wire/decode.go", importPath: "github.com/looprig/foreignloop/driver/claude", allowed: false},
-		{name: "future nested root driver", file: "future/wire/decode.go", importPath: "github.com/looprig/foreignloop/driver", allowed: true},
-		{name: "future nested sibling", file: "future/wire/decode.go", importPath: "github.com/looprig/foreignloop/driver/claude", allowed: false},
+		{name: "claude nested root driver", file: "claude/wire/decode.go", importPath: "github.com/looprig/foreignloops/driver", allowed: true},
+		{name: "claude nested codex", file: "claude/wire/decode.go", importPath: "github.com/looprig/foreignloops/driver/codex", allowed: false},
+		{name: "codex nested root driver", file: "codex/wire/decode.go", importPath: "github.com/looprig/foreignloops/driver", allowed: true},
+		{name: "codex nested claude", file: "codex/wire/decode.go", importPath: "github.com/looprig/foreignloops/driver/claude", allowed: false},
+		{name: "future nested root driver", file: "future/wire/decode.go", importPath: "github.com/looprig/foreignloops/driver", allowed: true},
+		{name: "future nested sibling", file: "future/wire/decode.go", importPath: "github.com/looprig/foreignloops/driver/claude", allowed: false},
 		{name: "future nested Harness", file: "future/wire/decode.go", importPath: "github.com/looprig/harness/pkg/command", allowed: false},
 	}
 
@@ -115,7 +115,7 @@ package wire
 import (
 	_ "context"
 	_ "github.com/looprig/core/content"
-	_ "github.com/looprig/foreignloop/driver"
+	_ "github.com/looprig/foreignloops/driver"
 )
 `)
 	writeDependencyFixture(t, filepath.Join(root, "claude", "wire", "bad.go"), `//go:build fixture_bad
@@ -123,7 +123,7 @@ import (
 package wire
 
 import (
-	_ "github.com/looprig/foreignloop/backend/internal"
+	_ "github.com/looprig/foreignloops/backend/internal"
 	_ "github.com/looprig/harness/pkg/event"
 )
 `)
@@ -134,7 +134,7 @@ import (
 	}
 	wantFile := filepath.Join("claude", "wire", "bad.go")
 	for _, importPath := range []string{
-		"github.com/looprig/foreignloop/backend/internal",
+		"github.com/looprig/foreignloops/backend/internal",
 		"github.com/looprig/harness/pkg/event",
 	} {
 		if !hasDependencyViolation(violations, wantFile, importPath) {

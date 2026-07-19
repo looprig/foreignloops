@@ -12,7 +12,7 @@ import (
 	"time"
 
 	"github.com/looprig/core/content"
-	"github.com/looprig/foreignloop/driver"
+	"github.com/looprig/foreignloops/driver"
 )
 
 // closeGrace is how long the process group has to exit on SIGINT before SIGKILL.

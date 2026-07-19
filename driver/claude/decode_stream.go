@@ -8,7 +8,7 @@ import (
 	"strings"
 
 	"github.com/looprig/core/content"
-	"github.com/looprig/foreignloop/driver"
+	"github.com/looprig/foreignloops/driver"
 )
 
 const maxLineBytes = 1 << 20

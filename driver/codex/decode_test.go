@@ -6,7 +6,7 @@ import (
 	"testing"
 
 	"github.com/looprig/core/content"
-	"github.com/looprig/foreignloop/driver"
+	"github.com/looprig/foreignloops/driver"
 )
 
 func TestDecodeLineHappyJSONL(t *testing.T) {

@@ -13,12 +13,12 @@ import (
 	"testing"
 )
 
-const backendDriverImport = "github.com/looprig/foreignloop/driver"
+const backendDriverImport = "github.com/looprig/foreignloops/driver"
 
 var backendAllowedImports = map[string]struct{}{
 	"github.com/looprig/core/content":         {},
 	"github.com/looprig/core/uuid":            {},
-	"github.com/looprig/foreignloop/driver":   {},
+	"github.com/looprig/foreignloops/driver":   {},
 	"github.com/looprig/harness/pkg/command":  {},
 	"github.com/looprig/harness/pkg/event":    {},
 	"github.com/looprig/harness/pkg/foreign":  {},
@@ -40,7 +40,7 @@ package nested
 
 import (
 	_ "context"
-	_ "github.com/looprig/foreignloop/driver"
+	_ "github.com/looprig/foreignloops/driver"
 	_ "github.com/looprig/harness/pkg/event"
 )
 `)
@@ -49,8 +49,8 @@ import (
 package nested
 
 import (
-	_ "github.com/looprig/foreignloop/driver/claude"
-	_ "github.com/looprig/foreignloop/driver/codex/wire"
+	_ "github.com/looprig/foreignloops/driver/claude"
+	_ "github.com/looprig/foreignloops/driver/codex/wire"
 )
 `)
 
@@ -60,8 +60,8 @@ import (
 	}
 	wantFile := filepath.Join("nested", "bad.go")
 	for _, importPath := range []string{
-		"github.com/looprig/foreignloop/driver/claude",
-		"github.com/looprig/foreignloop/driver/codex/wire",
+		"github.com/looprig/foreignloops/driver/claude",
+		"github.com/looprig/foreignloops/driver/codex/wire",
 	} {
 		if !hasBackendDependencyViolation(violations, wantFile, importPath) {
 			t.Errorf("violations = %#v, want %s importing %q", violations, wantFile, importPath)

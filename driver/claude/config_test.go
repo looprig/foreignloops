@@ -6,7 +6,7 @@ import (
 	"reflect"
 	"testing"
 
-	"github.com/looprig/foreignloop/driver"
+	"github.com/looprig/foreignloops/driver"
 )
 
 func TestNewAgentRequiredFields(t *testing.T) {

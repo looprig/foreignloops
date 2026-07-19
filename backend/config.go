@@ -4,7 +4,7 @@ package backend
 import (
 	"reflect"
 
-	"github.com/looprig/foreignloop/driver"
+	"github.com/looprig/foreignloops/driver"
 )
 
 // SIDMode selects whether the foreign session ID is known when the loop is

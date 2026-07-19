@@ -10,7 +10,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/looprig/foreignloop/driver"
+	"github.com/looprig/foreignloops/driver"
 )
 
 func TestCommandWrapperResultIsStarted(t *testing.T) {
