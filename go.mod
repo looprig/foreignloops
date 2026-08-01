@@ -9,6 +9,7 @@ tool (
 )
 
 require (
+	github.com/looprig/acp v0.1.0
 	github.com/looprig/core v0.2.0
 	github.com/looprig/harness v0.0.0-00010101000000-000000000000
 	github.com/looprig/inference v0.3.0
@@ -74,6 +75,8 @@ require (
 // Development-only mappings for the untagged public Harness seam and inference,
 // which is used directly by backend parity tests and provider fakes. Remove local
 // replaces and require tagged module versions before release.
+replace github.com/looprig/acp => ../acp
+
 replace github.com/looprig/harness => ../harness
 
 replace github.com/looprig/inference => ../inference
