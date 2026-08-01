@@ -26,7 +26,8 @@ func TestBackendAndDriverPublicTopLevelSymbols(t *testing.T) {
 				"Agent", "DecodeError", "Event", "ExitError", "History", "HistoryError",
 				"Kind", "KindInit", "KindStepComplete", "KindTerminalError", "KindTerminalOK",
 				"KindTextDelta", "KindThinkingDelta", "KindToolResult", "KindToolUse",
-				"PermissionPosture", "PostureAcceptEdits", "PostureDefault", "SpawnError", "Stream", "Turn",
+				"PermissionPosture", "Posture", "PostureAcceptEdits", "PostureDefault", "PostureReadOnly",
+				"PostureWorkspaceWrite", "SpawnError", "Stream", "Turn",
 			},
 		},
 		{
