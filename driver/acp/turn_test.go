@@ -2,7 +2,9 @@ package acp
 
 import (
 	"context"
+	"encoding/json"
 	"reflect"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -210,6 +212,113 @@ func TestTranslateUnknownACPUpdateIsIgnored(t *testing.T) {
 	}
 	if events := translateUpdate(protocol.SessionUpdate{}, state); len(events) != 0 {
 		t.Fatalf("translateUpdate(zero) = %#v, want no driver events", events)
+	}
+}
+
+func TestTranslateToolCallDoesNotExposeRawInput(t *testing.T) {
+	state := &translationState{}
+	rawInput := []byte(`{"token":"raw-token","password":"raw-password","url":"https://user:pass@example.test/?api_key=url-secret"}`)
+
+	events := translateUpdate(protocol.SessionUpdate{ToolCall: &protocol.ToolCall{
+		ToolCallID: "tool-secret",
+		Title:      "Inspect",
+		RawInput:   rawInput,
+	}}, state)
+	if len(events) != 1 || events[0].ToolUseID != "tool-secret" || events[0].ToolName != "Inspect" {
+		t.Fatalf("tool event = %#v, want stable id/name", events)
+	}
+
+	message := state.message()
+	if message == nil || len(message.Blocks) != 1 {
+		t.Fatalf("translated message = %#v, want one tool block", message)
+	}
+	tool, ok := message.Blocks[0].(*content.ToolUseBlock)
+	if !ok {
+		t.Fatalf("translated block = %T, want *content.ToolUseBlock", message.Blocks[0])
+	}
+	if len(tool.Input) != 0 {
+		t.Fatalf("tool input = %q, want no raw payload", tool.Input)
+	}
+
+	encoded, err := json.Marshal(message)
+	if err != nil {
+		t.Fatalf("marshal translated message: %v", err)
+	}
+	assertDoesNotContain(t, string(encoded), "raw-token", "raw-password", "url-secret", "user:pass")
+	assertDoesNotContain(t, string(events[0].ToolName), "raw-token", "raw-password", "url-secret", "user:pass")
+}
+
+func TestTranslateToolResultRedactsSecretsAndUnsafeURLs(t *testing.T) {
+	state := &translationState{}
+	rawOutput := []byte(`{"status":"completed","message":"ordinary output","token":"raw-token","password":"raw-password","authorization":"Bearer raw-authorization","url":"https://user:pass@example.test/result?x=1&api_key=url-secret"}`)
+
+	events := translateUpdate(protocol.SessionUpdate{ToolCallUpdate: &protocol.ToolCallUpdate{
+		ToolCallID: "tool-result",
+		Status:     toolStatus(protocol.ToolCallStatusCompleted),
+		RawOutput:  rawOutput,
+	}}, state)
+	if len(events) != 1 || events[0].Kind != driver.KindToolResult {
+		t.Fatalf("tool result events = %#v, want one KindToolResult", events)
+	}
+	preview := events[0].ResultPreview
+	if !strings.Contains(preview, "ordinary output") || !strings.Contains(preview, "completed") {
+		t.Fatalf("preview = %q, want ordinary output preserved", preview)
+	}
+	assertDoesNotContain(t, preview, "raw-token", "raw-password", "raw-authorization", "url-secret", "user:pass")
+	if !strings.Contains(preview, "x=1") {
+		t.Fatalf("preview = %q, want non-sensitive URL query preserved", preview)
+	}
+}
+
+func TestTranslateToolResultRedactsSecretsInHumanText(t *testing.T) {
+	state := &translationState{}
+	text := "status: ok token=raw-token password: raw-password; visit https://user:pass@example.test/path?x=1&secret=url-secret"
+	events := translateUpdate(protocol.SessionUpdate{ToolCallUpdate: &protocol.ToolCallUpdate{
+		ToolCallID: "tool-text",
+		Content: []protocol.ToolCallContent{{
+			Content: &protocol.Content{Content: protocol.ContentBlock{
+				Text: &protocol.TextContent{Text: text},
+			}},
+		}},
+	}}, state)
+	if len(events) != 1 {
+		t.Fatalf("tool result events = %#v, want one event", events)
+	}
+	if !strings.Contains(events[0].ResultPreview, "status: ok") {
+		t.Fatalf("preview = %q, want ordinary text preserved", events[0].ResultPreview)
+	}
+	assertDoesNotContain(t, events[0].ResultPreview, "raw-token", "raw-password", "url-secret", "user:pass")
+}
+
+func TestTranslateToolResultPreservesPlainJSONText(t *testing.T) {
+	preview := renderToolResult(nil, json.RawMessage(`"ordinary output"`))
+	if preview != "ordinary output" {
+		t.Fatalf("preview = %q, want unquoted ordinary text", preview)
+	}
+}
+
+func TestTranslateToolResultFailsSafelyOnMalformedOrAmbiguousJSON(t *testing.T) {
+	for _, raw := range []json.RawMessage{
+		[]byte(`{"token":"malformed-token",`),
+		[]byte(`{"status":"ok"} {"password":"trailing-password"}`),
+		[]byte(`{"secret":"first-secret","secret":"second-secret"}`),
+	} {
+		t.Run(string(raw), func(t *testing.T) {
+			preview := renderToolResult(nil, raw)
+			if preview == string(raw) {
+				t.Fatalf("preview returned raw JSON %q", preview)
+			}
+			assertDoesNotContain(t, preview, "malformed-token", "trailing-password", "first-secret", "second-secret")
+		})
+	}
+}
+
+func assertDoesNotContain(t *testing.T, got string, forbidden ...string) {
+	t.Helper()
+	for _, value := range forbidden {
+		if strings.Contains(got, value) {
+			t.Fatalf("value %q leaked in %q", value, got)
+		}
 	}
 }
 
