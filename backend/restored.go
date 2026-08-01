@@ -2,6 +2,7 @@ package backend
 
 import (
 	"context"
+	"sync"
 
 	"github.com/looprig/core/content"
 	"github.com/looprig/core/uuid"
@@ -27,6 +28,7 @@ type Loop struct {
 	backendCfg Config
 	idGen      func() (uuid.UUID, error)
 	fac        *event.Factory
+	closeOnce  sync.Once
 
 	msgs       content.AgenticMessages
 	turnIndex  event.TurnIndex

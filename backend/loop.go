@@ -97,6 +97,7 @@ func (l *Loop) run(loopCtx context.Context) {
 					return
 				}
 			case command.Shutdown:
+				l.closeAgent()
 				typed.Ack <- nil
 				return
 			case command.Interrupt:
@@ -113,13 +114,15 @@ func (l *Loop) run(loopCtx context.Context) {
 }
 
 func (l *Loop) closeAgent() {
-	closer, ok := l.backendCfg.Agent.(driver.Closer)
-	if !ok {
-		return
-	}
-	if err := closer.Close(); err != nil {
-		slog.Warn("foreignloop: agent close failed", "error", err)
-	}
+	l.closeOnce.Do(func() {
+		closer, ok := l.backendCfg.Agent.(driver.Closer)
+		if !ok {
+			return
+		}
+		if err := closer.Close(); err != nil {
+			slog.Warn("foreignloop: agent close failed", "error", err)
+		}
+	})
 }
 
 func (l *Loop) prepareInput(ctx context.Context, input command.UserInput) (preparedInput, bool) {

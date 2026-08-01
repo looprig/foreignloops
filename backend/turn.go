@@ -168,6 +168,7 @@ func (l *Loop) handleTurnCommand(loopCtx context.Context, input command.Command,
 		cancel()
 		<-result
 		l.cancelPending(pub, event.CancelTurnInterrupted)
+		l.closeAgent()
 		typed.Ack <- nil
 		return true, true
 	default:
