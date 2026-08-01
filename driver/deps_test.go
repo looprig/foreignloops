@@ -17,10 +17,12 @@ import (
 const (
 	backendImportRoot = "github.com/looprig/foreignloops/backend"
 	coreContentImport = "github.com/looprig/core/content"
+	coreUUIDImport    = "github.com/looprig/core/uuid"
 	driverImportRoot  = "github.com/looprig/foreignloops/driver"
 	harnessImportRoot = "github.com/looprig/harness"
 	acpImportRoot     = "github.com/looprig/acp"
 	acpDriverDir      = "acp/"
+	acpBuilderFile    = "acp/builder.go"
 )
 
 func forbiddenDriverImport(importPath string) bool {
@@ -207,6 +209,17 @@ type dependencyViolation struct {
 }
 
 func driverImportAllowedForFile(file, importPath string) bool {
+	file = filepath.ToSlash(filepath.Clean(file))
+	if file == acpBuilderFile {
+		switch {
+		case importPath == coreUUIDImport:
+			return true
+		case hasImportPathPrefix(importPath, backendImportRoot):
+			return true
+		case hasImportPathPrefix(importPath, harnessImportRoot):
+			return true
+		}
+	}
 	if forbiddenDriverImport(importPath) {
 		return false
 	}
@@ -214,7 +227,6 @@ func driverImportAllowedForFile(file, importPath string) bool {
 		return true
 	}
 
-	file = filepath.ToSlash(filepath.Clean(file))
 	if !strings.Contains(file, "/") {
 		return false
 	}
