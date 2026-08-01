@@ -18,6 +18,15 @@ type Agent interface {
 	Spawn(context.Context, Turn) (Stream, error)
 }
 
+// Closer is optionally implemented by agents that own long-lived resources
+// spanning turns. The backend invokes Close exactly once after the command
+// pump exits, whether it exits from command.Shutdown or loop-context
+// cancellation. Drivers that spawn a new CLI process per turn do not need to
+// implement Closer.
+type Closer interface {
+	Close() error
+}
+
 // Turn is one turn's input to a foreign agent.
 type Turn struct {
 	SystemPrompt string

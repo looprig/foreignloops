@@ -68,6 +68,7 @@ func (l *Loop) DoneChan() <-chan struct{} { return l.Done }
 
 func (l *Loop) run(loopCtx context.Context) {
 	defer close(l.Done)
+	defer l.closeAgent()
 	for {
 		if len(l.pending) > 0 {
 			next := l.pending[0]
@@ -108,6 +109,16 @@ func (l *Loop) run(loopCtx context.Context) {
 				slog.Warn("foreignloop: dropping un-honorable command while idle", "type", fmt.Sprintf("%T", input))
 			}
 		}
+	}
+}
+
+func (l *Loop) closeAgent() {
+	closer, ok := l.backendCfg.Agent.(driver.Closer)
+	if !ok {
+		return
+	}
+	if err := closer.Close(); err != nil {
+		slog.Warn("foreignloop: agent close failed", "error", err)
 	}
 }
 
