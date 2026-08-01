@@ -57,9 +57,9 @@ func BuildWith(cfg Config) foreign.Builder {
 }
 
 // BuildRestoredWith adapts ACP resume construction to the Harness restored
-// builder. The journal's ForeignSID is authoritative and replaces any
-// caller-provided session id before ACP construction, so restore always uses
-// session/load and preserves the backend's recovered conversation state.
+// builder. The journal's AgentSessionID is authoritative for ACP session/load;
+// ForeignSID remains the backend's recovered routing identity. An empty
+// AgentSessionID preserves legacy session/new behavior.
 func BuildRestoredWith(cfg Config) foreign.RestoredBuilder {
 	return func(
 		loopCtx context.Context,
@@ -75,7 +75,7 @@ func BuildRestoredWith(cfg Config) foreign.RestoredBuilder {
 			return nil, err
 		}
 		resumeCfg := cfg
-		resumeCfg.AgentSessionID = seed.ForeignSID
+		resumeCfg.AgentSessionID = seed.AgentSessionID
 		d, err := New(loopCtx, resumeCfg)
 		if err != nil {
 			return nil, err

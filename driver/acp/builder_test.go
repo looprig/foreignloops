@@ -135,8 +135,9 @@ func TestBuildRestoredLoadsSeedAgentSessionAndPreservesState(t *testing.T) {
 	})
 
 	seed := foreign.RestoredForeign{
-		ForeignSID: "journaled-agent-session",
-		TurnIndex:  4,
+		ForeignSID:     "journaled-foreign-routing-id",
+		AgentSessionID: "journaled-agent-session",
+		TurnIndex:      4,
 		Msgs: content.AgenticMessages{
 			&content.AIMessage{Message: content.Message{
 				Role:   content.RoleAssistant,
@@ -167,8 +168,8 @@ func TestBuildRestoredLoadsSeedAgentSessionAndPreservesState(t *testing.T) {
 	if conn.newCalls != 0 || conn.loadCalls != 1 {
 		t.Fatalf("session calls = new:%d load:%d, want new:0 load:1", conn.newCalls, conn.loadCalls)
 	}
-	if got := conn.loadParams[0].SessionID; got != "journaled-agent-session" {
-		t.Fatalf("LoadSession SessionID = %q, want journal seed", got)
+	if got := conn.loadParams[0].SessionID; string(got) != seed.AgentSessionID {
+		t.Fatalf("LoadSession SessionID = %q, want ACP agent seed %q", got, seed.AgentSessionID)
 	}
 	msgs, turnIndex, err := state.Snapshot(context.Background())
 	if err != nil {
