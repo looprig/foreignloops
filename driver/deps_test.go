@@ -19,6 +19,8 @@ const (
 	coreContentImport = "github.com/looprig/core/content"
 	driverImportRoot  = "github.com/looprig/foreignloops/driver"
 	harnessImportRoot = "github.com/looprig/harness"
+	acpImportRoot     = "github.com/looprig/acp"
+	acpDriverDir      = "acp/"
 )
 
 func forbiddenDriverImport(importPath string) bool {
@@ -95,6 +97,11 @@ func TestDriverImportAllowedForFile(t *testing.T) {
 		{name: "future nested root driver", file: "future/wire/decode.go", importPath: "github.com/looprig/foreignloops/driver", allowed: true},
 		{name: "future nested sibling", file: "future/wire/decode.go", importPath: "github.com/looprig/foreignloops/driver/claude", allowed: false},
 		{name: "future nested Harness", file: "future/wire/decode.go", importPath: "github.com/looprig/harness/pkg/command", allowed: false},
+		{name: "acp nested launch", file: "acp/config.go", importPath: "github.com/looprig/acp/launch", allowed: true},
+		{name: "acp nested driver", file: "acp/config.go", importPath: "github.com/looprig/foreignloops/driver", allowed: true},
+		{name: "claude nested acp forbidden", file: "claude/wire/decode.go", importPath: "github.com/looprig/acp/launch", allowed: false},
+		{name: "base acp forbidden", file: "driver.go", importPath: "github.com/looprig/acp/launch", allowed: false},
+		{name: "acp unrelated module not widened", file: "acp/config.go", importPath: "github.com/looprig/acpish/launch", allowed: false},
 	}
 
 	for _, tt := range tests {
@@ -208,7 +215,13 @@ func driverImportAllowedForFile(file, importPath string) bool {
 	}
 
 	file = filepath.ToSlash(filepath.Clean(file))
-	return strings.Contains(file, "/") && importPath == driverImportRoot
+	if !strings.Contains(file, "/") {
+		return false
+	}
+	if importPath == driverImportRoot {
+		return true
+	}
+	return strings.HasPrefix(file, acpDriverDir) && hasImportPathPrefix(importPath, acpImportRoot)
 }
 
 func isStandardLibraryImport(importPath string) bool {
