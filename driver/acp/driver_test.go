@@ -5,7 +5,9 @@ import (
 	"errors"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/looprig/acp/client"
 	"github.com/looprig/acp/launch"
@@ -85,14 +87,62 @@ type fakeDialedClient struct {
 	acpClient  acpClient
 	closeErr   error
 	closeCalls int
+	closeHook  func()
 }
 
 func (c *fakeDialedClient) client() acpClient { return c.acpClient }
 
 func (c *fakeDialedClient) close(context.Context) error {
 	c.closeCalls++
+	if c.closeHook != nil {
+		c.closeHook()
+	}
 	return c.closeErr
 }
+
+type driverContextSession struct {
+	*fakeSession
+
+	updates        chan client.Update
+	promptContexts chan context.Context
+	promptDone     chan error
+
+	blockOnCancel bool
+	cancelled     chan struct{}
+	allowReturn   chan struct{}
+	cancelOnce    sync.Once
+}
+
+func newDriverContextSession(id string) *driverContextSession {
+	return &driverContextSession{
+		fakeSession:    newFakeSession(id),
+		updates:        make(chan client.Update),
+		promptContexts: make(chan context.Context, 2),
+		promptDone:     make(chan error, 2),
+	}
+}
+
+func (s *driverContextSession) Updates() <-chan client.Update { return s.updates }
+
+func (s *driverContextSession) Prompt(ctx context.Context, _ []protocol.ContentBlock) (*client.PromptResult, error) {
+	s.promptContexts <- ctx
+	if s.blockOnCancel {
+		select {
+		case <-ctx.Done():
+			s.cancelOnce.Do(func() { close(s.cancelled) })
+			<-s.allowReturn
+		case <-s.allowReturn:
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		s.promptDone <- err
+		return nil, err
+	}
+	s.promptDone <- nil
+	return &client.PromptResult{StopReason: protocol.StopReasonEndTurn}, nil
+}
+
+func (s *driverContextSession) Cancel(ctx context.Context) error { return ctx.Err() }
 
 type fakeClaudeConnector struct {
 	models launch.ClaudeModels
@@ -253,8 +303,9 @@ func TestNewCodexCreatesOneSessionWithModelAndPosture(t *testing.T) {
 		t.Fatalf("Codex model = %q, want %q", harness.Model, cfg.ModelAlias)
 	}
 	wantPosture := launch.CodexPosture{
-		ApprovalPolicy: "never",
-		SandboxMode:    "read-only",
+		ApprovalPolicy:       "never",
+		SandboxMode:          "read-only",
+		SandboxNetworkAccess: true,
 	}
 	if harness.Posture != wantPosture {
 		t.Fatalf("Codex posture = %+v, want %+v", harness.Posture, wantPosture)
@@ -267,6 +318,37 @@ func TestNewCodexCreatesOneSessionWithModelAndPosture(t *testing.T) {
 	}
 	if err := d.Close(); err != nil {
 		t.Fatalf("Close() error = %v", err)
+	}
+}
+
+func TestNewCodexWorkspaceWritePreservesSandboxPosture(t *testing.T) {
+	cfg := validConfig(HarnessCodex)
+	cfg.AgentSessionID = ""
+	cfg.Posture = driver.PostureWorkspaceWrite
+	conn := &fakeClient{newSession: newFakeSession("workspace-write-session")}
+	owned := &fakeDialedClient{acpClient: conn}
+	var launchCfg launch.Config
+	installDial(t, func(_ context.Context, got launch.Config) (dialedClient, error) {
+		launchCfg = got
+		return owned, nil
+	})
+
+	d, err := New(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	defer func() { _ = d.Close() }()
+	harness, ok := launchCfg.Harness.(*launch.CodexConnector)
+	if !ok {
+		t.Fatalf("launch Harness = %T, want *launch.CodexConnector", launchCfg.Harness)
+	}
+	want := launch.CodexPosture{
+		ApprovalPolicy:       "never",
+		SandboxMode:          "workspace-write",
+		SandboxNetworkAccess: true,
+	}
+	if harness.Posture != want {
+		t.Fatalf("Codex posture = %+v, want %+v", harness.Posture, want)
 	}
 }
 
@@ -316,7 +398,154 @@ func TestNewNativeAuthOmitsProxyAndGatewayOverrides(t *testing.T) {
 					t.Errorf("native configured env contains gateway entry %q", entry)
 				}
 			}
+			if harnessName == HarnessCodex {
+				harness, ok := launchCfg.Harness.(*launch.CodexConnector)
+				if !ok {
+					t.Fatalf("native launch Harness = %T, want *launch.CodexConnector", launchCfg.Harness)
+				}
+				if harness.Posture.SandboxNetworkAccess {
+					t.Fatal("native Codex posture SandboxNetworkAccess = true, want false")
+				}
+			}
 		})
+	}
+}
+
+func TestNewCallerContextCancellationDoesNotPoisonLaterTurn(t *testing.T) {
+	cfg := validConfig(HarnessCodex)
+	cfg.AgentSessionID = ""
+	setupCtx, cancelSetup := context.WithCancel(context.Background())
+	sess := newDriverContextSession("context-owned-session")
+	conn := &fakeClient{newSession: sess}
+	owned := &fakeDialedClient{acpClient: conn}
+	installDial(t, func(context.Context, launch.Config) (dialedClient, error) {
+		return owned, nil
+	})
+
+	d, err := New(setupCtx, cfg)
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	defer func() { _ = d.Close() }()
+	cancelSetup()
+
+	stream, err := d.Spawn(context.Background(), driver.Turn{})
+	if err != nil {
+		t.Fatalf("Spawn() error = %v", err)
+	}
+	promptCtx := <-sess.promptContexts
+	if err := promptCtx.Err(); err != nil {
+		t.Fatalf("later-turn Prompt context error = %v, want nil after setup context cancellation", err)
+	}
+	events := collectTurnEvents(t, stream)
+	if len(events) == 0 || events[len(events)-1].Kind != driver.KindTerminalOK {
+		t.Fatalf("later-turn events = %#v, want successful terminal event", events)
+	}
+}
+
+func TestCloseCancelsActivePromptBeforeClosingOwnedClient(t *testing.T) {
+	cfg := validConfig(HarnessCodex)
+	cfg.AgentSessionID = ""
+	sess := newDriverContextSession("close-session")
+	sess.blockOnCancel = true
+	sess.cancelled = make(chan struct{})
+	sess.allowReturn = make(chan struct{})
+	conn := &fakeClient{newSession: sess}
+	ownedClosed := make(chan struct{})
+	owned := &fakeDialedClient{
+		acpClient: conn,
+		closeHook: func() { close(ownedClosed) },
+	}
+	installDial(t, func(context.Context, launch.Config) (dialedClient, error) {
+		return owned, nil
+	})
+
+	d, err := New(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	stream, err := d.Spawn(context.Background(), driver.Turn{})
+	if err != nil {
+		t.Fatalf("Spawn() error = %v", err)
+	}
+	<-sess.promptContexts
+
+	closeDone := make(chan error, 1)
+	go func() { closeDone <- d.Close() }()
+
+	select {
+	case <-sess.cancelled:
+	case <-time.After(3 * time.Second):
+		close(sess.allowReturn)
+		<-sess.promptDone
+		<-closeDone
+		t.Fatal("Close() did not cancel the active Prompt context")
+	}
+	select {
+	case <-ownedClosed:
+		close(sess.allowReturn)
+		<-sess.promptDone
+		<-closeDone
+		t.Fatal("Close() closed the owned client before the active Prompt returned")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	close(sess.allowReturn)
+	if err := <-closeDone; err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+	if owned.closeCalls != 1 {
+		t.Fatalf("owned client close calls = %d, want 1", owned.closeCalls)
+	}
+	if err := d.Close(); err != nil {
+		t.Fatalf("second Close() error = %v", err)
+	}
+	if err := <-sess.promptDone; err != context.Canceled {
+		t.Fatalf("Prompt() error = %v, want context.Canceled", err)
+	}
+	waitTurnDone(t, stream)
+}
+
+type restoredClaudeSession struct {
+	*fakeSession
+	setConfigCalls int
+	setModeCalls   int
+}
+
+func (s *restoredClaudeSession) ConfigOptions() []protocol.SessionConfigOption { return nil }
+
+func (s *restoredClaudeSession) Modes() *protocol.SessionModeState { return nil }
+
+func (s *restoredClaudeSession) SetConfigOption(context.Context, protocol.SessionConfigID, protocol.SessionConfigValueID) error {
+	s.setConfigCalls++
+	return nil
+}
+
+func (s *restoredClaudeSession) SetMode(context.Context, protocol.SessionModeID) error {
+	s.setModeCalls++
+	return nil
+}
+
+func TestNewRestoredClaudePreservesSessionWithoutConfigCapabilities(t *testing.T) {
+	cfg := validConfig(HarnessClaudeCode)
+	cfg.AgentSessionID = "restored-claude"
+	sess := &restoredClaudeSession{fakeSession: newFakeSession(cfg.AgentSessionID)}
+	conn := &fakeClient{loadSession: sess}
+	owned := &fakeDialedClient{acpClient: conn}
+	installDial(t, func(context.Context, launch.Config) (dialedClient, error) {
+		return owned, nil
+	})
+
+	d, err := New(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("New() error = %v, want restored session to load without mutable capabilities", err)
+	}
+	defer func() { _ = d.Close() }()
+	if conn.loadCalls != 1 || conn.newCalls != 0 {
+		t.Fatalf("session calls = new:%d load:%d, want new:0 load:1", conn.newCalls, conn.loadCalls)
+	}
+	if sess.setConfigCalls != 0 || sess.setModeCalls != 0 {
+		t.Fatalf("restored session mutations = config:%d mode:%d, want zero", sess.setConfigCalls, sess.setModeCalls)
 	}
 }
 

@@ -82,6 +82,10 @@ func (d *Driver) Spawn(ctx context.Context, turn driver.Turn) (driver.Stream, er
 		ctx = context.Background()
 	}
 	d.turnMu.Lock()
+	if d.closed {
+		d.turnMu.Unlock()
+		return nil, &driver.SpawnError{Cause: errors.New("acp: driver is closed")}
+	}
 
 	driverCtx := d.driverCtx
 	if driverCtx == nil {

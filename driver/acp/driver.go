@@ -71,8 +71,12 @@ type Driver struct {
 	session session
 
 	agentSessionID string
-	driverCtx      context.Context
-	turnMu         sync.Mutex
+	// driverCtx is rooted independently of New's setup context and is canceled
+	// only when the driver closes. Turns use it for Prompt and session/Cancel.
+	driverCtx    context.Context
+	driverCancel context.CancelFunc
+	turnMu       sync.Mutex
+	closed       bool
 
 	closeOnce sync.Once
 	closeErr  error
@@ -134,10 +138,13 @@ func New(ctx context.Context, cfg Config) (*Driver, error) {
 		owned:          owned,
 		session:        sess,
 		agentSessionID: string(sess.ID()),
-		driverCtx:      ctx,
 	}
+	d.driverCtx, d.driverCancel = context.WithCancel(context.Background())
 
-	if claude != nil {
+	// A loaded Claude session owns its existing configuration. ACP does not
+	// populate mutable config/mode capabilities for session/load, so only a
+	// fresh session receives the requested model and permission setup.
+	if claude != nil && cfg.AgentSessionID == "" {
 		if err := claude.SelectDefaultModel(ctx, sess); err != nil {
 			return nil, closeAfterConstructionFailure(d, fmt.Errorf("acp: select default model: %w", err))
 		}
@@ -162,7 +169,7 @@ func connectorFor(cfg Config) (launch.HarnessAdapter, claudeConnector, error) {
 		return launch.ClaudeCode(models), newClaudeConnector(models), nil
 	case HarnessCodex:
 		codex := launch.Codex("").WithModel(cfg.ModelAlias)
-		codex.Posture = codexPosture(cfg.Posture)
+		codex.Posture = codexPosture(cfg.Posture, cfg.gatewayBacked())
 		return codex, nil, nil
 	default:
 		return nil, nil, &ConfigError{Field: "Harness", Reason: "must be a supported harness"}
@@ -203,24 +210,27 @@ func claudePermissionMode(posture driver.Posture) protocol.SessionModeID {
 	}
 }
 
-func codexPosture(posture driver.Posture) launch.CodexPosture {
+func codexPosture(posture driver.Posture, gatewayBacked bool) launch.CodexPosture {
 	switch posture {
 	case driver.PostureReadOnly:
 		return launch.CodexPosture{
-			ApprovalPolicy: "never",
-			SandboxMode:    "read-only",
+			ApprovalPolicy:       "never",
+			SandboxMode:          "read-only",
+			SandboxNetworkAccess: gatewayBacked,
 		}
 	case driver.PostureWorkspaceWrite:
 		return launch.CodexPosture{
-			ApprovalPolicy: "never",
-			SandboxMode:    "workspace-write",
+			ApprovalPolicy:       "never",
+			SandboxMode:          "workspace-write",
+			SandboxNetworkAccess: gatewayBacked,
 		}
 	default:
 		// Config.validate rejects this path. Keep the fallback restrictive if
 		// this helper is ever called independently in the future.
 		return launch.CodexPosture{
-			ApprovalPolicy: "never",
-			SandboxMode:    "read-only",
+			ApprovalPolicy:       "never",
+			SandboxMode:          "read-only",
+			SandboxNetworkAccess: gatewayBacked,
 		}
 	}
 }
@@ -234,8 +244,9 @@ func (d *Driver) AgentSessionID() string {
 	return d.agentSessionID
 }
 
-// Close releases the owned ACP connection/process exactly once. The shared
-// proxy binding is only data passed to launch.Dial and is never touched here.
+// Close cancels active turns, releases the owned ACP connection/process exactly
+// once, and rejects new turns thereafter. The shared proxy binding is only data
+// passed to launch.Dial and is never touched here.
 func (d *Driver) Close() error {
 	return d.close(context.Background())
 }
@@ -245,6 +256,12 @@ func (d *Driver) close(ctx context.Context) error {
 		return nil
 	}
 	d.closeOnce.Do(func() {
+		if d.driverCancel != nil {
+			d.driverCancel()
+		}
+		d.turnMu.Lock()
+		d.closed = true
+		d.turnMu.Unlock()
 		if d.owned != nil {
 			d.closeErr = d.owned.close(ctx)
 		}
