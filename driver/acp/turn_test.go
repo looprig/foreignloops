@@ -404,10 +404,7 @@ func TestTranslateToolResultRedactsSecretsAndUnsafeURLs(t *testing.T) {
 	if !strings.Contains(preview, "ordinary output") || !strings.Contains(preview, "completed") {
 		t.Fatalf("preview = %q, want ordinary output preserved", preview)
 	}
-	assertDoesNotContain(t, preview, "raw-token", "raw-password", "raw-authorization", "url-secret", "user:pass")
-	if !strings.Contains(preview, "x=1") {
-		t.Fatalf("preview = %q, want non-sensitive URL query preserved", preview)
-	}
+	assertDoesNotContain(t, preview, "raw-token", "raw-password", "raw-authorization", "url-secret", "user:pass", "example.test", "/result", "x=1")
 }
 
 func TestTranslateToolResultRedactsSecretsInHumanText(t *testing.T) {
@@ -435,6 +432,59 @@ func TestTranslateToolResultPreservesPlainJSONText(t *testing.T) {
 	if preview != "ordinary output" {
 		t.Fatalf("preview = %q, want unquoted ordinary text", preview)
 	}
+}
+
+func TestTranslateToolResultRedactsUnknownAndNestedJSONFields(t *testing.T) {
+	rawOutput := json.RawMessage(`{"status":"completed","summary":"safe summary","credential":"raw-credential","provider":"raw-provider","error":"raw-error","unknown":"raw-unknown","detail":{"message":"nested safe summary","credential":"nested-credential","provider":"nested-provider","error":"nested-error"}}`)
+	preview := renderToolResult(nil, rawOutput)
+	if !strings.Contains(preview, "completed") || !strings.Contains(preview, "safe summary") || !strings.Contains(preview, "nested safe summary") {
+		t.Fatalf("preview = %q, want safe bounded summaries preserved", preview)
+	}
+	assertDoesNotContain(t, preview,
+		"raw-credential", "raw-provider", "raw-error", "raw-unknown",
+		"nested-credential", "nested-provider", "nested-error",
+	)
+}
+
+func TestTranslateToolResultRedactsGatewayURLsInJSONAndPlainText(t *testing.T) {
+	rawOutput := json.RawMessage(`{"status":"ok","message":"gateway response","url":"https://gateway.internal/v1/private?token=raw-token&x=1","detail":{"link":"https://gateway.internal/nested/path?credential=raw-credential"}}`)
+	jsonPreview := renderToolResult(nil, rawOutput)
+	if !strings.Contains(jsonPreview, "gateway response") {
+		t.Fatalf("JSON preview = %q, want safe message preserved", jsonPreview)
+	}
+	assertDoesNotContain(t, jsonPreview,
+		"gateway.internal", "/v1/private", "/nested/path", "raw-token", "raw-credential", "x=1",
+	)
+
+	plain := "status: ok provider=raw-provider error: raw-error credential=raw-credential visit https://gateway.internal/api/private?token=raw-token"
+	plainEvents := translateUpdate(protocol.SessionUpdate{ToolCallUpdate: &protocol.ToolCallUpdate{
+		ToolCallID: "tool-plain-sensitive",
+		Content: []protocol.ToolCallContent{{
+			Content: &protocol.Content{Content: protocol.ContentBlock{
+				Text: &protocol.TextContent{Text: plain},
+			}},
+		}},
+	}}, &translationState{})
+	if len(plainEvents) != 1 || !strings.Contains(plainEvents[0].ResultPreview, "status: ok") {
+		t.Fatalf("plain events = %#v, want safe status preserved", plainEvents)
+	}
+	assertDoesNotContain(t, plainEvents[0].ResultPreview,
+		"raw-provider", "raw-error", "raw-credential", "gateway.internal", "/api/private", "raw-token",
+	)
+}
+
+func TestTranslateToolTitleRedactsUnknownFieldsAndURLs(t *testing.T) {
+	title := "Inspect provider=raw-provider https://gateway.internal/tools/private?credential=raw-credential"
+	events := translateUpdate(protocol.SessionUpdate{ToolCall: &protocol.ToolCall{
+		ToolCallID: "tool-title-sensitive",
+		Title:      title,
+	}}, &translationState{})
+	if len(events) != 1 || !strings.Contains(events[0].ToolName, "Inspect") {
+		t.Fatalf("tool events = %#v, want safe title summary", events)
+	}
+	assertDoesNotContain(t, events[0].ToolName,
+		"raw-provider", "gateway.internal", "/tools/private", "raw-credential",
+	)
 }
 
 func TestToolTranslationBoundsAdversarialOutputAndTitle(t *testing.T) {
@@ -477,6 +527,7 @@ func TestToolTranslationBoundsAdversarialOutputAndTitle(t *testing.T) {
 func TestTranslateToolResultFailsSafelyOnMalformedOrAmbiguousJSON(t *testing.T) {
 	for _, raw := range []json.RawMessage{
 		[]byte(`{"token":"malformed-token",`),
+		[]byte(`{"provider":"malformed-provider",`),
 		[]byte(`{"status":"ok"} {"password":"trailing-password"}`),
 		[]byte(`{"secret":"first-secret","secret":"second-secret"}`),
 	} {
@@ -485,7 +536,7 @@ func TestTranslateToolResultFailsSafelyOnMalformedOrAmbiguousJSON(t *testing.T) 
 			if preview == string(raw) {
 				t.Fatalf("preview returned raw JSON %q", preview)
 			}
-			assertDoesNotContain(t, preview, "malformed-token", "trailing-password", "first-secret", "second-secret")
+			assertDoesNotContain(t, preview, "malformed-token", "malformed-provider", "trailing-password", "first-secret", "second-secret")
 		})
 	}
 }

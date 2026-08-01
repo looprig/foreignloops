@@ -6,7 +6,6 @@ import (
 	"errors"
 	"io"
 	"log/slog"
-	"net/url"
 	"regexp"
 	"strings"
 	"unicode/utf8"
@@ -30,10 +29,25 @@ const (
 )
 
 var (
-	toolURLPattern    = regexp.MustCompile(`(?i)\bhttps?://[^\s<>"']+`)
+	toolURLPattern    = regexp.MustCompile(`(?i)\b[a-z][a-z0-9+.-]*://[^\s<>"']+`)
 	toolAuthPattern   = regexp.MustCompile(`(?i)(\b(?:authorization|proxy-authorization)\b(?:\s*["']?\s*[:=]|\s+)\s*)([^\r\n,;&}\]]+)`)
-	toolSecretPattern = regexp.MustCompile(`(?i)(\b(?:api[\s_-]*key|access[\s_-]*token|refresh[\s_-]*token|secret[\s_-]*key|token|password|secret)\b\s*["']?\s*[:=]\s*)(?:"[^"]*"|'[^']*'|[^\s,;&}\]]+)`)
+	toolSecretPattern = regexp.MustCompile(`(?i)(\b(?:api[\s_-]*key|access[\s_-]*token|refresh[\s_-]*token|secret[\s_-]*key|token|password|secret|credential|provider|error)\b\s*["']?\s*[:=]\s*)(?:"[^"]*"|'[^']*'|[^\s,;&}\]]+)`)
 )
+
+var safeToolJSONFields = map[string]struct{}{
+	"count":       {},
+	"description": {},
+	"detail":      {},
+	"message":     {},
+	"output":      {},
+	"result":      {},
+	"state":       {},
+	"status":      {},
+	"success":     {},
+	"summary":     {},
+	"text":        {},
+	"total":       {},
+}
 
 type translationState struct {
 	blocks []content.Block
@@ -250,13 +264,13 @@ func sanitizeToolText(text string) string {
 func renderSanitizedJSON(value any) string {
 	safe := sanitizeJSONValue(value, 0)
 	if text, ok := safe.(string); ok {
-		return text
+		return bounded(text)
 	}
 	encoded, err := json.Marshal(safe)
 	if err != nil {
 		return unsafeToolOutput
 	}
-	return string(encoded)
+	return bounded(string(encoded))
 }
 
 func sanitizeToolTitle(title string) string {
@@ -349,6 +363,9 @@ func sanitizeJSONValue(value any, depth int) any {
 				out[key] = redactedToolValue
 				continue
 			}
+			if !isSafeToolJSONField(key) {
+				continue
+			}
 			out[key] = sanitizeJSONValue(item, depth+1)
 		}
 		return out
@@ -386,42 +403,30 @@ func sanitizePlainToolText(text string) string {
 func sanitizeURLToken(token string) string {
 	trimmed := strings.TrimRight(token, ".,;:!?)]}")
 	suffix := token[len(trimmed):]
-	parsed, err := url.Parse(trimmed)
-	if err != nil || parsed.Host == "" {
-		return redactedURL + suffix
-	}
-	parsed.User = nil
-	if parsed.RawQuery != "" {
-		query, err := url.ParseQuery(parsed.RawQuery)
-		if err != nil {
-			parsed.RawQuery = ""
-		} else {
-			for key := range query {
-				if isSecretField(key) {
-					query[key] = []string{redactedToolValue}
-				}
-			}
-			parsed.RawQuery = query.Encode()
-		}
-	}
-	if parsed.Fragment != "" {
-		parsed.Fragment = sanitizePlainToolText(parsed.Fragment)
-	}
-	return parsed.String() + suffix
+	return redactedURL + suffix
 }
 
 func isSecretField(key string) bool {
+	field := normalizeToolField(key)
+	for _, marker := range []string{"token", "password", "secret", "apikey", "authorization", "credential", "provider", "error"} {
+		if strings.Contains(field, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+func isSafeToolJSONField(key string) bool {
+	_, ok := safeToolJSONFields[normalizeToolField(key)]
+	return ok
+}
+
+func normalizeToolField(key string) string {
 	var normalized strings.Builder
 	for _, r := range strings.ToLower(key) {
 		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') {
 			normalized.WriteRune(r)
 		}
 	}
-	field := normalized.String()
-	for _, marker := range []string{"token", "password", "secret", "apikey", "authorization"} {
-		if strings.Contains(field, marker) {
-			return true
-		}
-	}
-	return false
+	return normalized.String()
 }
