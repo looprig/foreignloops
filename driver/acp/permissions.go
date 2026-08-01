@@ -3,6 +3,7 @@ package acp
 import (
 	"context"
 	"errors"
+	"os"
 	"path/filepath"
 	"strings"
 
@@ -157,11 +158,55 @@ func pathWithinWorkspace(root, path string) bool {
 	if root == "" || path == "" || !filepath.IsAbs(root) || !filepath.IsAbs(path) || filepath.Clean(root) != root || filepath.Clean(path) != path {
 		return false
 	}
-	relative, err := filepath.Rel(root, path)
+	canonicalRoot, ok := canonicalPathWithExistingParent(root)
+	if !ok {
+		return false
+	}
+	canonicalPath, ok := canonicalPathWithExistingParent(path)
+	if !ok {
+		return false
+	}
+	relative, err := filepath.Rel(canonicalRoot, canonicalPath)
 	if err != nil || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) || filepath.IsAbs(relative) {
 		return false
 	}
 	return true
+}
+
+// canonicalPathWithExistingParent resolves every existing component of path.
+// The suffix after the deepest existing parent is retained only when that
+// parent resolves to a directory; any filesystem ambiguity rejects the path.
+func canonicalPathWithExistingParent(path string) (string, bool) {
+	current := path
+	var missing []string
+	for {
+		_, err := os.Lstat(current)
+		if err == nil {
+			resolved, err := filepath.EvalSymlinks(current)
+			if err != nil {
+				return "", false
+			}
+			if len(missing) > 0 {
+				resolvedInfo, err := os.Stat(current)
+				if err != nil || !resolvedInfo.IsDir() {
+					return "", false
+				}
+			}
+			for i := len(missing) - 1; i >= 0; i-- {
+				resolved = filepath.Join(resolved, missing[i])
+			}
+			return filepath.Clean(resolved), true
+		}
+		if !os.IsNotExist(err) {
+			return "", false
+		}
+		parent := filepath.Dir(current)
+		if parent == current {
+			return "", false
+		}
+		missing = append(missing, filepath.Base(current))
+		current = parent
+	}
 }
 
 var _ client.PermissionHandler = (*permissionHandler)(nil)

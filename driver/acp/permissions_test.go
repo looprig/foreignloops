@@ -3,6 +3,8 @@ package acp
 import (
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -13,7 +15,8 @@ import (
 )
 
 func TestPermissionHandlerSelectsOfferedOptionByKind(t *testing.T) {
-	workspaceRoot := "/workspace/project"
+	workspaceRoot := t.TempDir()
+	outsidePath := filepath.Join(filepath.Dir(workspaceRoot), "outside", "note.txt")
 
 	tests := []struct {
 		name          string
@@ -83,7 +86,7 @@ func TestPermissionHandlerSelectsOfferedOptionByKind(t *testing.T) {
 			posture: driver.PostureWorkspaceWrite,
 			request: permissionRequest(
 				protocol.ToolKindEdit,
-				[]protocol.ToolCallContent{{Diff: &protocol.Diff{Path: "/workspace/other/note.txt"}}},
+				[]protocol.ToolCallContent{{Diff: &protocol.Diff{Path: outsidePath}}},
 				permissionOptions(),
 			),
 			wantOptionID: "reject-by-kind",
@@ -169,6 +172,31 @@ func TestPermissionHandlerSelectsOfferedOptionByKind(t *testing.T) {
 				t.Fatalf("selected option id = %q, want %q", got.Outcome.Selected.OptionID, tt.wantOptionID)
 			}
 		})
+	}
+}
+
+func TestPathWithinWorkspaceRejectsSymlinkEscape(t *testing.T) {
+	workspaceRoot := t.TempDir()
+	outsideRoot := t.TempDir()
+	linkPath := filepath.Join(workspaceRoot, "linked")
+	if err := os.Symlink(outsideRoot, linkPath); err != nil {
+		t.Fatalf("create test symlink: %v", err)
+	}
+
+	if pathWithinWorkspace(workspaceRoot, filepath.Join(linkPath, "nested", "note.txt")) {
+		t.Fatal("path through an escaping symlink was accepted")
+	}
+}
+
+func TestPathWithinWorkspaceAllowsSafeNestedPath(t *testing.T) {
+	workspaceRoot := t.TempDir()
+	nestedRoot := filepath.Join(workspaceRoot, "nested", "directory")
+	if err := os.MkdirAll(nestedRoot, 0o755); err != nil {
+		t.Fatalf("create nested workspace directory: %v", err)
+	}
+
+	if !pathWithinWorkspace(workspaceRoot, filepath.Join(nestedRoot, "new-note.txt")) {
+		t.Fatal("safe nested path was rejected")
 	}
 }
 
