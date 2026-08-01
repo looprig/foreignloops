@@ -33,6 +33,41 @@ func TestBuildRestoredWithReturnsForeignBuilder(t *testing.T) {
 	var _ foreign.RestoredBuilder = BuildRestoredWith(Config{})
 }
 
+func TestBuildRestoredRejectsEmptySIDBeforeDial(t *testing.T) {
+	cfg := validConfig(HarnessCodex)
+	cfg.AgentSessionID = "caller-session-must-not-be-used"
+	var dialCalls int
+	installDial(t, func(context.Context, launch.Config) (dialedClient, error) {
+		dialCalls++
+		return nil, errors.New("dial must not run for an empty restore seed")
+	})
+
+	built, err := BuildRestoredWith(cfg)(
+		context.Background(),
+		uuid.UUID{},
+		uuid.UUID{},
+		loop.Provenance{},
+		nil,
+		nil,
+		nil,
+		nil,
+		foreign.RestoredForeign{},
+	)
+	if built != nil {
+		t.Fatalf("BuildRestoredWith() backend = %T, want nil", built)
+	}
+	var configErr *backend.ConfigError
+	if !errors.As(err, &configErr) {
+		t.Fatalf("BuildRestoredWith() error = %T %v, want *backend.ConfigError", err, err)
+	}
+	if configErr.Field != "RestoredForeign.ForeignSID" || configErr.Reason != "required" {
+		t.Fatalf("ConfigError = %+v, want empty restored SID", configErr)
+	}
+	if dialCalls != 0 {
+		t.Fatalf("ACP dial calls = %d, want 0 for invalid restore seed", dialCalls)
+	}
+}
+
 func TestBuildWithLiveLoopBindsACPSessionID(t *testing.T) {
 	workspace := t.TempDir()
 	cfg := validConfig(HarnessCodex)

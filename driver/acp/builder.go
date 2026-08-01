@@ -71,6 +71,9 @@ func BuildRestoredWith(cfg Config) foreign.RestoredBuilder {
 		fac *event.Factory,
 		seed foreign.RestoredForeign,
 	) (loop.Backend, error) {
+		if err := validateRestoredSeed(seed); err != nil {
+			return nil, err
+		}
 		resumeCfg := cfg
 		resumeCfg.AgentSessionID = seed.ForeignSID
 		d, err := New(loopCtx, resumeCfg)
@@ -99,6 +102,13 @@ func BuildRestoredWith(cfg Config) foreign.RestoredBuilder {
 		}
 		return state, nil
 	}
+}
+
+func validateRestoredSeed(seed foreign.RestoredForeign) error {
+	if seed.ForeignSID == "" {
+		return &backend.ConfigError{Field: "RestoredForeign.ForeignSID", Reason: "required"}
+	}
+	return nil
 }
 
 func legacyPosture(posture driver.Posture) driver.PermissionPosture {
