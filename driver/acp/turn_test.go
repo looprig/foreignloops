@@ -443,6 +443,7 @@ func TestTranslateToolResultRedactsUnknownAndNestedJSONFields(t *testing.T) {
 	assertDoesNotContain(t, preview,
 		"raw-credential", "raw-provider", "raw-error", "raw-unknown",
 		"nested-credential", "nested-provider", "nested-error",
+		`"credential"`, `"provider"`, `"error"`, `"unknown"`,
 	)
 }
 
@@ -473,8 +474,22 @@ func TestTranslateToolResultRedactsGatewayURLsInJSONAndPlainText(t *testing.T) {
 	)
 }
 
+func TestTranslateToolResultRedactsSensitivePhrasesInsideSafeFields(t *testing.T) {
+	rawOutput := json.RawMessage(`{"message":"provider Anthropic credential sk-live-message error raw provider failure","summary":"ordinary safe summary","detail":{"text":"provider OpenAI credential sk-live-nested"}}`)
+	preview := renderToolResult(nil, rawOutput)
+	if !strings.Contains(preview, "ordinary safe summary") {
+		t.Fatalf("preview = %q, want ordinary safe summary preserved", preview)
+	}
+	assertDoesNotContain(t, preview,
+		"Anthropic", "OpenAI", "sk-live-message", "sk-live-nested", "raw provider failure",
+	)
+
+	plainPreview := renderToolResult(nil, json.RawMessage(`provider Anthropic credential sk-live-raw`))
+	assertDoesNotContain(t, plainPreview, "Anthropic", "sk-live-raw")
+}
+
 func TestTranslateToolTitleRedactsUnknownFieldsAndURLs(t *testing.T) {
-	title := "Inspect provider=raw-provider https://gateway.internal/tools/private?credential=raw-credential"
+	title := "Inspect provider Anthropic credential sk-live-title https://gateway.internal/tools/private"
 	events := translateUpdate(protocol.SessionUpdate{ToolCall: &protocol.ToolCall{
 		ToolCallID: "tool-title-sensitive",
 		Title:      title,
@@ -483,7 +498,7 @@ func TestTranslateToolTitleRedactsUnknownFieldsAndURLs(t *testing.T) {
 		t.Fatalf("tool events = %#v, want safe title summary", events)
 	}
 	assertDoesNotContain(t, events[0].ToolName,
-		"raw-provider", "gateway.internal", "/tools/private", "raw-credential",
+		"Anthropic", "sk-live-title", "gateway.internal", "/tools/private",
 	)
 }
 

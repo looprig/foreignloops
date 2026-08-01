@@ -29,9 +29,11 @@ const (
 )
 
 var (
-	toolURLPattern    = regexp.MustCompile(`(?i)\b[a-z][a-z0-9+.-]*://[^\s<>"']+`)
-	toolAuthPattern   = regexp.MustCompile(`(?i)(\b(?:authorization|proxy-authorization)\b(?:\s*["']?\s*[:=]|\s+)\s*)([^\r\n,;&}\]]+)`)
-	toolSecretPattern = regexp.MustCompile(`(?i)(\b(?:api[\s_-]*key|access[\s_-]*token|refresh[\s_-]*token|secret[\s_-]*key|token|password|secret|credential|provider|error)\b\s*["']?\s*[:=]\s*)(?:"[^"]*"|'[^']*'|[^\s,;&}\]]+)`)
+	toolURLPattern             = regexp.MustCompile(`(?i)\b[a-z][a-z0-9+.-]*://[^\s<>"']+`)
+	toolAuthPattern            = regexp.MustCompile(`(?i)(\b(?:authorization|proxy-authorization)\b(?:\s*["']?\s*[:=]|\s+)\s*)([^\r\n,;&}\]]+)`)
+	toolSecretPattern          = regexp.MustCompile(`(?i)(\b(?:api[\s_-]*key|access[\s_-]*token|refresh[\s_-]*token|secret[\s_-]*key|token|password|secret|credential|provider|error)\b\s*["']?\s*[:=]\s*)(?:"[^"]*"|'[^']*'|[^\s,;&}\]]+)`)
+	toolSensitivePhrasePattern = regexp.MustCompile(`(?i)\b(?:api[\s_-]*key|access[\s_-]*token|refresh[\s_-]*token|secret[\s_-]*key|token|password|secret|credential|provider|authorization|proxy-authorization|error)\b(?:\s*["']?\s*[:=]\s*|\s+)[^\r\n,;]+`)
+	toolCredentialTokenPattern = regexp.MustCompile(`(?i)\b(?:sk|pk|ghp|gho|ghu|ghs|ghr|xox[baprs]|AIza)[-_][a-z0-9][a-z0-9._-]*\b`)
 )
 
 var safeToolJSONFields = map[string]struct{}{
@@ -247,7 +249,7 @@ func sanitizeToolOutput(raw json.RawMessage) string {
 	if looksLikeJSON(trimmed) {
 		return unsafeToolOutput
 	}
-	return sanitizePlainToolText(boundedToolText(string(raw)))
+	return sanitizeFreeText(boundedToolText(string(raw)))
 }
 
 func sanitizeToolText(text string) string {
@@ -258,7 +260,7 @@ func sanitizeToolText(text string) string {
 	if looksLikeJSON(trimmed) {
 		return unsafeToolOutput
 	}
-	return sanitizePlainToolText(text)
+	return sanitizeFreeText(text)
 }
 
 func renderSanitizedJSON(value any) string {
@@ -275,6 +277,12 @@ func renderSanitizedJSON(value any) string {
 
 func sanitizeToolTitle(title string) string {
 	return sanitizeToolText(boundedToolText(title))
+}
+
+func sanitizeFreeText(text string) string {
+	text = sanitizePlainToolText(text)
+	text = toolSensitivePhrasePattern.ReplaceAllString(text, redactedToolValue)
+	return toolCredentialTokenPattern.ReplaceAllString(text, redactedToolValue)
 }
 
 func decodeStrictJSON(raw []byte) (any, bool) {
@@ -359,11 +367,7 @@ func sanitizeJSONValue(value any, depth int) any {
 	case map[string]any:
 		out := make(map[string]any, len(typed))
 		for key, item := range typed {
-			if isSecretField(key) {
-				out[key] = redactedToolValue
-				continue
-			}
-			if !isSafeToolJSONField(key) {
+			if isSecretField(key) || !isSafeToolJSONField(key) {
 				continue
 			}
 			out[key] = sanitizeJSONValue(item, depth+1)
@@ -376,7 +380,7 @@ func sanitizeJSONValue(value any, depth int) any {
 		}
 		return out
 	case string:
-		return sanitizePlainToolText(typed)
+		return sanitizeFreeText(typed)
 	default:
 		return typed
 	}
