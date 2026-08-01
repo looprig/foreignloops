@@ -71,6 +71,8 @@ type Driver struct {
 	session session
 
 	agentSessionID string
+	driverCtx      context.Context
+	turnMu         sync.Mutex
 
 	closeOnce sync.Once
 	closeErr  error
@@ -126,6 +128,7 @@ func New(ctx context.Context, cfg Config) (*Driver, error) {
 		owned:          owned,
 		session:        sess,
 		agentSessionID: string(sess.ID()),
+		driverCtx:      ctx,
 	}
 
 	if claude != nil {

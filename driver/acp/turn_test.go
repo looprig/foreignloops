@@ -1,0 +1,286 @@
+package acp
+
+import (
+	"context"
+	"reflect"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/looprig/acp/client"
+	"github.com/looprig/acp/protocol"
+	"github.com/looprig/core/content"
+	"github.com/looprig/foreignloops/driver"
+)
+
+type scriptedSession struct {
+	id      protocol.SessionID
+	updates chan client.Update
+
+	promptStarts chan struct{}
+	promptCalls  atomic.Int32
+	promptHook   func(int, []protocol.ContentBlock) (*client.PromptResult, error)
+
+	mu      sync.Mutex
+	prompts [][]protocol.ContentBlock
+}
+
+func newScriptedSession(id string) *scriptedSession {
+	return &scriptedSession{
+		id:           protocol.SessionID(id),
+		updates:      make(chan client.Update, 64),
+		promptStarts: make(chan struct{}, 16),
+	}
+}
+
+func (s *scriptedSession) ID() protocol.SessionID { return s.id }
+
+func (s *scriptedSession) ConfigOptions() []protocol.SessionConfigOption { return nil }
+
+func (s *scriptedSession) Modes() *protocol.SessionModeState { return nil }
+
+func (s *scriptedSession) SetConfigOption(context.Context, protocol.SessionConfigID, protocol.SessionConfigValueID) error {
+	return nil
+}
+
+func (s *scriptedSession) SetMode(context.Context, protocol.SessionModeID) error { return nil }
+
+func (s *scriptedSession) Prompt(_ context.Context, blocks []protocol.ContentBlock) (*client.PromptResult, error) {
+	call := int(s.promptCalls.Add(1))
+	s.mu.Lock()
+	s.prompts = append(s.prompts, cloneACPBlocks(blocks))
+	s.mu.Unlock()
+	s.promptStarts <- struct{}{}
+	if s.promptHook != nil {
+		return s.promptHook(call, blocks)
+	}
+	return &client.PromptResult{StopReason: protocol.StopReasonEndTurn}, nil
+}
+
+func (s *scriptedSession) Updates() <-chan client.Update { return s.updates }
+
+func cloneACPBlocks(blocks []protocol.ContentBlock) []protocol.ContentBlock {
+	return append([]protocol.ContentBlock(nil), blocks...)
+}
+
+func newTurnTestDriver(sess *scriptedSession) *Driver {
+	return &Driver{session: sess, driverCtx: context.Background()}
+}
+
+func TestSpawnTranslatesACPUpdatesAndLeavesSessionOwned(t *testing.T) {
+	sess := newScriptedSession("session-1")
+	release := make(chan struct{})
+	sess.promptHook = func(int, []protocol.ContentBlock) (*client.PromptResult, error) {
+		<-release
+		return &client.PromptResult{StopReason: protocol.StopReasonEndTurn}, nil
+	}
+	d := newTurnTestDriver(sess)
+	owned := &fakeDialedClient{}
+	d.owned = owned
+
+	stream, err := d.Spawn(context.Background(), driver.Turn{
+		SystemPrompt: "system rules",
+		Input:        []content.Block{&content.TextBlock{Text: "inspect the tree"}},
+	})
+	if err != nil {
+		t.Fatalf("Spawn() error = %v", err)
+	}
+	<-sess.promptStarts
+
+	sess.updates <- client.Update{SessionUpdate: protocol.SessionUpdate{
+		AgentMessageChunk: &protocol.ContentChunk{Content: protocol.ContentBlock{
+			Text: &protocol.TextContent{Text: "hello "},
+		}},
+	}}
+	sess.updates <- client.Update{SessionUpdate: protocol.SessionUpdate{
+		AgentThoughtChunk: &protocol.ContentChunk{Content: protocol.ContentBlock{
+			Text: &protocol.TextContent{Text: "thinking"},
+		}},
+	}}
+	sess.updates <- client.Update{SessionUpdate: protocol.SessionUpdate{
+		ToolCall: &protocol.ToolCall{
+			ToolCallID: "tool-1",
+			Title:      "Read file",
+			Kind:       toolKind(protocol.ToolKindRead),
+			RawInput:   []byte(`{"path":"main.go"}`),
+		},
+	}}
+	sess.updates <- client.Update{SessionUpdate: protocol.SessionUpdate{
+		ToolCallUpdate: &protocol.ToolCallUpdate{
+			ToolCallID: "tool-1",
+			Status:     toolStatus(protocol.ToolCallStatusCompleted),
+			Content: []protocol.ToolCallContent{{
+				Content: &protocol.Content{Content: protocol.ContentBlock{
+					Text: &protocol.TextContent{Text: "file contents"},
+				}},
+			}},
+		},
+	}}
+	// Plan is a known ACP update with no driver event yet; it must be ignored.
+	sess.updates <- client.Update{SessionUpdate: protocol.SessionUpdate{Plan: &protocol.Plan{}}}
+	close(release)
+
+	events := collectTurnEvents(t, stream)
+	wantKinds := []driver.Kind{
+		driver.KindTextDelta,
+		driver.KindThinkingDelta,
+		driver.KindToolUse,
+		driver.KindToolResult,
+		driver.KindStepComplete,
+		driver.KindTerminalOK,
+	}
+	if got := eventKinds(events); !reflect.DeepEqual(got, wantKinds) {
+		t.Fatalf("event kinds = %v, want %v", got, wantKinds)
+	}
+	if events[0].Text != "hello " || events[1].Text != "thinking" {
+		t.Fatalf("text events = %#v, want text and thought chunks", events[:2])
+	}
+	if events[2].ToolUseID != "tool-1" || events[2].ToolName != "Read file" {
+		t.Fatalf("tool use = %#v, want stable id and title", events[2])
+	}
+	if events[3].ToolUseID != "tool-1" || events[3].ResultPreview != "file contents" || events[3].IsError {
+		t.Fatalf("tool result = %#v, want completed preview", events[3])
+	}
+	if events[4].Message == nil || len(events[4].Message.Blocks) != 3 {
+		t.Fatalf("step complete message = %#v, want text/thought/tool blocks", events[4].Message)
+	}
+
+	sess.mu.Lock()
+	prompts := append([][]protocol.ContentBlock(nil), sess.prompts...)
+	sess.mu.Unlock()
+	if len(prompts) != 1 || len(prompts[0]) != 1 || prompts[0][0].Text == nil {
+		t.Fatalf("prompt blocks = %#v, want one text block", prompts)
+	}
+	wantPrompt := "<looprig-system>system rules</looprig-system>\n\n<user-task>inspect the tree</user-task>"
+	if got := prompts[0][0].Text.Text; got != wantPrompt {
+		t.Fatalf("prompt text = %q, want %q", got, wantPrompt)
+	}
+
+	history, err := stream.History()
+	if err != nil {
+		t.Fatalf("History() error = %v", err)
+	}
+	if history.Available || history.Steps != nil {
+		t.Fatalf("History() = %#v, want unavailable history", history)
+	}
+	if err := stream.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+	if owned.closeCalls != 0 {
+		t.Fatalf("stream Close() closed persistent client %d times, want 0", owned.closeCalls)
+	}
+}
+
+func TestSpawnReusesOnePersistentSessionAcrossTurns(t *testing.T) {
+	sess := newScriptedSession("session-2")
+	sess.promptHook = func(call int, _ []protocol.ContentBlock) (*client.PromptResult, error) {
+		sess.updates <- client.Update{SessionUpdate: protocol.SessionUpdate{
+			AgentMessageChunk: &protocol.ContentChunk{Content: protocol.ContentBlock{
+				Text: &protocol.TextContent{Text: "turn-" + string(rune('0'+call))},
+			}},
+		}}
+		return &client.PromptResult{StopReason: protocol.StopReasonEndTurn}, nil
+	}
+	d := newTurnTestDriver(sess)
+
+	for i := 1; i <= 2; i++ {
+		stream, err := d.Spawn(context.Background(), driver.Turn{Input: []content.Block{&content.TextBlock{Text: "next"}}})
+		if err != nil {
+			t.Fatalf("Spawn(%d) error = %v", i, err)
+		}
+		events := collectTurnEvents(t, stream)
+		if len(events) != 3 || events[0].Kind != driver.KindTextDelta || events[2].Kind != driver.KindTerminalOK {
+			t.Fatalf("turn %d events = %#v, want text, step, terminal", i, events)
+		}
+		if err := stream.Close(); err != nil {
+			t.Fatalf("turn %d Close() error = %v", i, err)
+		}
+	}
+	if got := sess.promptCalls.Load(); got != 2 {
+		t.Fatalf("Prompt calls = %d, want 2 on one session", got)
+	}
+}
+
+func TestTranslateUnknownACPUpdateIsIgnored(t *testing.T) {
+	state := &translationState{}
+	events := translateUpdate(protocol.SessionUpdate{Plan: &protocol.Plan{Entries: []protocol.PlanEntry{{Content: "future"}}}}, state)
+	if len(events) != 0 {
+		t.Fatalf("translateUpdate(plan) = %#v, want no driver events", events)
+	}
+	if events := translateUpdate(protocol.SessionUpdate{}, state); len(events) != 0 {
+		t.Fatalf("translateUpdate(zero) = %#v, want no driver events", events)
+	}
+}
+
+func TestStreamLifecycleIsRaceSafeDuringConcurrentDelivery(t *testing.T) {
+	sess := newScriptedSession("session-race")
+	release := make(chan struct{})
+	sess.promptHook = func(int, []protocol.ContentBlock) (*client.PromptResult, error) {
+		<-release
+		return &client.PromptResult{StopReason: protocol.StopReasonEndTurn}, nil
+	}
+	d := newTurnTestDriver(sess)
+	stream, err := d.Spawn(context.Background(), driver.Turn{Input: []content.Block{&content.TextBlock{Text: "race"}}})
+	if err != nil {
+		t.Fatalf("Spawn() error = %v", err)
+	}
+	<-sess.promptStarts
+
+	var wg sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			sess.updates <- client.Update{SessionUpdate: protocol.SessionUpdate{
+				AgentMessageChunk: &protocol.ContentChunk{Content: protocol.ContentBlock{
+					Text: &protocol.TextContent{Text: string(rune('a' + i))},
+				}},
+			}}
+		}(i)
+	}
+	for i := 0; i < 4; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_ = stream.Close()
+		}()
+	}
+	close(release)
+	_ = collectTurnEvents(t, stream)
+	wg.Wait()
+}
+
+func toolKind(kind protocol.ToolKind) *protocol.ToolKind { return &kind }
+
+func toolStatus(status protocol.ToolCallStatus) *protocol.ToolCallStatus { return &status }
+
+func collectTurnEvents(t *testing.T, stream driver.Stream) []driver.Event {
+	t.Helper()
+	var events []driver.Event
+	timeout := time.NewTimer(3 * time.Second)
+	defer timeout.Stop()
+	for {
+		select {
+		case event, ok := <-stream.Events():
+			if !ok {
+				return events
+			}
+			events = append(events, event)
+		case <-timeout.C:
+			t.Fatalf("timed out waiting for stream close; events = %#v", events)
+		}
+	}
+}
+
+func eventKinds(events []driver.Event) []driver.Kind {
+	kinds := make([]driver.Kind, 0, len(events))
+	for _, event := range events {
+		kinds = append(kinds, event.Kind)
+	}
+	return kinds
+}
+
+var _ session = (*scriptedSession)(nil)
+var _ turnSession = (*scriptedSession)(nil)
+var _ driver.Agent = (*Driver)(nil)
