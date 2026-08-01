@@ -5,6 +5,7 @@ import (
 
 	"github.com/looprig/acp/launch"
 	"github.com/looprig/foreignloops/driver"
+	"github.com/looprig/harness/pkg/loop"
 )
 
 // Harness identifies the ACP adapter contract selected by Config.
@@ -23,8 +24,12 @@ type Config struct {
 	Executable string
 	// Env is the complete child environment supplied by the caller.
 	Env []string
+	// Credential selects whether the child uses the product gateway or its
+	// own harness login state.
+	Credential loop.CredentialMode
 	// Binding is borrowed caller-owned proxy data. The driver never starts or
-	// closes anything represented by this value.
+	// closes anything represented by this value. It is required for
+	// gateway-backed children and must be zero for native-auth children.
 	Binding launch.ProxyBinding
 	// ModelAlias is the primary harness-facing model alias.
 	ModelAlias string
@@ -64,11 +69,21 @@ func (c Config) validate() error {
 		return &ConfigError{Field: "Harness", Reason: "must be a supported harness"}
 	}
 
+	switch c.Credential {
+	case loop.CredentialGatewayBacked, loop.CredentialNativeAuth:
+	default:
+		return &ConfigError{Field: "Credential", Reason: "must be a supported credential mode"}
+	}
+
 	if !cleanAbsolutePath(c.Executable) {
 		return &ConfigError{Field: "Executable", Reason: "must be a clean absolute path"}
 	}
-	if c.Binding.BaseURL == "" || c.Binding.Token == "" {
-		return &ConfigError{Field: "Binding", Reason: "is required"}
+	if c.Credential == loop.CredentialGatewayBacked {
+		if c.Binding.BaseURL == "" || c.Binding.Token == "" {
+			return &ConfigError{Field: "Binding", Reason: "is required"}
+		}
+	} else if c.Binding != (launch.ProxyBinding{}) {
+		return &ConfigError{Field: "Binding", Reason: "must be empty for native authentication"}
 	}
 	if c.ModelAlias == "" {
 		return &ConfigError{Field: "ModelAlias", Reason: "is required"}
@@ -91,6 +106,10 @@ func (c Config) validate() error {
 		}
 	}
 	return nil
+}
+
+func (c Config) gatewayBacked() bool {
+	return c.Credential == loop.CredentialGatewayBacked
 }
 
 func cleanAbsolutePath(path string) bool {

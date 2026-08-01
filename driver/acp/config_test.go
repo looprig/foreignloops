@@ -7,6 +7,7 @@ import (
 
 	"github.com/looprig/acp/launch"
 	"github.com/looprig/foreignloops/driver"
+	"github.com/looprig/harness/pkg/loop"
 )
 
 func validConfig(h Harness) Config {
@@ -14,6 +15,7 @@ func validConfig(h Harness) Config {
 		Harness:         h,
 		Executable:      "/opt/looprig/acp-adapter",
 		Env:             []string{"TOKEN=env-secret", "LANG=C"},
+		Credential:      loop.CredentialGatewayBacked,
 		Binding:         launch.ProxyBinding{BaseURL: "http://127.0.0.1:4141", Token: "binding-secret"},
 		ModelAlias:      "primary",
 		SmallModelAlias: "small",
@@ -57,6 +59,16 @@ func TestConfigValidateRejectsInvalidFields(t *testing.T) {
 			name:   "empty model alias",
 			field:  "ModelAlias",
 			mutate: func(cfg *Config) { cfg.ModelAlias = "" },
+		},
+		{
+			name:   "empty credential",
+			field:  "Credential",
+			mutate: func(cfg *Config) { cfg.Credential = "" },
+		},
+		{
+			name:   "unknown credential",
+			field:  "Credential",
+			mutate: func(cfg *Config) { cfg.Credential = loop.CredentialMode("unknown") },
 		},
 		{
 			name:   "invalid posture",
@@ -114,6 +126,18 @@ func TestConfigValidateRejectsInvalidFields(t *testing.T) {
 			field:  "Binding",
 			mutate: func(cfg *Config) { cfg.Binding.Token = "" },
 		},
+		{
+			name:   "gateway credential without binding",
+			field:  "Binding",
+			mutate: func(cfg *Config) { cfg.Binding = launch.ProxyBinding{} },
+		},
+		{
+			name:  "native credential with binding",
+			field: "Binding",
+			mutate: func(cfg *Config) {
+				cfg.Credential = loop.CredentialNativeAuth
+			},
+		},
 	}
 
 	for _, tt := range tests {
@@ -143,6 +167,20 @@ func TestConfigValidateRejectsInvalidFields(t *testing.T) {
 				if sensitive != "" && strings.Contains(err.Error(), sensitive) {
 					t.Errorf("ConfigError.Error() contains sensitive value %q: %q", sensitive, err)
 				}
+			}
+		})
+	}
+}
+
+func TestConfigValidateAcceptsNativeAuthWithoutBinding(t *testing.T) {
+	for _, harness := range []Harness{HarnessClaudeCode, HarnessCodex} {
+		t.Run(string(harness), func(t *testing.T) {
+			cfg := validConfig(harness)
+			cfg.Credential = loop.CredentialNativeAuth
+			cfg.Binding = launch.ProxyBinding{}
+
+			if err := cfg.validate(); err != nil {
+				t.Fatalf("validate() error = %v, want nil", err)
 			}
 		})
 	}

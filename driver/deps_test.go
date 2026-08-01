@@ -15,14 +15,16 @@ import (
 )
 
 const (
-	backendImportRoot = "github.com/looprig/foreignloops/backend"
-	coreContentImport = "github.com/looprig/core/content"
-	coreUUIDImport    = "github.com/looprig/core/uuid"
-	driverImportRoot  = "github.com/looprig/foreignloops/driver"
-	harnessImportRoot = "github.com/looprig/harness"
-	acpImportRoot     = "github.com/looprig/acp"
-	acpDriverDir      = "acp/"
-	acpBuilderFile    = "acp/builder.go"
+	backendImportRoot           = "github.com/looprig/foreignloops/backend"
+	coreContentImport           = "github.com/looprig/core/content"
+	coreUUIDImport              = "github.com/looprig/core/uuid"
+	driverImportRoot            = "github.com/looprig/foreignloops/driver"
+	harnessImportRoot           = "github.com/looprig/harness"
+	harnessLoopCredentialImport = "github.com/looprig/harness/pkg/loop"
+	acpImportRoot               = "github.com/looprig/acp"
+	acpDriverDir                = "acp/"
+	acpBuilderFile              = "acp/builder.go"
+	acpConfigFile               = "acp/config.go"
 )
 
 func forbiddenDriverImport(importPath string) bool {
@@ -99,6 +101,8 @@ func TestDriverImportAllowedForFile(t *testing.T) {
 		{name: "future nested root driver", file: "future/wire/decode.go", importPath: "github.com/looprig/foreignloops/driver", allowed: true},
 		{name: "future nested sibling", file: "future/wire/decode.go", importPath: "github.com/looprig/foreignloops/driver/claude", allowed: false},
 		{name: "future nested Harness", file: "future/wire/decode.go", importPath: "github.com/looprig/harness/pkg/command", allowed: false},
+		{name: "acp config credential mode", file: acpConfigFile, importPath: harnessLoopCredentialImport, allowed: true},
+		{name: "acp config unrelated Harness", file: acpConfigFile, importPath: "github.com/looprig/harness/pkg/event", allowed: false},
 		{name: "acp nested launch", file: "acp/config.go", importPath: "github.com/looprig/acp/launch", allowed: true},
 		{name: "acp nested driver", file: "acp/config.go", importPath: "github.com/looprig/foreignloops/driver", allowed: true},
 		{name: "claude nested acp forbidden", file: "claude/wire/decode.go", importPath: "github.com/looprig/acp/launch", allowed: false},
@@ -210,6 +214,9 @@ type dependencyViolation struct {
 
 func driverImportAllowedForFile(file, importPath string) bool {
 	file = filepath.ToSlash(filepath.Clean(file))
+	if file == acpConfigFile && importPath == harnessLoopCredentialImport {
+		return true
+	}
 	if file == acpBuilderFile {
 		switch {
 		case importPath == coreUUIDImport:

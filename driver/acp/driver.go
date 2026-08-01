@@ -92,9 +92,8 @@ func New(ctx context.Context, cfg Config) (*Driver, error) {
 		return nil, err
 	}
 
-	owned, err := dial(ctx, launch.Config{
-		SharedProxy: &cfg.Binding,
-		Harness:     harness,
+	launchCfg := launch.Config{
+		Harness: harness,
 		Client: client.Options{
 			Permissions: newPermissionHandler(cfg.Posture, cfg.WorkspaceRoot),
 		},
@@ -103,7 +102,14 @@ func New(ctx context.Context, cfg Config) (*Driver, error) {
 			Env:  append([]string(nil), cfg.Env...),
 			Dir:  cfg.WorkspaceRoot,
 		},
-	})
+	}
+	if cfg.gatewayBacked() {
+		launchCfg.SharedProxy = &cfg.Binding
+	} else {
+		launchCfg.NoProxy = true
+	}
+
+	owned, err := dial(ctx, launchCfg)
 	if err != nil {
 		return nil, fmt.Errorf("acp: dial: %w", err)
 	}

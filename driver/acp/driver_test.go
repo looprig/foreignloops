@@ -4,12 +4,14 @@ import (
 	"context"
 	"errors"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/looprig/acp/client"
 	"github.com/looprig/acp/launch"
 	"github.com/looprig/acp/protocol"
 	"github.com/looprig/foreignloops/driver"
+	"github.com/looprig/harness/pkg/loop"
 )
 
 type fakeSession struct {
@@ -257,8 +259,64 @@ func TestNewCodexCreatesOneSessionWithModelAndPosture(t *testing.T) {
 	if harness.Posture != wantPosture {
 		t.Fatalf("Codex posture = %+v, want %+v", harness.Posture, wantPosture)
 	}
+	if launchCfg.SharedProxy == nil {
+		t.Fatal("launch config SharedProxy = nil, want gateway binding")
+	}
+	if got := *launchCfg.SharedProxy; got != cfg.Binding {
+		t.Fatalf("launch SharedProxy = %+v, want %+v", got, cfg.Binding)
+	}
 	if err := d.Close(); err != nil {
 		t.Fatalf("Close() error = %v", err)
+	}
+}
+
+func TestNewNativeAuthOmitsProxyAndGatewayOverrides(t *testing.T) {
+	for _, harnessName := range []Harness{HarnessClaudeCode, HarnessCodex} {
+		t.Run(string(harnessName), func(t *testing.T) {
+			cfg := validConfig(harnessName)
+			cfg.Credential = loop.CredentialNativeAuth
+			cfg.Binding = launch.ProxyBinding{}
+			cfg.AgentSessionID = ""
+			originalEnv := append([]string(nil), cfg.Env...)
+			sess := newFakeSession("native-auth-session")
+			conn := &fakeClient{newSession: sess}
+			owned := &fakeDialedClient{acpClient: conn}
+			var launchCfg launch.Config
+			if harnessName == HarnessClaudeCode {
+				installClaudeConnectorFactory(t, func(models launch.ClaudeModels) claudeConnector {
+					return &fakeClaudeConnector{models: models}
+				})
+			}
+
+			installDial(t, func(_ context.Context, got launch.Config) (dialedClient, error) {
+				launchCfg = got
+				return owned, nil
+			})
+
+			d, err := New(context.Background(), cfg)
+			if err != nil {
+				t.Fatalf("New() error = %v", err)
+			}
+			defer func() { _ = d.Close() }()
+
+			if launchCfg.SharedProxy != nil {
+				t.Fatal("native launch config SharedProxy != nil, want nil")
+			}
+			if !launchCfg.NoProxy {
+				t.Fatal("native launch config NoProxy = false, want true")
+			}
+			if !reflect.DeepEqual(launchCfg.Command.Env, originalEnv) {
+				t.Fatalf("native launch env = %#v, want caller env %#v without gateway additions", launchCfg.Command.Env, originalEnv)
+			}
+
+			for _, entry := range launchCfg.Command.Env {
+				if strings.HasPrefix(entry, "ANTHROPIC_BASE_URL=") ||
+					strings.HasPrefix(entry, "ANTHROPIC_AUTH_TOKEN=") ||
+					strings.HasPrefix(entry, "LOOPRIG_PROXY_TOKEN=") {
+					t.Errorf("native configured env contains gateway entry %q", entry)
+				}
+			}
+		})
 	}
 }
 
