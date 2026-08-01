@@ -90,6 +90,16 @@ func New(ctx context.Context, cfg Config) (*Driver, error) {
 	if err := cfg.validate(); err != nil {
 		return nil, err
 	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	driverCtx, driverCancel := context.WithCancel(context.WithoutCancel(ctx))
+	driverOwnsContext := false
+	defer func() {
+		if !driverOwnsContext {
+			driverCancel()
+		}
+	}()
 
 	harness, claude, err := connectorFor(cfg)
 	if err != nil {
@@ -113,7 +123,7 @@ func New(ctx context.Context, cfg Config) (*Driver, error) {
 		launchCfg.NoProxy = true
 	}
 
-	owned, err := dial(ctx, launchCfg)
+	owned, err := dial(driverCtx, launchCfg)
 	if err != nil {
 		return nil, fmt.Errorf("acp: dial: %w", err)
 	}
@@ -126,7 +136,7 @@ func New(ctx context.Context, cfg Config) (*Driver, error) {
 		return nil, closeAfterConstructionFailure(owned, errors.New("acp: dial returned a nil ACP client"))
 	}
 
-	sess, err := createSession(ctx, acpClient, cfg)
+	sess, err := createSession(driverCtx, acpClient, cfg)
 	if err != nil {
 		return nil, closeAfterConstructionFailure(owned, err)
 	}
@@ -138,24 +148,26 @@ func New(ctx context.Context, cfg Config) (*Driver, error) {
 		owned:          owned,
 		session:        sess,
 		agentSessionID: string(sess.ID()),
+		driverCtx:      driverCtx,
+		driverCancel:   driverCancel,
 	}
-	d.driverCtx, d.driverCancel = context.WithCancel(context.Background())
 
 	// A loaded Claude session owns its existing configuration. ACP does not
 	// populate mutable config/mode capabilities for session/load, so only a
 	// fresh session receives the requested model and permission setup.
 	if claude != nil && cfg.AgentSessionID == "" {
-		if err := claude.SelectDefaultModel(ctx, sess); err != nil {
+		if err := claude.SelectDefaultModel(driverCtx, sess); err != nil {
 			return nil, closeAfterConstructionFailure(d, fmt.Errorf("acp: select default model: %w", err))
 		}
-		if err := claude.SelectSmallModel(ctx, sess); err != nil {
+		if err := claude.SelectSmallModel(driverCtx, sess); err != nil {
 			return nil, closeAfterConstructionFailure(d, fmt.Errorf("acp: select small model: %w", err))
 		}
-		if err := claude.ApplyPermissionMode(ctx, sess, claudePermissionMode(cfg.Posture)); err != nil {
+		if err := claude.ApplyPermissionMode(driverCtx, sess, claudePermissionMode(cfg.Posture)); err != nil {
 			return nil, closeAfterConstructionFailure(d, fmt.Errorf("acp: apply permission mode: %w", err))
 		}
 	}
 
+	driverOwnsContext = true
 	return d, nil
 }
 

@@ -206,6 +206,71 @@ func TestNewValidatesBeforeDial(t *testing.T) {
 	}
 }
 
+type constructionContextKey struct{}
+
+func TestNewUsesDriverOwnedContextForDial(t *testing.T) {
+	cfg := validConfig(HarnessCodex)
+	cfg.AgentSessionID = ""
+	callerBase := context.WithValue(context.Background(), constructionContextKey{}, "preserved-value")
+	callerCtx, cancelCaller := context.WithTimeout(callerBase, time.Hour)
+	defer cancelCaller()
+
+	conn := &fakeClient{newSession: newFakeSession("construction-context-session")}
+	owned := &fakeDialedClient{acpClient: conn}
+	var dialCtx context.Context
+	installDial(t, func(ctx context.Context, _ launch.Config) (dialedClient, error) {
+		dialCtx = ctx
+		return owned, nil
+	})
+
+	d, err := New(callerCtx, cfg)
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	if dialCtx == nil {
+		t.Fatal("dial context = nil, want driver-owned context")
+	}
+	if dialCtx == callerCtx {
+		t.Fatal("dial received caller context directly")
+	}
+	if got := dialCtx.Value(constructionContextKey{}); got != "preserved-value" {
+		t.Fatalf("dial context value = %v, want preserved caller value", got)
+	}
+	if _, ok := dialCtx.Deadline(); ok {
+		t.Fatal("dial context unexpectedly retained caller deadline")
+	}
+	cancelCaller()
+	if err := dialCtx.Err(); err != nil {
+		t.Fatalf("dial context error after caller cancellation = %v, want nil", err)
+	}
+	if err := d.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+	if err := dialCtx.Err(); err != context.Canceled {
+		t.Fatalf("dial context error after driver Close = %v, want context.Canceled", err)
+	}
+}
+
+func TestNewCancelsDriverOwnedContextWhenDialFails(t *testing.T) {
+	cfg := validConfig(HarnessCodex)
+	cfg.AgentSessionID = ""
+	var dialCtx context.Context
+	installDial(t, func(ctx context.Context, _ launch.Config) (dialedClient, error) {
+		dialCtx = ctx
+		return nil, errors.New("dial failed")
+	})
+
+	if _, err := New(context.Background(), cfg); err == nil {
+		t.Fatal("New() error = nil, want dial error")
+	}
+	if dialCtx == nil {
+		t.Fatal("dial context = nil, want captured driver-owned context")
+	}
+	if err := dialCtx.Err(); err != context.Canceled {
+		t.Fatalf("dial context error after construction failure = %v, want context.Canceled", err)
+	}
+}
+
 func TestNewClaudeCreatesOneSessionAppliesModelsAndPosture(t *testing.T) {
 	cfg := validConfig(HarnessClaudeCode)
 	cfg.AgentSessionID = ""
