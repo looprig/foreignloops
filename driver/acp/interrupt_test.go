@@ -191,7 +191,7 @@ func TestInterruptWatcherLogsCancelFailure(t *testing.T) {
 	turnCtx, cancelTurn := context.WithCancel(context.Background())
 	turnDone := make(chan struct{})
 	watcherDone := make(chan struct{})
-	go watchTurnCancellation(turnCtx, context.Background(), sess, turnDone, watcherDone, &turnLifecycle{})
+	go watchTurnCancellation(turnCtx, context.Background(), cancelTurn, sess, turnDone, watcherDone, &turnLifecycle{})
 	cancelTurn()
 
 	select {
@@ -201,6 +201,9 @@ func TestInterruptWatcherLogsCancelFailure(t *testing.T) {
 	}
 	if !strings.Contains(logs.String(), "acp: session cancel failed") {
 		t.Fatalf("logs = %q, want bounded cancellation warning", logs.String())
+	}
+	if strings.Contains(logs.String(), `error="cancel failed"`) {
+		t.Fatalf("logs = %q, want no raw ACP cancellation error", logs.String())
 	}
 }
 

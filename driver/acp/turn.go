@@ -68,8 +68,9 @@ type stream struct {
 
 // Spawn starts one prompt on the session created by New. The prompt itself is
 // deliberately run under the driver's context. The caller's context controls
-// only this stream's forwarding lifetime; protocol cancellation is handled by
-// the interrupt watcher in the next ACP turn phase.
+// this stream's forwarding lifetime, and the driver's context cancels it when
+// Driver.Close is called; protocol cancellation is handled by the interrupt
+// watcher in the turn phase.
 func (d *Driver) Spawn(ctx context.Context, turn driver.Turn) (driver.Stream, error) {
 	if d == nil || d.session == nil {
 		return nil, &driver.SpawnError{Cause: errors.New("acp: session unavailable")}
@@ -99,12 +100,14 @@ func (d *Driver) Spawn(ctx context.Context, turn driver.Turn) (driver.Stream, er
 		done:   done,
 		cancel: cancel,
 	}
-	go d.runTurn(turnCtx, driverCtx, sess, turn, events, done)
+	go d.runTurn(turnCtx, cancel, driverCtx, sess, turn, events, done)
 	return s, nil
 }
 
 func (d *Driver) runTurn(
-	turnCtx, driverCtx context.Context,
+	turnCtx context.Context,
+	turnCancel context.CancelFunc,
+	driverCtx context.Context,
 	sess turnSession,
 	turn driver.Turn,
 	events chan<- driver.Event,
@@ -113,11 +116,12 @@ func (d *Driver) runTurn(
 	turnDone := make(chan struct{})
 	watcherDone := make(chan struct{})
 	lifecycle := &turnLifecycle{}
-	go watchTurnCancellation(turnCtx, driverCtx, sess, turnDone, watcherDone, lifecycle)
+	go watchTurnCancellation(turnCtx, driverCtx, turnCancel, sess, turnDone, watcherDone, lifecycle)
 	defer func() {
 		lifecycle.finish()
 		close(turnDone)
 		<-watcherDone
+		turnCancel()
 		close(done)
 		close(events)
 		d.turnMu.Unlock()
@@ -138,7 +142,7 @@ func (d *Driver) runTurn(
 				updates = nil
 				continue
 			}
-			for _, event := range translateUpdate(update.SessionUpdate, state) {
+			for _, event := range translateLiveUpdate(update, state) {
 				sendTurnEvent(turnCtx, events, event)
 			}
 		case outcome := <-promptDone:
@@ -153,6 +157,7 @@ func (d *Driver) runTurn(
 
 func watchTurnCancellation(
 	turnCtx, driverCtx context.Context,
+	turnCancel context.CancelFunc,
 	sess turnSession,
 	turnDone <-chan struct{},
 	watcherDone chan<- struct{},
@@ -161,13 +166,21 @@ func watchTurnCancellation(
 	defer close(watcherDone)
 	select {
 	case <-turnCtx.Done():
-		if !lifecycle.beginCancel() {
-			return
-		}
-		if err := sess.Cancel(driverCtx); err != nil {
-			slog.Warn("acp: session cancel failed", "error", err)
-		}
+	case <-driverCtx.Done():
+		// Driver.Close owns driverCtx, while turnCtx belongs to this stream.
+		// Cancel forwarding before attempting protocol cancellation so an
+		// abandoned full Events channel cannot hold turnMu indefinitely.
+		turnCancel()
 	case <-turnDone:
+		return
+	}
+	if !lifecycle.beginCancel() {
+		return
+	}
+	if err := sess.Cancel(driverCtx); err != nil {
+		// Keep cancellation diagnostics fixed-category and avoid copying ACP
+		// error text, which may contain protocol payloads or credentials.
+		slog.Warn("acp: session cancel failed")
 	}
 }
 
@@ -186,13 +199,21 @@ func drainTurnUpdates(
 			if !ok {
 				return
 			}
-			for _, event := range translateUpdate(update.SessionUpdate, state) {
+			for _, event := range translateLiveUpdate(update, state) {
 				sendTurnEvent(turnCtx, events, event)
 			}
 		default:
 			return
 		}
 	}
+}
+
+func translateLiveUpdate(update client.Update, state *translationState) []driver.Event {
+	if update.Meta.IsReplay {
+		slog.Debug("acp: ignored replay session update")
+		return nil
+	}
+	return translateUpdate(update.SessionUpdate, state)
 }
 
 func sendTurnEvent(ctx context.Context, events chan<- driver.Event, event driver.Event) {

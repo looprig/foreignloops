@@ -9,13 +9,17 @@ import (
 	"net/url"
 	"regexp"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/looprig/acp/protocol"
 	"github.com/looprig/core/content"
 	"github.com/looprig/foreignloops/driver"
 )
 
-const maxACPPreviewRunes = 512
+const (
+	maxACPPreviewRunes   = 512
+	maxToolAssemblyRunes = maxACPPreviewRunes * 4
+)
 
 const (
 	redactedToolValue    = "[REDACTED]"
@@ -128,7 +132,7 @@ func translateToolCallUpdate(update *protocol.ToolCallUpdate, state *translation
 		if state.tools == nil {
 			state.tools = make(map[string]string)
 		}
-		state.tools[id] = bounded(*update.Title)
+		state.tools[id] = boundedToolName(*update.Title, nil)
 	}
 	return []driver.Event{{
 		Kind:          driver.KindToolResult,
@@ -145,19 +149,23 @@ func boundedToolName(title string, kind *protocol.ToolKind) string {
 	if title == "" {
 		title = "tool"
 	}
-	return bounded(title)
+	return bounded(sanitizeToolTitle(title))
 }
 
 func renderToolResult(parts []protocol.ToolCallContent, raw json.RawMessage) string {
 	var out strings.Builder
+	remaining := maxToolAssemblyRunes
 	for _, part := range parts {
 		switch {
 		case part.Content != nil:
-			appendContentText(&out, part.Content.Content)
+			appendContentText(&out, &remaining, part.Content.Content)
 		case part.Diff != nil:
-			out.WriteString(part.Diff.NewText)
+			appendBoundedText(&out, &remaining, part.Diff.NewText)
 		case part.Terminal != nil:
-			out.WriteString("terminal output available")
+			appendBoundedText(&out, &remaining, "terminal output available")
+		}
+		if remaining == 0 {
+			break
 		}
 	}
 	if out.Len() > 0 {
@@ -166,22 +174,49 @@ func renderToolResult(parts []protocol.ToolCallContent, raw json.RawMessage) str
 	return bounded(sanitizeToolOutput(raw))
 }
 
-func appendContentText(out *strings.Builder, block protocol.ContentBlock) {
+func appendContentText(out *strings.Builder, remaining *int, block protocol.ContentBlock) {
 	if block.Text != nil {
-		out.WriteString(block.Text.Text)
+		appendBoundedText(out, remaining, block.Text.Text)
 		return
 	}
 	if block.Resource != nil && block.Resource.Resource.TextResourceContents != nil {
-		out.WriteString(block.Resource.Resource.TextResourceContents.Text)
+		appendBoundedText(out, remaining, block.Resource.Resource.TextResourceContents.Text)
 	}
 }
 
 func bounded(text string) string {
-	runes := []rune(text)
-	if len(runes) <= maxACPPreviewRunes {
-		return text
+	prefix, _ := takeRunes(text, maxACPPreviewRunes)
+	return prefix
+}
+
+func boundedToolText(text string) string {
+	prefix, _ := takeRunes(text, maxToolAssemblyRunes)
+	return prefix
+}
+
+func appendBoundedText(out *strings.Builder, remaining *int, text string) {
+	if remaining == nil || *remaining <= 0 || text == "" {
+		return
 	}
-	return string(runes[:maxACPPreviewRunes])
+	prefix, count := takeRunes(text, *remaining)
+	out.WriteString(prefix)
+	*remaining -= count
+}
+
+func takeRunes(text string, limit int) (string, int) {
+	if limit <= 0 || text == "" {
+		return "", 0
+	}
+	count := 0
+	for offset := 0; offset < len(text); {
+		if count == limit {
+			return text[:offset], count
+		}
+		_, size := utf8.DecodeRuneInString(text[offset:])
+		offset += size
+		count++
+	}
+	return text, count
 }
 
 func sanitizeToolOutput(raw json.RawMessage) string {
@@ -198,7 +233,7 @@ func sanitizeToolOutput(raw json.RawMessage) string {
 	if looksLikeJSON(trimmed) {
 		return unsafeToolOutput
 	}
-	return sanitizePlainToolText(string(raw))
+	return sanitizePlainToolText(boundedToolText(string(raw)))
 }
 
 func sanitizeToolText(text string) string {
@@ -222,6 +257,10 @@ func renderSanitizedJSON(value any) string {
 		return unsafeToolOutput
 	}
 	return string(encoded)
+}
+
+func sanitizeToolTitle(title string) string {
+	return sanitizeToolText(boundedToolText(title))
 }
 
 func decodeStrictJSON(raw []byte) (any, bool) {

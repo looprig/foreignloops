@@ -204,6 +204,146 @@ func TestSpawnReusesOnePersistentSessionAcrossTurns(t *testing.T) {
 	}
 }
 
+func TestSpawnSkipsReplayUpdatesDuringForwardingAndDrain(t *testing.T) {
+	sess := newScriptedSession("session-replay")
+	release := make(chan struct{})
+	sess.promptHook = func(int, []protocol.ContentBlock) (*client.PromptResult, error) {
+		<-release
+		return &client.PromptResult{StopReason: protocol.StopReasonEndTurn}, nil
+	}
+	d := newTurnTestDriver(sess)
+	stream, err := d.Spawn(context.Background(), driver.Turn{})
+	if err != nil {
+		t.Fatalf("Spawn() error = %v", err)
+	}
+	<-sess.promptStarts
+
+	sess.updates <- client.Update{
+		Meta: client.UpdateMeta{IsReplay: true},
+		SessionUpdate: protocol.SessionUpdate{AgentMessageChunk: &protocol.ContentChunk{Content: protocol.ContentBlock{
+			Text: &protocol.TextContent{Text: "replayed text"},
+		}}},
+	}
+	sess.updates <- client.Update{SessionUpdate: protocol.SessionUpdate{AgentMessageChunk: &protocol.ContentChunk{Content: protocol.ContentBlock{
+		Text: &protocol.TextContent{Text: "live text"},
+	}}}}
+
+	var events []driver.Event
+	select {
+	case event := <-stream.Events():
+		events = append(events, event)
+		if event.Kind != driver.KindTextDelta || event.Text != "live text" {
+			t.Fatalf("first event = %#v, want live text only", event)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for live update")
+	}
+
+	// This replay notification is queued for the prompt-completion drain path.
+	sess.updates <- client.Update{
+		Meta: client.UpdateMeta{IsReplay: true},
+		SessionUpdate: protocol.SessionUpdate{ToolCall: &protocol.ToolCall{
+			ToolCallID: "replayed-tool",
+			Title:      "replayed tool",
+		}},
+	}
+	close(release)
+	events = append(events, collectTurnEvents(t, stream)...)
+
+	wantKinds := []driver.Kind{driver.KindTextDelta, driver.KindStepComplete, driver.KindTerminalOK}
+	if got := eventKinds(events); !reflect.DeepEqual(got, wantKinds) {
+		t.Fatalf("event kinds = %v, want %v", got, wantKinds)
+	}
+	if events[1].Message == nil || len(events[1].Message.Blocks) != 1 {
+		t.Fatalf("step complete message = %#v, want only live text", events[1].Message)
+	}
+}
+
+func TestDrainTurnUpdatesSkipsReplayNotifications(t *testing.T) {
+	updates := make(chan client.Update, 2)
+	updates <- client.Update{
+		Meta: client.UpdateMeta{IsReplay: true},
+		SessionUpdate: protocol.SessionUpdate{ToolCall: &protocol.ToolCall{
+			ToolCallID: "replayed-tool",
+			Title:      "replayed tool",
+		}},
+	}
+	updates <- client.Update{SessionUpdate: protocol.SessionUpdate{AgentMessageChunk: &protocol.ContentChunk{Content: protocol.ContentBlock{
+		Text: &protocol.TextContent{Text: "live drain text"},
+	}}}}
+
+	state := &translationState{}
+	events := make(chan driver.Event, 2)
+	drainTurnUpdates(context.Background(), updates, state, events)
+	close(events)
+
+	var got []driver.Event
+	for event := range events {
+		got = append(got, event)
+	}
+	if len(got) != 1 || got[0].Kind != driver.KindTextDelta || got[0].Text != "live drain text" {
+		t.Fatalf("drained events = %#v, want live text only", got)
+	}
+	if state.message() == nil || len(state.message().Blocks) != 1 {
+		t.Fatalf("drained state = %#v, want only live text", state.message())
+	}
+}
+
+func TestDriverCloseDoesNotWaitForAbandonedFullStream(t *testing.T) {
+	sess := newScriptedSession("session-close-full")
+	release := make(chan struct{})
+	sess.promptHook = func(int, []protocol.ContentBlock) (*client.PromptResult, error) {
+		<-release
+		return &client.PromptResult{StopReason: protocol.StopReasonEndTurn}, nil
+	}
+	driverCtx, driverCancel := context.WithCancel(context.Background())
+	d := &Driver{
+		session:      sess,
+		driverCtx:    driverCtx,
+		driverCancel: driverCancel,
+		owned:        &fakeDialedClient{},
+	}
+	stream, err := d.Spawn(context.Background(), driver.Turn{})
+	if err != nil {
+		t.Fatalf("Spawn() error = %v", err)
+	}
+	<-sess.promptStarts
+
+	for i := 0; i < cap(stream.Events())+1; i++ {
+		sess.updates <- client.Update{SessionUpdate: protocol.SessionUpdate{AgentMessageChunk: &protocol.ContentChunk{Content: protocol.ContentBlock{
+			Text: &protocol.TextContent{Text: "queued"},
+		}}}}
+	}
+	deadline := time.NewTimer(3 * time.Second)
+	defer deadline.Stop()
+	for len(stream.Events()) < cap(stream.Events()) {
+		select {
+		case <-deadline.C:
+			t.Fatalf("stream buffer did not fill: len=%d cap=%d", len(stream.Events()), cap(stream.Events()))
+		default:
+			time.Sleep(time.Millisecond)
+		}
+	}
+
+	closeDone := make(chan error, 1)
+	go func() { closeDone <- d.Close() }()
+	select {
+	case <-driverCtx.Done():
+		close(release)
+	case <-time.After(3 * time.Second):
+		close(release)
+		t.Fatal("Driver.Close() did not cancel the driver context")
+	}
+	select {
+	case err := <-closeDone:
+		if err != nil {
+			t.Fatalf("Driver.Close() error = %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("Driver.Close() blocked behind an abandoned full stream")
+	}
+}
+
 func TestTranslateUnknownACPUpdateIsIgnored(t *testing.T) {
 	state := &translationState{}
 	events := translateUpdate(protocol.SessionUpdate{Plan: &protocol.Plan{Entries: []protocol.PlanEntry{{Content: "future"}}}}, state)
@@ -295,6 +435,43 @@ func TestTranslateToolResultPreservesPlainJSONText(t *testing.T) {
 	if preview != "ordinary output" {
 		t.Fatalf("preview = %q, want unquoted ordinary text", preview)
 	}
+}
+
+func TestToolTranslationBoundsAdversarialOutputAndTitle(t *testing.T) {
+	title := "Inspect token=title-secret " + strings.Repeat("title ", maxACPPreviewRunes*32)
+	state := &translationState{}
+	toolEvents := translateUpdate(protocol.SessionUpdate{ToolCall: &protocol.ToolCall{
+		ToolCallID: "tool-large",
+		Title:      title,
+	}}, state)
+	if len(toolEvents) != 1 {
+		t.Fatalf("tool events = %#v, want one event", toolEvents)
+	}
+	if len([]rune(toolEvents[0].ToolName)) > maxACPPreviewRunes {
+		t.Fatalf("tool name length = %d, want <= %d", len([]rune(toolEvents[0].ToolName)), maxACPPreviewRunes)
+	}
+	assertDoesNotContain(t, toolEvents[0].ToolName, "title-secret")
+
+	largeOutput := strings.Repeat("ordinary output ", maxACPPreviewRunes*32)
+	resultEvents := translateUpdate(protocol.SessionUpdate{ToolCallUpdate: &protocol.ToolCallUpdate{
+		ToolCallID: "tool-large",
+		Content: []protocol.ToolCallContent{{
+			Content: &protocol.Content{Content: protocol.ContentBlock{
+				Text: &protocol.TextContent{Text: largeOutput},
+			}},
+		}, {
+			Content: &protocol.Content{Content: protocol.ContentBlock{
+				Text: &protocol.TextContent{Text: " password=output-secret"},
+			}},
+		}},
+	}}, state)
+	if len(resultEvents) != 1 {
+		t.Fatalf("result events = %#v, want one event", resultEvents)
+	}
+	if len([]rune(resultEvents[0].ResultPreview)) > maxACPPreviewRunes {
+		t.Fatalf("result preview length = %d, want <= %d", len([]rune(resultEvents[0].ResultPreview)), maxACPPreviewRunes)
+	}
+	assertDoesNotContain(t, resultEvents[0].ResultPreview, "output-secret")
 }
 
 func TestTranslateToolResultFailsSafelyOnMalformedOrAmbiguousJSON(t *testing.T) {
