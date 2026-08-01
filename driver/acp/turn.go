@@ -3,6 +3,7 @@ package acp
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"strings"
 	"sync"
 
@@ -19,11 +20,38 @@ type turnSession interface {
 	session
 	Prompt(context.Context, []protocol.ContentBlock) (*client.PromptResult, error)
 	Updates() <-chan client.Update
+	Cancel(context.Context) error
 }
 
 type promptOutcome struct {
 	result *client.PromptResult
 	err    error
+}
+
+// turnLifecycle closes the small race between a prompt completing and its
+// caller context being cancelled. A watcher that wins the race reserves the
+// cancellation before calling the ACP session; a completed turn prevents a
+// late session/cancel from reaching the next turn.
+type turnLifecycle struct {
+	mu         sync.Mutex
+	finished   bool
+	cancelling bool
+}
+
+func (l *turnLifecycle) beginCancel() bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.finished || l.cancelling {
+		return false
+	}
+	l.cancelling = true
+	return true
+}
+
+func (l *turnLifecycle) finish() {
+	l.mu.Lock()
+	l.finished = true
+	l.mu.Unlock()
 }
 
 // stream is one prompt view over Driver's persistent ACP session. Its close
@@ -78,9 +106,18 @@ func (d *Driver) runTurn(
 	events chan<- driver.Event,
 	done chan<- struct{},
 ) {
-	defer close(done)
-	defer close(events)
-	defer d.turnMu.Unlock()
+	turnDone := make(chan struct{})
+	watcherDone := make(chan struct{})
+	lifecycle := &turnLifecycle{}
+	go watchTurnCancellation(turnCtx, driverCtx, sess, turnDone, watcherDone, lifecycle)
+	defer func() {
+		lifecycle.finish()
+		close(turnDone)
+		<-watcherDone
+		close(done)
+		close(events)
+		d.turnMu.Unlock()
+	}()
 
 	promptDone := make(chan promptOutcome, 1)
 	go func() {
@@ -107,6 +144,26 @@ func (d *Driver) runTurn(
 			sendPromptTerminal(turnCtx, events, state, outcome)
 			return
 		}
+	}
+}
+
+func watchTurnCancellation(
+	turnCtx, driverCtx context.Context,
+	sess turnSession,
+	turnDone <-chan struct{},
+	watcherDone chan<- struct{},
+	lifecycle *turnLifecycle,
+) {
+	defer close(watcherDone)
+	select {
+	case <-turnCtx.Done():
+		if !lifecycle.beginCancel() {
+			return
+		}
+		if err := sess.Cancel(driverCtx); err != nil {
+			slog.Warn("acp: session cancel failed", "error", err)
+		}
+	case <-turnDone:
 	}
 }
 
@@ -146,7 +203,7 @@ func sendTurnEvent(ctx context.Context, events chan<- driver.Event, event driver
 
 func sendPromptTerminal(ctx context.Context, events chan<- driver.Event, state *translationState, outcome promptOutcome) {
 	if outcome.err != nil || outcome.result == nil {
-		sendTurnEvent(ctx, events, driver.Event{
+		sendTerminalEvent(ctx, events, driver.Event{
 			Kind:    driver.KindTerminalError,
 			ErrText: "acp prompt failed",
 		})
@@ -158,7 +215,23 @@ func sendPromptTerminal(ctx context.Context, events chan<- driver.Event, state *
 			Message: message,
 		})
 	}
-	sendTurnEvent(ctx, events, terminalEvent(outcome.result.StopReason))
+	sendTerminalEvent(ctx, events, terminalEvent(outcome.result.StopReason))
+}
+
+// sendTerminalEvent preserves the terminal marker when a cancelled turn is
+// still being drained. If the caller has abandoned the stream and its buffer
+// is full, the non-blocking fallback keeps the persistent session from being
+// wedged behind an unobserved stream; the backend already treats the canceled
+// turn context as interrupted.
+func sendTerminalEvent(ctx context.Context, events chan<- driver.Event, event driver.Event) {
+	select {
+	case events <- event:
+	case <-ctx.Done():
+		select {
+		case events <- event:
+		default:
+		}
+	}
 }
 
 func terminalEvent(reason protocol.StopReason) driver.Event {
