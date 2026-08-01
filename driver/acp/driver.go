@@ -93,6 +93,9 @@ func New(ctx context.Context, cfg Config) (*Driver, error) {
 	owned, err := dial(ctx, launch.Config{
 		SharedProxy: &cfg.Binding,
 		Harness:     harness,
+		Client: client.Options{
+			Permissions: newPermissionHandler(cfg.Posture, cfg.WorkspaceRoot),
+		},
 		Command: stdio.Command{
 			Path: cfg.Executable,
 			Env:  append([]string(nil), cfg.Env...),
