@@ -81,6 +81,8 @@ func (s *interruptSession) Prompt(ctx context.Context, _ []protocol.ContentBlock
 
 func (s *interruptSession) Updates() <-chan client.Update { return s.updates }
 
+func (s *interruptSession) WaitForUpdates(context.Context) error { return nil }
+
 func (s *interruptSession) Cancel(ctx context.Context) error {
 	s.cancelCalls.Add(1)
 	s.cancelContexts <- ctx

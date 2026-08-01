@@ -21,7 +21,30 @@ type turnSession interface {
 	Prompt(context.Context, []protocol.ContentBlock) (*client.PromptResult, error)
 	Updates() <-chan client.Update
 	Cancel(context.Context) error
+	WaitForUpdates(context.Context) error
 }
+
+// promptSession is the pre-barrier ACP client shape. The checked-out ACP
+// client does not expose WaitForUpdates yet, so Spawn wraps this legacy shape
+// with the compatibility stub below. Once the client-side ordered barrier
+// lands, *client.Session will satisfy turnSession directly and the wrapper is
+// bypassed.
+type promptSession interface {
+	session
+	Prompt(context.Context, []protocol.ContentBlock) (*client.PromptResult, error)
+	Updates() <-chan client.Update
+	Cancel(context.Context) error
+}
+
+type legacyTurnSession struct {
+	promptSession
+}
+
+// WaitForUpdates is an explicit compatibility seam for ACP clients built
+// before the ordered-delivery API. It intentionally has no behavior; the
+// client implementation that provides the barrier satisfies turnSession
+// directly and never uses this fallback.
+func (legacyTurnSession) WaitForUpdates(context.Context) error { return nil }
 
 type promptOutcome struct {
 	result *client.PromptResult
@@ -76,6 +99,13 @@ func (d *Driver) Spawn(ctx context.Context, turn driver.Turn) (driver.Stream, er
 		return nil, &driver.SpawnError{Cause: errors.New("acp: session unavailable")}
 	}
 	sess, ok := d.session.(turnSession)
+	if !ok {
+		legacy, legacyOK := d.session.(promptSession)
+		if legacyOK {
+			sess = legacyTurnSession{promptSession: legacy}
+			ok = true
+		}
+	}
 	if !ok {
 		return nil, &driver.SpawnError{Cause: errors.New("acp: session does not support turns")}
 	}
@@ -146,11 +176,39 @@ func (d *Driver) runTurn(
 				sendTurnEvent(turnCtx, events, event)
 			}
 		case outcome := <-promptDone:
-			// ACP sends session updates before the prompt response. Drain any
-			// notifications already queued so the terminal remains last.
-			drainTurnUpdates(turnCtx, updates, state, events)
-			sendPromptTerminal(turnCtx, events, state, outcome)
-			return
+			// The prompt response can become visible before the ordered
+			// notification handler has delivered the final session/update.
+			// Wait for the client barrier in a separate goroutine while this
+			// goroutine keeps consuming Updates; the client may need that
+			// consumer to make the barrier progress.
+			barrierDone := make(chan error, 1)
+			go func() {
+				barrierDone <- sess.WaitForUpdates(driverCtx)
+			}()
+			for {
+				select {
+				case update, ok := <-updates:
+					if !ok {
+						updates = nil
+						continue
+					}
+					for _, event := range translateLiveUpdate(update, state) {
+						sendTurnEvent(turnCtx, events, event)
+					}
+				case err := <-barrierDone:
+					if err != nil && driverCtx.Err() == nil {
+						// Keep the diagnostic fixed-category: ACP errors may
+						// contain protocol payloads or credentials.
+						slog.Warn("acp: update delivery barrier failed")
+					}
+					// The barrier covers ordered handler delivery. Drain the
+					// session channel once more so a final handoff that became
+					// ready with the barrier cannot be consumed by the next turn.
+					drainTurnUpdates(turnCtx, updates, state, events)
+					sendPromptTerminal(turnCtx, events, state, outcome)
+					return
+				}
+			}
 		}
 	}
 }
@@ -314,3 +372,4 @@ func (s *stream) Close() error {
 
 var _ driver.Agent = (*Driver)(nil)
 var _ driver.Stream = (*stream)(nil)
+var _ turnSession = legacyTurnSession{}

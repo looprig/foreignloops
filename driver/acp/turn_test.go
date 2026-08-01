@@ -22,7 +22,9 @@ type scriptedSession struct {
 
 	promptStarts chan struct{}
 	promptCalls  atomic.Int32
+	barrierCalls atomic.Int32
 	promptHook   func(int, []protocol.ContentBlock) (*client.PromptResult, error)
+	barrierHook  func(context.Context) error
 
 	mu      sync.Mutex
 	prompts [][]protocol.ContentBlock
@@ -61,6 +63,14 @@ func (s *scriptedSession) Prompt(_ context.Context, blocks []protocol.ContentBlo
 }
 
 func (s *scriptedSession) Updates() <-chan client.Update { return s.updates }
+
+func (s *scriptedSession) WaitForUpdates(ctx context.Context) error {
+	s.barrierCalls.Add(1)
+	if s.barrierHook != nil {
+		return s.barrierHook(ctx)
+	}
+	return nil
+}
 
 func cloneACPBlocks(blocks []protocol.ContentBlock) []protocol.ContentBlock {
 	return append([]protocol.ContentBlock(nil), blocks...)
@@ -201,6 +211,80 @@ func TestSpawnReusesOnePersistentSessionAcrossTurns(t *testing.T) {
 	}
 	if got := sess.promptCalls.Load(); got != 2 {
 		t.Fatalf("Prompt calls = %d, want 2 on one session", got)
+	}
+}
+
+func TestSpawnWaitsForOrderedUpdateDeliveryBeforeTerminal(t *testing.T) {
+	sess := newScriptedSession("session-barrier")
+	promptReturned := make(chan struct{})
+	barrierStarted := make(chan struct{})
+	releaseBarrier := make(chan struct{})
+	sess.promptHook = func(call int, _ []protocol.ContentBlock) (*client.PromptResult, error) {
+		if call == 1 {
+			close(promptReturned)
+		}
+		return &client.PromptResult{StopReason: protocol.StopReasonEndTurn}, nil
+	}
+	sess.barrierHook = func(ctx context.Context) error {
+		if sess.barrierCalls.Load() != 1 {
+			return nil
+		}
+		close(barrierStarted)
+		select {
+		case <-releaseBarrier:
+			sess.updates <- client.Update{SessionUpdate: protocol.SessionUpdate{
+				AgentMessageChunk: &protocol.ContentChunk{Content: protocol.ContentBlock{
+					Text: &protocol.TextContent{Text: "delayed update"},
+				}},
+			}}
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	d := newTurnTestDriver(sess)
+
+	stream, err := d.Spawn(context.Background(), driver.Turn{})
+	if err != nil {
+		t.Fatalf("Spawn() error = %v", err)
+	}
+	<-sess.promptStarts
+	<-promptReturned
+	select {
+	case <-barrierStarted:
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for ordered update barrier")
+	}
+	select {
+	case event := <-stream.Events():
+		t.Fatalf("received event before barrier release: %#v", event)
+	default:
+	}
+
+	close(releaseBarrier)
+	events := collectTurnEvents(t, stream)
+	wantKinds := []driver.Kind{
+		driver.KindTextDelta,
+		driver.KindStepComplete,
+		driver.KindTerminalOK,
+	}
+	if got := eventKinds(events); !reflect.DeepEqual(got, wantKinds) {
+		t.Fatalf("event kinds = %v, want %v", got, wantKinds)
+	}
+	if events[0].Text != "delayed update" {
+		t.Fatalf("first event = %#v, want delayed update", events[0])
+	}
+
+	second, err := d.Spawn(context.Background(), driver.Turn{})
+	if err != nil {
+		t.Fatalf("second Spawn() error = %v", err)
+	}
+	secondEvents := collectTurnEvents(t, second)
+	if got := eventKinds(secondEvents); !reflect.DeepEqual(got, []driver.Kind{driver.KindTerminalOK}) {
+		t.Fatalf("second turn events = %v, want terminal only", got)
+	}
+	if got := sess.barrierCalls.Load(); got != 2 {
+		t.Fatalf("barrier calls = %d, want one per persistent turn", got)
 	}
 }
 
