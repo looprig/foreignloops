@@ -155,25 +155,60 @@ func (a *initAgent) Close() error { return a.agent.Close() }
 type initStream struct {
 	inner  driver.Stream
 	events <-chan driver.Event
+	done   <-chan struct{}
+	cancel context.CancelFunc
+
+	closeOnce sync.Once
+	closeErr  error
 }
 
 func newInitStream(inner driver.Stream, sessionID string) driver.Stream {
+	ctx, cancel := context.WithCancel(context.Background())
 	events := make(chan driver.Event, 1)
+	done := make(chan struct{})
 	go func() {
+		defer close(done)
 		defer close(events)
-		events <- driver.Event{Kind: driver.KindInit, SessionID: sessionID}
-		for event := range inner.Events() {
-			events <- event
+		select {
+		case events <- driver.Event{Kind: driver.KindInit, SessionID: sessionID}:
+		case <-ctx.Done():
+			return
+		}
+		innerEvents := inner.Events()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case event, ok := <-innerEvents:
+				if !ok {
+					return
+				}
+				select {
+				case events <- event:
+				case <-ctx.Done():
+					return
+				}
+			}
 		}
 	}()
-	return &initStream{inner: inner, events: events}
+	return &initStream{inner: inner, events: events, done: done, cancel: cancel}
 }
 
 func (s *initStream) Events() <-chan driver.Event { return s.events }
 
 func (s *initStream) History() (driver.History, error) { return s.inner.History() }
 
-func (s *initStream) Close() error { return s.inner.Close() }
+func (s *initStream) Close() error {
+	if s == nil {
+		return nil
+	}
+	s.closeOnce.Do(func() {
+		s.cancel()
+		s.closeErr = s.inner.Close()
+		<-s.done
+	})
+	return s.closeErr
+}
 
 var (
 	_ foreign.Builder         = BuildWith(Config{})

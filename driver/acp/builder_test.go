@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -220,9 +221,77 @@ func TestBuilderMapsNeutralPostureAtBackendBoundary(t *testing.T) {
 	}
 }
 
+func TestInitStreamCloseWithoutDrainStopsForwarder(t *testing.T) {
+	inner := newCloseBlockingStream()
+	wrapped := newInitStream(inner, "session").(*initStream)
+	out := wrapped.Events()
+
+	if got := <-out; got.Kind != driver.KindInit || got.SessionID != "session" {
+		t.Fatalf("first wrapper event = %#v, want synthetic init", got)
+	}
+	inner.events <- driver.Event{Kind: driver.KindTextDelta, Text: "first"}
+	if got := <-out; got.Text != "first" {
+		t.Fatalf("forwarded event = %#v, want first event", got)
+	}
+
+	// The second event occupies the one-slot output buffer. The third has been
+	// received from the inner stream and leaves the forwarding goroutine blocked
+	// on output; no consumer drains it before Close.
+	sent := make(chan struct{})
+	go func() {
+		inner.events <- driver.Event{Kind: driver.KindTextDelta, Text: "buffered"}
+		inner.events <- driver.Event{Kind: driver.KindTextDelta, Text: "blocked"}
+		close(sent)
+	}()
+	select {
+	case <-sent:
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out staging blocked wrapper output")
+	}
+
+	if err := wrapped.Close(); err != nil {
+		t.Fatalf("first Close() error = %v", err)
+	}
+	if err := wrapped.Close(); err != nil {
+		t.Fatalf("second Close() error = %v", err)
+	}
+	select {
+	case <-wrapped.done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("initStream forwarder did not stop after Close without drain")
+	}
+	if got := inner.closeCalls.Load(); got != 1 {
+		t.Fatalf("inner Close calls = %d, want exactly one", got)
+	}
+}
+
 type builderPublisher struct {
 	mu     sync.Mutex
 	events []event.Event
+}
+
+type closeBlockingStream struct {
+	events     chan driver.Event
+	closeCalls atomic.Int32
+	closeOnce  sync.Once
+}
+
+func newCloseBlockingStream() *closeBlockingStream {
+	return &closeBlockingStream{events: make(chan driver.Event)}
+}
+
+func (s *closeBlockingStream) Events() <-chan driver.Event { return s.events }
+
+func (s *closeBlockingStream) History() (driver.History, error) {
+	return driver.History{Available: false}, nil
+}
+
+func (s *closeBlockingStream) Close() error {
+	s.closeOnce.Do(func() {
+		s.closeCalls.Add(1)
+		close(s.events)
+	})
+	return nil
 }
 
 func (p *builderPublisher) PublishEvent(_ context.Context, input event.Event) error {
