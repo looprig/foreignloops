@@ -29,10 +29,10 @@ var (
 	_ Event = RestoreStarted{}
 	_ Event = RestoreDone{}
 	_ Event = RestoreErrored{}
+	_ Event = ConfigurationAdopted{}
 	_ Event = WorkspaceCheckpointed{}
 	_ Event = WorkspaceRestored{}
 	_ Event = ActiveLoopChanged{}
-	_ Event = SecurityLimitChanged{}
 	_ Event = IntegrationStatus{}
 
 	// Loop-scoped events.
@@ -43,6 +43,8 @@ var (
 	_ Event = LoopModeChanged{}
 	_ Event = LoopExternalToolsetChanged{}
 	_ Event = ForeignSessionBound{}
+	_ Event = LoopAgentSessionBound{}
+	_ Event = LoopRestoreTombstoned{}
 	_ Event = CompactionStarted{}
 	_ Event = CompactionCommitted{}
 	_ Event = CompactionRejected{}
@@ -64,4 +66,6 @@ var (
 	_ Event = UserInputRequested{}
 	_ Event = ToolCallStarted{}
 	_ Event = ToolCallCompleted{}
+	_ Event = PermissionReviewStarted{}
+	_ Event = PermissionReviewCompleted{}
 )

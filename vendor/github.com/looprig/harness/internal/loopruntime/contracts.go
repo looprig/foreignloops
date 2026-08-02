@@ -3,13 +3,9 @@ package loopruntime
 import "github.com/looprig/harness/pkg/loop"
 
 type (
-	Effect                 = loop.Effect
-	ToolPolicy             = loop.ToolPolicy
+	AccessGate             = loop.AccessGate
 	ReadGuard              = loop.ReadGuard
-	PermissionFactory      = loop.PermissionFactory
 	Delegation             = loop.Delegation
-	PermissionDecision     = loop.PermissionDecision
-	PermissionGate         = loop.PermissionGate
 	RuntimeContextProvider = loop.RuntimeContextProvider
 	Provenance             = loop.Provenance
 	ConfigError            = loop.ConfigError
@@ -17,14 +13,10 @@ type (
 	IDGenerationError      = loop.IDGenerationError
 	CommitError            = loop.CommitError
 	CommitCancelReason     = loop.CommitCancelReason
-	InvalidEffectError     = loop.InvalidEffectError
 	Backend                = loop.Backend
 )
 
 const (
-	EffectAsk              = loop.EffectAsk
-	EffectAutoApprove      = loop.EffectAutoApprove
-	EffectDeny             = loop.EffectDeny
 	ConfigMissingClient    = loop.ConfigMissingClient
 	ConfigInvalidModel     = loop.ConfigInvalidModel
 	ConfigMissingPublisher = loop.ConfigMissingPublisher
@@ -33,11 +25,12 @@ const (
 )
 
 var (
-	WithProvenance         = loop.WithProvenance
-	ProvenanceFrom         = loop.ProvenanceFrom
-	WithToolUseID          = loop.WithToolUseID
-	ToolUseIDFrom          = loop.ToolUseIDFrom
-	WithPrepared           = loop.WithPrepared
-	PreparedFromContext    = loop.PreparedFromContext
-	WithUserInputRequester = loop.WithUserInputRequester
+	WithProvenance          = loop.WithProvenance
+	ProvenanceFrom          = loop.ProvenanceFrom
+	WithToolUseID           = loop.WithToolUseID
+	ToolUseIDFrom           = loop.ToolUseIDFrom
+	WithPreparedCall        = loop.WithPreparedCall
+	PreparedCallFromContext = loop.PreparedCallFromContext
+	WithUserInputRequester  = loop.WithUserInputRequester
+	WithApprovalRequester   = loop.WithApprovalRequester
 )

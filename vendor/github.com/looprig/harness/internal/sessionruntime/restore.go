@@ -10,7 +10,6 @@ import (
 	"github.com/looprig/harness/pkg/hustle"
 	"github.com/looprig/harness/pkg/identity"
 	"github.com/looprig/harness/pkg/loop"
-	"github.com/looprig/harness/pkg/security"
 	model "github.com/looprig/inference/model"
 )
 
@@ -194,6 +193,49 @@ func firstConfigFingerprint(events []event.Event) (event.ConfigFingerprint, erro
 	return event.ConfigFingerprint{}, &RestoreDiscoveryError{Kind: RestoreNoSessionStarted}
 }
 
+// adoptedBaseline is the restore comparison baseline: the manifest and epoch of
+// the LATEST committed SessionStarted or ConfigurationAdopted. A legacy
+// SessionStarted (no manifest) yields a SchemaVersion-0 projection, which limits
+// drift assessment and forces a baseline upgrade on acceptance (Task 10).
+type adoptedBaseline struct {
+	Manifest event.ConfigManifest
+	Epoch    event.ConfigEpoch
+}
+
+// latestAdoptedBaseline scans the replayed stream for the baseline the next restore
+// assesses drift against: the manifest + epoch of the LATEST committed SessionStarted
+// or ConfigurationAdopted. Only the FIRST SessionStarted seeds epoch 1 (a legacy start
+// without a manifest projects via ManifestFromLegacy at SchemaVersion 0); a later
+// ConfigurationAdopted overrides both manifest and epoch, last-write-wins. A stream with
+// no SessionStarted fails closed with a typed *RestoreDiscoveryError — the same discovery
+// error firstConfigFingerprint returns.
+func latestAdoptedBaseline(events []event.Event) (adoptedBaseline, error) {
+	var baseline adoptedBaseline
+	found := false
+	for _, ev := range events {
+		switch typed := ev.(type) {
+		case event.SessionStarted:
+			if !found { // only the first SessionStarted seeds epoch 1
+				found = true
+				baseline.Epoch = 1
+				if typed.Manifest.SchemaVersion != 0 {
+					baseline.Manifest = typed.Manifest
+				} else {
+					baseline.Manifest = event.ManifestFromLegacy(typed.Config)
+				}
+			}
+		case event.ConfigurationAdopted:
+			found = true
+			baseline.Manifest = typed.Manifest
+			baseline.Epoch = typed.Epoch
+		}
+	}
+	if !found {
+		return adoptedBaseline{}, &RestoreDiscoveryError{Kind: RestoreNoSessionStarted}
+	}
+	return baseline, nil
+}
+
 // findRootLoopStarted locates the session's root LoopStarted: the one whose
 // Cause.Coordinates is zero (a root loop has no spawning loop/turn/step). Restore reads
 // two facts off it — the root loop's stable id (the recovered loop comes up under THIS
@@ -271,33 +313,17 @@ func effectiveCurrentWorkspace(events []event.Event) (string, bool) {
 	return ref, ok
 }
 
-// lastSecurityLimit returns the ordinal of the LAST SecurityLimitChanged event in the
-// replay — the live security security limit to re-seed on resume (last write wins) — and false if
-// the session never changed its security limit (it then resumes at the fail-secure most-restrictive
-// default). SecurityLimitChanged is session-scoped, so it is present in the unnarrowed
-// discovery drain; scanning to the end picks the newest (a change appends a fresh event,
-// never replacing the prior one). It mirrors effectiveCurrentWorkspace — a single-purpose
-// discovery scanner — so the restore constructor stays a straight-line assembly and
-// foldLoop stays pure.
-func lastSecurityLimit(events []event.Event) (security.Level, bool) {
-	level, ok := security.Level(0), false
-	for _, ev := range events {
-		if sc, isSC := ev.(event.SecurityLimitChanged); isSC {
-			level, ok = sc.Level, true // keep scanning; the LAST one wins
-		}
-	}
-	return level, ok
-}
-
 // restoredInference is the fold of one loop's selected mode and latest resolved
 // runtime. Every lifecycle event replaces Runtime, matching the actor's live
 // precedence, so restore does not consult a mutable model catalog for identity,
 // limits, or effort.
 type restoredInference struct {
-	Mode       loop.ModeName
-	HasMode    bool
-	Runtime    event.ModelRuntime
-	HasRuntime bool
+	Mode           loop.ModeName
+	HasMode        bool
+	Runtime        event.ModelRuntime
+	HasRuntime     bool
+	AgentRuntime   *event.AgentRuntime
+	AgentSessionID string
 }
 
 // foldLoopInference folds a loop's ordered lifecycle events into its durable mode
@@ -305,9 +331,11 @@ type restoredInference struct {
 // additive runtime retain the live bound definition fallback.
 func foldLoopInference(events []event.Event) restoredInference {
 	var ri restoredInference
+	var loopID uuid.UUID
 	for _, ev := range events {
 		switch e := ev.(type) {
 		case event.LoopStarted:
+			loopID = e.LoopID
 			// Seed the mode BASELINE from the durable start mode: a mode-selective spawn
 			// records the selected mode on LoopStarted and emits NO LoopModeChanged, so
 			// without this a child spawned in a non-default mode would resume at the
@@ -322,6 +350,13 @@ func foldLoopInference(events []event.Event) restoredInference {
 				ri.Runtime = e.Runtime
 				ri.HasRuntime = true
 			}
+			if e.AgentRuntime != nil {
+				copy := *e.AgentRuntime
+				ri.AgentRuntime = &copy
+				if copy.ACPSessionID != "" {
+					ri.AgentSessionID = copy.ACPSessionID
+				}
+			}
 		case event.LoopModeChanged:
 			ri.Mode = loop.ModeName(e.Mode)
 			ri.HasMode = true
@@ -333,6 +368,10 @@ func foldLoopInference(events []event.Event) restoredInference {
 		case event.LoopInferenceChanged:
 			ri.Runtime = e.Runtime
 			ri.HasRuntime = e.Runtime != (event.ModelRuntime{})
+		case event.LoopAgentSessionBound:
+			if loopID.IsZero() || e.LoopID == loopID {
+				ri.AgentSessionID = e.ACPSessionID
+			}
 		}
 	}
 	return ri
@@ -343,16 +382,17 @@ func foldLoopInference(events []event.Event) restoredInference {
 // the effective config it crashed under.
 func restoredStateFrom(folded foldResult, ri restoredInference) loopruntime.RestoredState {
 	return loopruntime.RestoredState{
-		Msgs:       folded.Msgs,
-		TurnIndex:  folded.TurnIndex,
-		Mode:       ri.Mode,
-		HasMode:    ri.HasMode,
-		Runtime:    ri.Runtime,
-		HasRuntime: ri.HasRuntime,
-		Context:    folded.Context,
-		HasContext: folded.HasContext,
-		Basis:      folded.Basis,
-		HasBasis:   folded.HasBasis,
+		Msgs:          folded.Msgs,
+		DerivedPrefix: folded.DerivedPrefix,
+		TurnIndex:     folded.TurnIndex,
+		Mode:          ri.Mode,
+		HasMode:       ri.HasMode,
+		Runtime:       ri.Runtime,
+		HasRuntime:    ri.HasRuntime,
+		Context:       folded.Context,
+		HasContext:    folded.HasContext,
+		Basis:         folded.Basis,
+		HasBasis:      folded.HasBasis,
 
 		AutomaticBasis:    folded.AutomaticBasis,
 		HasAutomaticBasis: folded.HasAutomaticBasis,
@@ -378,15 +418,23 @@ func restoredStateFrom(folded foldResult, ri restoredInference) loopruntime.Rest
 // The Task 8.3 constructor closes such a turn by synthesizing a TurnInterrupted
 // before resuming, so a resumed loop never observes a half-open turn.
 type foldResult struct {
-	Msgs       content.AgenticMessages
-	TurnIndex  event.TurnIndex
-	OpenTurn   bool
-	Runtime    event.ModelRuntime
-	HasRuntime bool
-	Context    event.ContextMeasurement
-	HasContext bool
-	Basis      event.ContextBasis
-	HasBasis   bool
+	Msgs content.AgenticMessages
+	// DerivedPrefix counts the leading messages in Msgs that are a
+	// compaction-generated summary rather than genuine human-authored
+	// conversation. It is 1 immediately after the last CompactionCommitted
+	// in the folded sequence replaces Msgs with its Summary (a
+	// model-generated *content.UserMessage), and 0 if no compaction has ever
+	// committed — see loopruntime.RestoredState.DerivedPrefix's doc comment
+	// for why this must be threaded through to a restored loop.
+	DerivedPrefix int
+	TurnIndex     event.TurnIndex
+	OpenTurn      bool
+	Runtime       event.ModelRuntime
+	HasRuntime    bool
+	Context       event.ContextMeasurement
+	HasContext    bool
+	Basis         event.ContextBasis
+	HasBasis      bool
 
 	AutomaticBasis    event.ContextBasis
 	HasAutomaticBasis bool
@@ -675,6 +723,7 @@ func foldLoop(events []event.Event) foldResult {
 	// matching content.AgenticMessages' documented empty zero value and the loop's
 	// own freshly-seeded msgs.
 	msgs := content.AgenticMessages{}
+	derivedPrefix := 0
 	var turnIndex event.TurnIndex
 	openTurn := false
 	var runtime event.ModelRuntime
@@ -760,6 +809,11 @@ func foldLoop(events []event.Event) foldResult {
 			}
 		case event.CompactionCommitted:
 			msgs = content.AgenticMessages{e.Summary}
+			// e.Summary is the compaction Hustle's model-generated summary
+			// (wrapped as a *content.UserMessage), not genuine human input,
+			// and it now IS the entirety of msgs — see foldResult.DerivedPrefix's
+			// doc comment.
+			derivedPrefix = 1
 			contextMeasurement = e.PostContext
 			hasContext = true
 			basis = e.PostContext.Basis
@@ -781,7 +835,7 @@ func foldLoop(events []event.Event) foldResult {
 		hasContext = false
 	}
 	return foldResult{
-		Msgs: msgs, TurnIndex: turnIndex, OpenTurn: openTurn,
+		Msgs: msgs, DerivedPrefix: derivedPrefix, TurnIndex: turnIndex, OpenTurn: openTurn,
 		Runtime: runtime, HasRuntime: hasRuntime,
 		Context: contextMeasurement, HasContext: hasContext, Err: foldErr,
 		Basis: basis, HasBasis: hasBasis,

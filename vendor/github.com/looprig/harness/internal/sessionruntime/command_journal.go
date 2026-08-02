@@ -12,7 +12,6 @@ import (
 	"github.com/looprig/harness/pkg/foreign"
 	"github.com/looprig/harness/pkg/journal"
 	"github.com/looprig/harness/pkg/loop"
-	"github.com/looprig/harness/pkg/security"
 	"github.com/looprig/harness/pkg/workspacestore"
 )
 
@@ -46,6 +45,12 @@ func (nopCommandAppender) AppendCommand(context.Context, journal.CommandRecord) 
 // appender (Phase 10) without New growing a positional parameter.
 type Option func(*Session)
 
+// RuntimeCatalogProvider returns the immutable runtime catalog visible to one
+// parent definition. Returning false preserves the native/no-choice surface
+// for that parent. A provider is composition-root policy and must not derive
+// entries from model-controlled request data.
+type RuntimeCatalogProvider func(parent loop.Definition) (loop.RuntimeCatalog, bool)
+
 // WithCommandAppender injects the intent-log appender (the composition
 // root's adapter over SessionJournal). A nil appender is ignored (the nop default stays
 // installed) so a caller can never accidentally null out the field and nil-deref the
@@ -54,23 +59,6 @@ func WithCommandAppender(a commandAppender) Option {
 	return func(s *Session) {
 		if a != nil {
 			s.cmdAppender = a
-		}
-	}
-}
-
-// WithSecurityLimit injects the session's SECURITY LIMIT source — the SAME *security.Limit the
-// composition root wires into the permission checker via tools.WithSecurityLimitPostures.
-// Sharing ONE state is what makes SetSecurityLimit's clamp visible to the checker on the
-// next Check (SPEC §8). Without this option the session mints its own internal state
-// (SetSecurityLimit still journals/applies/emits, but no checker observes it). A nil
-// state is ignored (the default internal state stays), so a wiring slip can never null the
-// field. It applies to both New and Restore — Restore re-seeds the injected state from the
-// folded SecurityLimitChanged events, so the checker sees the recovered security limit on
-// resume.
-func WithSecurityLimit(cs *security.Limit) Option {
-	return func(s *Session) {
-		if cs != nil {
-			s.securityLimit = cs
 		}
 	}
 }
@@ -141,6 +129,24 @@ func WithLimits(l Limits) Option {
 func WithAllowConfigMismatch() Option {
 	return func(s *Session) {
 		s.allowConfigMismatch = true
+		// The deprecated shim also installs the accept-all decider so a manifest-carrying
+		// caller that opts into mismatch accepts Warn drift through the NEW drift-assessed
+		// path too (the legacy path still reads the bool). A later WithRestoreDecider on the
+		// same session overrides this.
+		s.restoreDecider = AcceptAllDecider{}
+	}
+}
+
+// WithRestoreDecider installs the restore-only application policy that answers a
+// configuration-drift assessment (the successor seam to WithAllowConfigMismatch).
+// A nil decider is ignored so a wiring slip cannot null the field — the session
+// then keeps its fail-secure DefaultPolicyDecider{} default. New ignores the
+// decider (only Restore assesses drift); a later task consumes it in the restore path.
+func WithRestoreDecider(decider RestoreDecider) Option {
+	return func(s *Session) {
+		if decider != nil {
+			s.restoreDecider = decider
+		}
 	}
 }
 
@@ -204,6 +210,16 @@ func WithFingerprint(fingerprint event.ConfigFingerprint) Option {
 	}
 }
 
+// WithManifest installs the rig-assembled ConfigManifest counterpart to the frozen
+// fingerprint. The session stamps it onto the construction-time SessionStarted's
+// additive Manifest field.
+func WithManifest(manifest event.ConfigManifest) Option {
+	return func(s *Session) {
+		copy := manifest
+		s.frozenManifest = &copy
+	}
+}
+
 // WithForeignBuilders wires the composition-root seam that constructs foreign-engine
 // loops (live + restored). Without it, a foreign-engine definition fails closed at newLoop
 // (SessionForeignBuilderMissing) and at restore (RestoreForeignBuilderMissing) — a
@@ -214,6 +230,31 @@ func WithForeignBuilders(b foreign.Builder, rb foreign.RestoredBuilder) Option {
 	return func(s *Session) {
 		s.foreignBuild = b
 		s.foreignBuildRestored = rb
+	}
+}
+
+// WithForeignBuilderRegistry injects profile-keyed foreign construction while
+// retaining the legacy function-pair seam for EngineForeignClaude/Codex.
+func WithForeignBuilderRegistry(registry *foreign.BuilderRegistry) Option {
+	return func(s *Session) { s.foreignRegistry = registry }
+}
+
+// WithRuntimeCatalog installs one immutable parent-scoped catalog snapshot. The
+// same value feeds Subagent schema/preparation and controller revalidation.
+func WithRuntimeCatalog(catalog loop.RuntimeCatalog) Option {
+	return func(s *Session) {
+		s.runtimeCatalog = catalog
+		s.hasRuntimeCatalog = true
+	}
+}
+
+// WithRuntimeCatalogProvider installs parent-specific catalog snapshots. It
+// takes precedence over WithRuntimeCatalog when both are supplied.
+func WithRuntimeCatalogProvider(provider RuntimeCatalogProvider) Option {
+	return func(s *Session) {
+		if provider != nil {
+			s.runtimeCatalogProvider = provider
+		}
 	}
 }
 

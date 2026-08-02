@@ -9,6 +9,8 @@ import (
 	"github.com/looprig/harness/pkg/event"
 )
 
+const maxDelegateOutputBytes = 256 << 10
+
 // drainFailedError wraps a TurnFailed.Err terminal: the sub-loop's turn ended on
 // a non-cancellation provider/LLM error. Cause is the typed cause the loop
 // carried; callers errors.As to this type and errors.Is/As through Unwrap to the
@@ -157,21 +159,6 @@ func drainCorrelated(ctx context.Context, sub event.Subscription, commandID uuid
 	}
 }
 
-// handleEvent applies one event to the two-phase correlation state. It returns
-// done=true with the result (text+err) only on the matched turn's terminal (or a
-// phase-1 rejection); otherwise done=false and the caller keeps draining. turnID,
-// loopID, haveTurn, and lastStep are updated in place across calls.
-func handleEvent(
-	ev event.Event,
-	commandID uuid.UUID,
-	turnID *uuid.UUID,
-	loopID *uuid.UUID,
-	haveTurn *bool,
-	lastStep *string,
-) (text string, done bool, err error) {
-	return handleCorrelatedEvent(ev, commandID, turnID, loopID, haveTurn, lastStep, true)
-}
-
 func handleCorrelatedEvent(
 	ev event.Event,
 	commandID uuid.UUID,
@@ -241,6 +228,14 @@ func aiText(m *content.AIMessage) string {
 	var b strings.Builder
 	for _, blk := range m.Blocks {
 		if tb, ok := blk.(*content.TextBlock); ok {
+			remaining := maxDelegateOutputBytes - b.Len()
+			if remaining <= 0 {
+				break
+			}
+			if len(tb.Text) > remaining {
+				b.WriteString(tb.Text[:remaining])
+				break
+			}
 			b.WriteString(tb.Text)
 		}
 	}

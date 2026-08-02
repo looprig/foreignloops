@@ -18,6 +18,7 @@ import (
 	"github.com/looprig/harness/pkg/journal"
 	"github.com/looprig/harness/pkg/loop"
 	"github.com/looprig/harness/pkg/tool"
+	inferencemodel "github.com/looprig/inference/model"
 )
 
 // delegation.go is the session-runtime delegation manager (design §"Synchronous and
@@ -52,7 +53,10 @@ type delegationManager struct {
 	// loop's folded history (request id → the terminal of the correlated turn). It is the
 	// post-restore fallback for wait: the in-memory pending handle does not survive a
 	// process restart, but the child's committed turn terminal does. Guarded by mu.
-	resolved map[uuid.UUID]resolvedRequest
+	resolved               map[uuid.UUID]resolvedRequest
+	runtimeCatalog         loop.RuntimeCatalog
+	hasRuntimeCatalog      bool
+	runtimeCatalogProvider RuntimeCatalogProvider
 }
 
 type delegateAdmission struct {
@@ -126,21 +130,49 @@ type resolvedRequest struct {
 	text    string
 }
 
-func newDelegationManager(topology Topology) *delegationManager {
+func newDelegationManager(topology Topology, catalogs ...loop.RuntimeCatalog) *delegationManager {
 	byName := make(map[identity.AgentName]loop.Definition, len(topology.Definitions))
 	for _, def := range topology.Definitions {
 		byName[def.Name()] = def
 	}
-	return &delegationManager{
+	manager := &delegationManager{
 		byName:   byName,
 		requests: make(map[uuid.UUID]*pendingRequest),
 		resolved: make(map[uuid.UUID]resolvedRequest),
 	}
+	if len(catalogs) > 0 {
+		manager.runtimeCatalog = catalogs[0]
+		manager.hasRuntimeCatalog = true
+	}
+	return manager
+}
+
+func newDelegationManagerWithCatalogProvider(topology Topology, provider RuntimeCatalogProvider) *delegationManager {
+	manager := newDelegationManager(topology)
+	manager.runtimeCatalogProvider = provider
+	return manager
+}
+
+func (m *delegationManager) catalogFor(parent loop.Definition) (loop.RuntimeCatalog, bool) {
+	if m == nil {
+		return loop.RuntimeCatalog{}, false
+	}
+	if m.runtimeCatalogProvider != nil {
+		return m.runtimeCatalogProvider(parent)
+	}
+	if m.hasRuntimeCatalog {
+		return m.runtimeCatalog, true
+	}
+	return loop.RuntimeCatalog{}, false
 }
 
 // seedResolvedDelegateRecords reconstructs durable delegate correlation from required
 // machine NoFold intents, then overlays exact started-turn terminals and crash closures.
-func seedResolvedDelegateRecords(m *delegationManager, records []journal.JournalRecord, replayed, closures []event.Event) error {
+func seedResolvedDelegateRecords(m *delegationManager, records []journal.JournalRecord, replayed, closures []event.Event, tombstonedSet ...map[uuid.UUID]struct{}) error {
+	tombstoned := map[uuid.UUID]struct{}{}
+	if len(tombstonedSet) > 0 && tombstonedSet[0] != nil {
+		tombstoned = tombstonedSet[0]
+	}
 	intents := make(map[uuid.UUID]uuid.UUID)
 	for _, record := range records {
 		commandRecord, ok := record.(journal.CommandRecord)
@@ -185,6 +217,11 @@ func seedResolvedDelegateRecords(m *delegationManager, records []journal.Journal
 	for requestID, terminal := range foldDelegateTerminals(combined) {
 		if _, admitted := index[requestID]; admitted {
 			index[requestID] = terminal
+		}
+	}
+	for requestID, childID := range intents {
+		if _, ok := tombstoned[childID]; ok {
+			index[requestID] = resolvedRequest{childID: childID, status: tool.DelegateStatusFailed}
 		}
 	}
 	// A queued request may be durably cancelled before TurnStarted, so it has no
@@ -294,6 +331,11 @@ func delegateExtraTools(def loop.Definition, manager *delegationManager) []tool.
 		}
 		catalog[i] = entry
 	}
+	if manager != nil {
+		if runtimeCatalog, ok := manager.catalogFor(def); ok {
+			return []tool.Definition{delegationtool.Definition(def.Delegation().Style, catalog, runtimeCatalog)}
+		}
+	}
 	return []tool.Definition{delegationtool.Definition(def.Delegation().Style, catalog)}
 }
 
@@ -306,12 +348,16 @@ func (m *delegationManager) controllerFor(parentLoopID uuid.UUID, parent loop.De
 	for _, name := range parent.Delegates() {
 		allowed[name] = struct{}{}
 	}
-	return &scopedController{
+	controller := &scopedController{
 		manager:      m,
 		parentLoopID: parentLoopID,
 		style:        parent.Delegation().Style,
 		allowed:      allowed,
 	}
+	if m != nil {
+		controller.runtimeCatalog, controller.hasRuntimeCatalog = m.catalogFor(parent)
+	}
+	return controller
 }
 
 // pendingRequest is one in-flight wait:false delegate request: a background drain fills
@@ -385,11 +431,15 @@ func (m *delegationManager) pendingCount(childID uuid.UUID) int {
 // loop. It is the model-facing delegation seam; it holds no session directly, only the
 // manager, so the tool never receives the session or a session controller.
 type scopedController struct {
-	manager      *delegationManager
-	parentLoopID uuid.UUID
-	style        loop.DelegationStyle
-	allowed      map[identity.AgentName]struct{}
+	manager           *delegationManager
+	parentLoopID      uuid.UUID
+	style             loop.DelegationStyle
+	allowed           map[identity.AgentName]struct{}
+	runtimeCatalog    loop.RuntimeCatalog
+	hasRuntimeCatalog bool
 }
+
+const maxDelegateStatusChildren = 256
 
 var _ tool.DelegateController = (*scopedController)(nil)
 
@@ -433,9 +483,42 @@ func (c *scopedController) start(ctx context.Context, s *Session, req tool.Deleg
 	if !known {
 		return tool.DelegateResult{}, &DelegateError{Kind: DelegateUnknownAgent, Agent: agent}
 	}
+	if c.hasRuntimeCatalog && !c.runtimeCatalog.HasEntries() {
+		return tool.DelegateResult{}, &DelegateError{Kind: DelegateRuntimeUnavailable}
+	}
 	mode := loop.ModeName(req.Mode)
 	if err := validateDelegateMode(childDef, mode); err != nil {
 		return tool.DelegateResult{}, err
+	}
+	var runtime *loop.Resolved
+	if c.hasRuntimeCatalog {
+		entries := c.runtimeCatalog.EntriesFor(agent)
+		if req.Runtime == nil && len(entries) > 0 {
+			resolved, err := c.runtimeCatalog.Resolve(agent, "", "", inferencemodel.EffortNone)
+			if err != nil {
+				return tool.DelegateResult{}, &DelegateError{Kind: DelegateRuntimeInvalid}
+			}
+			runtime = &resolved
+		}
+	}
+	if req.Runtime != nil {
+		if !c.hasRuntimeCatalog {
+			return tool.DelegateResult{}, &DelegateError{Kind: DelegateRuntimeUnavailable}
+		}
+		if !validControllerRuntimeSelection(c.runtimeCatalog, agent, *req.Runtime) {
+			return tool.DelegateResult{}, &DelegateError{Kind: DelegateRuntimeInvalid}
+		}
+		resolved, err := c.runtimeCatalog.ResolveWithExplicitEffort(
+			agent,
+			loop.AgentHarnessName(req.Runtime.Harness),
+			loop.ModelAlias(req.Runtime.Model),
+			parseRuntimeEffort(req.Runtime.Effort),
+			req.Runtime.Explicit.Effort,
+		)
+		if err != nil || string(resolved.AgentHarness) != req.Runtime.Harness || string(resolved.Profile) != req.Runtime.Profile || string(resolved.ModelAlias) != req.Runtime.Model || string(resolved.SmallModel) != req.Runtime.SmallModel || runtimeEffortString(resolved.Effort) != req.Runtime.Effort {
+			return tool.DelegateResult{}, &DelegateError{Kind: DelegateRuntimeInvalid}
+		}
+		runtime = &resolved
 	}
 	// Interrupt admission gate: a parent under an interrupt barrier admits no NEW machine
 	// delegate work (the machine side of the interrupt queue policy), so a parent whose
@@ -449,11 +532,90 @@ func (c *scopedController) start(ctx context.Context, s *Session, req tool.Deleg
 		return tool.DelegateResult{}, &DelegateError{Kind: DelegateInterruptPending, DelegateID: c.parentLoopID}
 	}
 	parent := loop.Provenance{LoopID: c.parentLoopID}
-	childID, requestID, sub, err := s.startDelegate(ctx, parent, childDef, mode, req.Message, req.ParentToolUseID)
+	childID, requestID, sub, err := s.startDelegate(ctx, parent, childDef, mode, req.Message, req.ParentToolUseID, runtime, c.runtimeCatalog, c.hasRuntimeCatalog)
 	if err != nil {
 		return tool.DelegateResult{}, err
 	}
 	return c.resolveOrQueue(ctx, s, childID, requestID, sub, req)
+}
+
+// validControllerRuntimeSelection re-applies the model-facing capability rules
+// at the controller boundary. Preparation normally supplies the Explicit bits,
+// but a caller can bypass schema/preparation and invoke the typed controller
+// directly, so omitted selectors must still equal catalog defaults and explicit
+// selectors must correspond to an actually selectable branch.
+func validControllerRuntimeSelection(catalog loop.RuntimeCatalog, agent identity.AgentName, runtime tool.DelegateRuntime) bool {
+	entries := catalog.EntriesFor(agent)
+	var selected *loop.RuntimeCatalogEntry
+	for i := range entries {
+		if entries[i].AgentHarness == loop.AgentHarnessName(runtime.Harness) {
+			selected = &entries[i]
+			break
+		}
+	}
+	if selected == nil {
+		return false
+	}
+	harnessSelectable := len(entries) > 1 || anyNonDefaultRuntimeHarness(entries)
+	if runtime.Explicit.Harness {
+		if !harnessSelectable {
+			return false
+		}
+	} else if !selected.Default {
+		return false
+	}
+	if runtime.Explicit.Model {
+		if len(selected.Models) <= 1 {
+			return false
+		}
+	} else if runtime.Model != string(selected.DefaultModel) {
+		return false
+	}
+	var selectedModel *loop.RuntimeModelOption
+	for i := range selected.Models {
+		if selected.Models[i].Alias == loop.ModelAlias(runtime.Model) {
+			selectedModel = &selected.Models[i]
+			break
+		}
+	}
+	if selectedModel == nil {
+		return false
+	}
+	if runtime.Explicit.Effort {
+		if len(runtimeEfforts(selected.Models)) <= 1 {
+			return false
+		}
+	} else if runtime.Effort != runtimeEffortString(selectedModel.DefaultEffort) {
+		return false
+	}
+	return true
+}
+
+func anyNonDefaultRuntimeHarness(entries []loop.RuntimeCatalogEntry) bool {
+	for _, entry := range entries {
+		if !entry.Default {
+			return true
+		}
+	}
+	return false
+}
+
+func runtimeEfforts(models []loop.RuntimeModelOption) []inferencemodel.Effort {
+	seen := make(map[inferencemodel.Effort]struct{})
+	for _, option := range models {
+		efforts := option.Efforts
+		if len(efforts) == 0 {
+			efforts = []inferencemodel.Effort{option.DefaultEffort}
+		}
+		for _, effort := range efforts {
+			seen[effort] = struct{}{}
+		}
+	}
+	result := make([]inferencemodel.Effort, 0, len(seen))
+	for effort := range seen {
+		result = append(result, effort)
+	}
+	return result
 }
 
 // send enqueues a distinct NON-FOLDING follow-up turn on an owned child and waits or
@@ -547,7 +709,7 @@ func (c *scopedController) interrupt(s *Session, req tool.DelegateRequest) (tool
 // when delegate_id is omitted. It never returns a raw event cursor or child transcript.
 func (c *scopedController) status(s *Session, req tool.DelegateRequest) (tool.DelegateResult, error) {
 	if !req.DelegateID.IsZero() {
-		if err := c.ownsChild(s, req.DelegateID); err != nil {
+		if err := c.ownsChildForStatus(s, req.DelegateID); err != nil {
 			return tool.DelegateResult{}, err
 		}
 		return tool.DelegateResult{
@@ -556,15 +718,20 @@ func (c *scopedController) status(s *Session, req tool.DelegateRequest) (tool.De
 			PendingRequests: c.manager.pendingCount(req.DelegateID),
 		}, nil
 	}
-	children := make([]tool.DelegateChildStatus, 0)
-	for _, id := range c.ownedChildren(s) {
+	owned := c.ownedChildren(s)
+	truncated := len(owned) > maxDelegateStatusChildren
+	if truncated {
+		owned = owned[:maxDelegateStatusChildren]
+	}
+	children := make([]tool.DelegateChildStatus, 0, len(owned))
+	for _, id := range owned {
 		children = append(children, tool.DelegateChildStatus{
 			DelegateID:      id,
 			Status:          c.childStatus(s, id),
 			PendingRequests: c.manager.pendingCount(id),
 		})
 	}
-	return tool.DelegateResult{Children: children}, nil
+	return tool.DelegateResult{Children: children, ChildrenTruncated: truncated}, nil
 }
 
 // resolveOrQueue waits for the correlated turn (wait:true) or registers a pending
@@ -592,11 +759,25 @@ func (c *scopedController) resolveOrQueue(ctx context.Context, s *Session, child
 // ownsChild fails closed unless childID is a registered loop whose parent is exactly
 // this controller's bound parent — rejecting siblings, ancestors, and unrelated loops.
 func (c *scopedController) ownsChild(s *Session, childID uuid.UUID) error {
+	return c.ownsChildWithClosed(s, childID, false)
+}
+
+func (c *scopedController) ownsChildForStatus(s *Session, childID uuid.UUID) error {
+	return c.ownsChildWithClosed(s, childID, true)
+}
+
+func (c *scopedController) ownsChildWithClosed(s *Session, childID uuid.UUID, allowClosed bool) error {
 	s.loopsMu.RLock()
 	handle, ok := s.loops[childID]
 	s.loopsMu.RUnlock()
-	if !ok || handle.parent.LoopID != c.parentLoopID {
+	if !ok {
 		return &DelegateError{Kind: DelegateNotOwned, DelegateID: childID}
+	}
+	if handle.parent.LoopID != c.parentLoopID {
+		return &DelegateError{Kind: DelegateNotOwned, DelegateID: childID}
+	}
+	if handle.tombstoned && !allowClosed {
+		return &DelegateError{Kind: DelegateClosed, DelegateID: childID}
 	}
 	return nil
 }
@@ -624,6 +805,9 @@ func (c *scopedController) childStatus(s *Session, childID uuid.UUID) tool.Deleg
 	s.loopsMu.RUnlock()
 	if !ok {
 		return tool.DelegateStatusUnknown
+	}
+	if handle.backend == nil {
+		return tool.DelegateStatusFailed
 	}
 	select {
 	case <-handle.backend.DoneChan():
@@ -701,13 +885,27 @@ func timeoutOrInterrupted(timeoutSeconds *int, waitCtx context.Context) tool.Del
 // subscription, request mint, backend construction, and initial-command acceptance all
 // precede the checked LoopStarted commit. The backend's publisher remains blocked until
 // that commit, so TurnStarted can neither race ahead nor survive a failed spawn.
-func (s *Session) startDelegate(ctx context.Context, parent loop.Provenance, cfg loop.Definition, mode loop.ModeName, message, parentToolUseID string) (childID, requestID uuid.UUID, sub event.Subscription, err error) {
+func (s *Session) startDelegate(ctx context.Context, parent loop.Provenance, cfg loop.Definition, mode loop.ModeName, message, parentToolUseID string, runtime *loop.Resolved, runtimeCatalog loop.RuntimeCatalog, hasRuntimeCatalog bool) (childID, requestID uuid.UUID, sub event.Subscription, err error) {
 	admission := &delegateAdmission{ctx: ctx, message: message}
-	childID, err = s.newLoopWithAdmission(parent, cfg, parentToolUseID, mode, nil, admission)
+	childID, err = s.newLoopWithAdmission(parent, cfg, parentToolUseID, mode, nil, admission, runtime, runtimeCatalog, hasRuntimeCatalog)
 	if err != nil {
 		return uuid.UUID{}, uuid.UUID{}, nil, err
 	}
 	return childID, admission.requestID, admission.sub, nil
+}
+
+func parseRuntimeEffort(value string) inferencemodel.Effort {
+	if value == "none" || value == "" {
+		return inferencemodel.EffortNone
+	}
+	return inferencemodel.Effort(value)
+}
+
+func runtimeEffortString(value inferencemodel.Effort) string {
+	if value == inferencemodel.EffortNone {
+		return "none"
+	}
+	return string(value)
 }
 
 // sendDelegate enqueues a distinct NON-FOLDING follow-up turn on an existing owned
@@ -751,6 +949,9 @@ func (s *Session) enqueueDelegateTurn(ctx context.Context, loopID uuid.UUID, blo
 	backend, ok := s.loopFor(loopID)
 	if !ok {
 		return uuid.UUID{}, &SessionError{Kind: SessionLoopNotFound}
+	}
+	if backend == nil {
+		return uuid.UUID{}, &SessionError{Kind: SessionLoopExited}
 	}
 	id, err := s.newCommandID()
 	if err != nil {
@@ -805,6 +1006,9 @@ const (
 	// This is the machine-side of the interrupt queue policy: user input stays queued, but a
 	// parent whose interrupted delegate wait resolves cannot open a fresh delegate step.
 	DelegateInterruptPending
+	DelegateRuntimeUnavailable
+	DelegateRuntimeInvalid
+	DelegateClosed
 )
 
 // DelegateError is the typed delegation refusal. Callers errors.As to inspect Kind and
@@ -841,7 +1045,26 @@ func (e *DelegateError) Error() string {
 		return "delegation: unknown operation"
 	case DelegateInterruptPending:
 		return "delegation: loop is interrupt-pending; new delegate work is not admitted until the interrupt barrier releases"
+	case DelegateRuntimeUnavailable, DelegateRuntimeInvalid:
+		return "delegation: runtime selection is unavailable"
+	case DelegateClosed:
+		return "delegation: delegate is closed"
 	default:
 		return "delegation: refused"
+	}
+}
+
+// ModelFacingError exposes only the fixed, bounded category needed by the
+// model-facing Subagent result. It deliberately omits all request fields;
+// ordinary delegation errors continue to use the generic tool-result error.
+func (e *DelegateError) ModelFacingError() string {
+	if e == nil {
+		return ""
+	}
+	switch e.Kind {
+	case DelegateRuntimeUnavailable, DelegateRuntimeInvalid:
+		return "runtime selection is unavailable"
+	default:
+		return ""
 	}
 }

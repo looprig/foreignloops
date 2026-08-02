@@ -7,9 +7,11 @@ import (
 	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/harness/pkg/foreign"
+	"github.com/looprig/harness/pkg/gate"
+	"github.com/looprig/harness/pkg/hook"
 	"github.com/looprig/harness/pkg/hustle"
 	"github.com/looprig/harness/pkg/journal"
-	"github.com/looprig/harness/pkg/security"
+	"github.com/looprig/harness/pkg/loop"
 	"github.com/looprig/harness/pkg/sessionstore"
 	"github.com/looprig/harness/pkg/workspacestore"
 )
@@ -56,8 +58,6 @@ const (
 	// NewSessionAppenderFailed: a checked journal appender (event/command/gate) could not be
 	// constructed over the opened journal.
 	NewSessionAppenderFailed NewSessionErrorKind = "appender_failed"
-	// NewSessionSecurityLimitFailed: the configured factory returned no per-session security.
-	NewSessionSecurityLimitFailed NewSessionErrorKind = "ceiling_failed"
 	// NewSessionRuntimeFailed: NewSession refused to build the live session over the wired dependencies.
 	NewSessionRuntimeFailed NewSessionErrorKind = "session_failed"
 )
@@ -82,12 +82,6 @@ func (e *NewSessionError) Error() string {
 
 func (e *NewSessionError) Unwrap() error { return e.Cause }
 
-// NilSecurityLimitError reports a per-session security limit factory that violated its contract.
-// Silently minting the default would hide broken security-policy wiring.
-type NilSecurityLimitError struct{}
-
-func (*NilSecurityLimitError) Error() string { return "session: security limit factory returned nil" }
-
 // Lifecycle binds a design-time loop topology and durable backend into an immutable,
 // reusable factory for live sessions. NewTopologyLifecycle captures the caller-facing
 // options once; NewSession mints a fresh session id and brings up a brand-new session over
@@ -101,6 +95,7 @@ func (*NilSecurityLimitError) Error() string { return "session: security limit f
 type Lifecycle struct {
 	topology Topology
 	store    *sessionstore.Store
+	hooks    *hook.Runner
 
 	// catalog is the derived session-index each session's event appender notifies (via
 	// journal.WithCatalog) after each durable append, so the replay-free status fold stays
@@ -111,7 +106,7 @@ type Lifecycle struct {
 	// NewSession and RestoreSession: limits, fingerprint projection,
 	// WithWorkspaceCheckpointing, WithForeignBuilders, WithGateCaps. They are forwarded verbatim to
 	// both NewSession and RestoreSession. The per-session dependencies (session ID,
-	// appenders, lease release, and security limit) are appended by each lifecycle call.
+	// appenders, and lease release) are appended by each lifecycle call.
 	baseOpts []Option
 
 	// allowConfigMismatch is the NewTopologyLifecycle-time opt-in forwarded to RestoreSession ONLY (as
@@ -120,16 +115,20 @@ type Lifecycle struct {
 	// serve.Rig interface minimalism, so it is fixed for the Lifecycle's whole lifetime.
 	allowConfigMismatch bool
 
-	// security limitFactory mints a FRESH *security.Limit per NewSession/RestoreSession. Reusing one
-	// Lifecycle across concurrent sessions must never reuse mutable security limit state. The
-	// Lifecycle therefore mints a per-session state here and injects it via WithSecurityLimit so
-	// the session's security limit source is isolated. Every loop PermissionFactory receives this
-	// exact live source through tool.Bindings, so native permission checkers can select
-	// postures on each Check. When the factory is nil the Lifecycle falls
-	// back to today's behavior — the session default-mints its own internal security limit state.
-	securityLimitFactory SecurityLimitFactory
-	fingerprint          FingerprintProvider
-	frozenFingerprint    *event.ConfigFingerprint
+	// restoreDecider is the NewTopologyLifecycle-time application policy forwarded to
+	// RestoreSession ONLY (as WithRestoreDecider): it answers a configuration-drift
+	// assessment. NewSession never reads it. Nil leaves the restored session on its
+	// fail-secure DefaultPolicyDecider{} default. Classified NewTopologyLifecycle-time
+	// for the same serve.Rig interface-minimalism reason as allowConfigMismatch.
+	restoreDecider RestoreDecider
+
+	fingerprint       FingerprintProvider
+	frozenFingerprint *event.ConfigFingerprint
+	// frozenManifest is the rig-assembled ConfigManifest counterpart to
+	// frozenFingerprint. When set it is stamped onto the construction-time
+	// SessionStarted alongside the legacy fingerprint. Nil leaves the additive
+	// Manifest field at its zero value (the deprecation-window default).
+	frozenManifest *event.ConfigManifest
 
 	// placement is the OPTIONAL managed-workspace placement (exclusive/per-session/shared)
 	// resolved per session by NewSession/RestoreSession. The zero value (PlacementNone) means
@@ -147,6 +146,65 @@ type Lifecycle struct {
 	// session's private hustle controller.
 	hustles      []hustle.Definition
 	hustleLimits HustleLimits
+
+	// permissionReviewClassifiers, permissionReviewPolicy, and
+	// permissionReviewConfigured capture WithLifecyclePermissionReview's
+	// installed classifier set and local decision policy (design §20).
+	// permissionReviewConfigured is the signal NewSession/RestoreSession use
+	// to decide whether to apply withPermissionReview at all: it tracks
+	// whether the OPTION was called, not whether the resulting classifier set
+	// happens to be non-empty, so a bare Lifecycle (the option never called)
+	// applies neither withPermissionReview nor withPermissionReviewBreaker
+	// below, preserving the pre-Task-16 "no permission review configured"
+	// default exactly.
+	permissionReviewClassifiers gate.PermissionClassifierSet
+	permissionReviewPolicy      gate.PermissionReviewPolicy
+	permissionReviewConfigured  bool
+
+	// permissionReviewBreakerLimits and permissionReviewBreakerConfigured
+	// capture WithLifecyclePermissionReviewBreaker's installed circuit-breaker
+	// thresholds (design §18), already converted to the private
+	// reviewCircuitBreakerLimits shape withPermissionReviewBreaker
+	// (review_state.go) consumes. permissionReviewBreakerConfigured mirrors
+	// permissionReviewConfigured's "option called, not value non-zero" signal.
+	permissionReviewBreakerLimits     reviewCircuitBreakerLimits
+	permissionReviewBreakerConfigured bool
+
+	// permissionReviewEvidenceAccess, permissionReviewEvidenceContainment,
+	// permissionReviewEvidenceAllowedKinds, and
+	// permissionReviewEvidenceConfigured capture
+	// WithLifecyclePermissionReviewEvidence's installed evidence-tool access
+	// boundary (design §13.1), mirroring permissionReviewConfigured's "option
+	// called, not value non-zero" signal.
+	permissionReviewEvidenceAccess       gate.EvidenceAccessEvaluator
+	permissionReviewEvidenceContainment  gate.EvidenceContainmentVerifier
+	permissionReviewEvidenceAllowedKinds []string
+	permissionReviewEvidenceConfigured   bool
+
+	// permissionReviewSecurityCeiling and
+	// permissionReviewSecurityCeilingConfigured capture
+	// WithLifecyclePermissionReviewSecurityCeiling's installed consumer-owned
+	// effective security posture (design §13.1/§21), mirroring
+	// permissionReviewEvidenceConfigured's "option called, not value
+	// non-zero" signal. Omitting the option leaves every session's
+	// permissionReviewSecurityCeiling at its zero value (empty string) —
+	// never a Harness-invented placeholder — which makes loopReviewContext
+	// (gates.go) return nil (defense in depth).
+	permissionReviewSecurityCeiling           string
+	permissionReviewSecurityCeilingConfigured bool
+
+	// permissionReviewObservationVerifier and
+	// permissionReviewObservationVerifierConfigured capture
+	// WithLifecyclePermissionReviewObservations' installed, OPTIONAL
+	// TOCTOU-recheck seam (design §13.4), mirroring
+	// permissionReviewEvidenceConfigured's "option called, not value
+	// non-zero" signal. Unlike permissionReviewEvidence*/
+	// permissionReviewSecurityCeiling above, leaving this unconfigured is a
+	// fully supported terminal state, not a gap a later construction-time
+	// check must close — see gates.go's permissionReviewObservationVerifier
+	// field doc comment (session.go) for why.
+	permissionReviewObservationVerifier           gate.EvidenceObservationVerifier
+	permissionReviewObservationVerifierConfigured bool
 }
 
 // HustleLimits is sessionruntime's narrow, rig-independent copy of the hustle
@@ -168,6 +226,143 @@ func WithLifecycleHustles(definitions []hustle.Definition, limits HustleLimits) 
 	return func(r *Lifecycle) {
 		r.hustles = append([]hustle.Definition(nil), captured...)
 		r.hustleLimits = limits
+	}
+}
+
+// PermissionReviewBreakerLimits are the consumer-configurable bounded
+// per-turn and per-session circuit-breaker thresholds (design §18). A zero
+// value disables the corresponding counter — see reviewCircuitBreakerLimits'
+// doc comment (review_state.go) for why the turn-scoped and session-scoped
+// thresholds are deliberately separate configuration surfaces.
+type PermissionReviewBreakerLimits struct {
+	MaxConsecutiveNeedsHuman int
+	MaxInvalidOrFailed       int
+	MaxIdenticalSubjects     int
+	MaxStaleResponses        int
+	InterruptOnTrip          bool
+	Session                  PermissionReviewSessionBreakerLimits
+}
+
+// PermissionReviewSessionBreakerLimits is PermissionReviewBreakerLimits'
+// session-scoped counterpart (design §18: "track per-turn AND per-session
+// bounded counters"), mirroring reviewSessionCircuitBreakerLimits.
+type PermissionReviewSessionBreakerLimits struct {
+	MaxConsecutiveNeedsHuman int
+	MaxInvalidOrFailed       int
+	MaxIdenticalSubjects     int
+	MaxStaleResponses        int
+}
+
+// toReviewCircuitBreakerLimits converts the consumer-facing shape into the
+// private review_state.go representation withPermissionReviewBreaker
+// consumes. It is a field-for-field copy; the two shapes exist separately so
+// review_state.go's internals stay unexported while this Lifecycle option
+// surface is public.
+func (l PermissionReviewBreakerLimits) toReviewCircuitBreakerLimits() reviewCircuitBreakerLimits {
+	return reviewCircuitBreakerLimits{
+		MaxConsecutiveNeedsHuman: l.MaxConsecutiveNeedsHuman,
+		MaxInvalidOrFailed:       l.MaxInvalidOrFailed,
+		MaxIdenticalSubjects:     l.MaxIdenticalSubjects,
+		MaxStaleResponses:        l.MaxStaleResponses,
+		InterruptOnTrip:          l.InterruptOnTrip,
+		Session: reviewSessionCircuitBreakerLimits{
+			MaxConsecutiveNeedsHuman: l.Session.MaxConsecutiveNeedsHuman,
+			MaxInvalidOrFailed:       l.Session.MaxInvalidOrFailed,
+			MaxIdenticalSubjects:     l.Session.MaxIdenticalSubjects,
+			MaxStaleResponses:        l.Session.MaxStaleResponses,
+		},
+	}
+}
+
+// WithLifecyclePermissionReview installs the registered classifier set and
+// local decision policy every session in this lifecycle uses for automatic
+// permission-gate review (design §20), mirroring WithLifecycleHustles'
+// capture-once-forward-to-both shape. Both NewSession and RestoreSession
+// apply it via the private withPermissionReview Option (gates.go). Omitting
+// this option leaves every session's permissionClassifiers at its zero
+// value, preserving StartPermissionReview's pre-Task-16 no-op default
+// exactly.
+func WithLifecyclePermissionReview(classifiers gate.PermissionClassifierSet, policy gate.PermissionReviewPolicy) LifecycleOption {
+	return func(r *Lifecycle) {
+		r.permissionReviewClassifiers = classifiers
+		r.permissionReviewPolicy = policy
+		r.permissionReviewConfigured = true
+	}
+}
+
+// WithLifecyclePermissionReviewBreaker installs the bounded circuit-breaker
+// thresholds every session in this lifecycle applies to automatic permission
+// review (design §18). Both NewSession and RestoreSession apply it via the
+// private withPermissionReviewBreaker Option (review_state.go). Omitting
+// this option leaves every session's breaker limits at their zero value
+// (every counter disabled), matching withPermissionReviewBreaker's own
+// zero-preserves-behavior default.
+func WithLifecyclePermissionReviewBreaker(limits PermissionReviewBreakerLimits) LifecycleOption {
+	return func(r *Lifecycle) {
+		r.permissionReviewBreakerLimits = limits.toReviewCircuitBreakerLimits()
+		r.permissionReviewBreakerConfigured = true
+	}
+}
+
+// WithLifecyclePermissionReviewEvidence installs the consumer-supplied
+// read-only evidence-tool access boundary every registered permission
+// classifier's evidence tools authorize against (design §13.1), mirroring
+// WithLifecyclePermissionReview's capture-once-forward-to-both shape. Both
+// NewSession and RestoreSession apply it via the private
+// withPermissionReviewEvidence Option (gates.go). Omitting this option
+// leaves every session's evidence collaborators at their zero value;
+// newHustleController (hustle.go) then fails CONSTRUCTION closed — never
+// silently permissive — for any registered classifier whose definition
+// actually needs evidence tools.
+func WithLifecyclePermissionReviewEvidence(access gate.EvidenceAccessEvaluator, containment gate.EvidenceContainmentVerifier, allowedKinds []string) LifecycleOption {
+	captured := append([]string(nil), allowedKinds...)
+	return func(r *Lifecycle) {
+		r.permissionReviewEvidenceAccess = access
+		r.permissionReviewEvidenceContainment = containment
+		r.permissionReviewEvidenceAllowedKinds = append([]string(nil), captured...)
+		r.permissionReviewEvidenceConfigured = true
+	}
+}
+
+// WithLifecyclePermissionReviewSecurityCeiling installs the consumer-supplied
+// effective security posture (design §13.1/§21) every registered permission
+// classifier's ReviewContext/ReviewBasis carries as SecurityCeiling,
+// mirroring WithLifecyclePermissionReviewEvidence's capture-once-forward-to-both
+// shape. Both NewSession and RestoreSession apply it via the private
+// withPermissionReviewSecurityCeiling Option (gates.go). Omitting this
+// option leaves every session's permissionReviewSecurityCeiling at its zero
+// value; loopReviewContext (gates.go) then returns nil for that session
+// (capture stays off) rather than ever falling back to a Harness-invented
+// placeholder — see withPermissionReviewSecurityCeiling's doc comment for
+// why a fixed sentinel is exactly the bug this option exists to close
+// (Finding 2, Phase 6 spec-compliance review).
+func WithLifecyclePermissionReviewSecurityCeiling(ceiling string) LifecycleOption {
+	return func(r *Lifecycle) {
+		r.permissionReviewSecurityCeiling = ceiling
+		r.permissionReviewSecurityCeilingConfigured = true
+	}
+}
+
+// WithLifecyclePermissionReviewObservations installs the consumer-supplied,
+// OPTIONAL recheck seam (design §13.4, TOCTOU) every classifier-originated
+// auto-approval's recorded observations are verified against immediately
+// before the gate is claimed, mirroring
+// WithLifecyclePermissionReviewEvidence's capture-once-forward-to-both
+// shape. Both NewSession and RestoreSession apply it via the private
+// withPermissionReviewObservationVerifier Option (gates.go) — but, unlike
+// Evidence/SecurityCeiling, ONLY when this option was actually called:
+// omitting it leaves every session's permissionReviewObservationVerifier at
+// its nil zero value, which respondFromClassifier's
+// verifyPermissionReviewObservations then handles as a fully supported
+// terminal state whenever no observation was ever recorded, and as a
+// fail-closed (stale) outcome whenever one was — see that method's own doc
+// comment for the full reasoning, including why this cannot be a
+// Define()-time "missing" pairing error the way
+// WithLifecyclePermissionReviewEvidence's absence is.
+func WithLifecyclePermissionReviewObservations(verifier gate.EvidenceObservationVerifier) LifecycleOption {
+	return func(r *Lifecycle) {
+		r.permissionReviewObservationVerifier = verifier
+		r.permissionReviewObservationVerifierConfigured = true
 	}
 }
 
@@ -225,16 +420,19 @@ func WithLifecyclePlacement(p WorkspacePlacement) LifecycleOption {
 	}
 }
 
-// SecurityLimitFactory mints a fresh security limit state. The Lifecycle calls it once per
-// NewSession/RestoreSession so each session gets its own independent clamp (AMBIGUITY A1 on
-// Lifecycle.security limitFactory). It is a named type per the codebase's prefer-named-types rule.
-type SecurityLimitFactory func() *security.Limit
-
 // LifecycleOption configures a Lifecycle at NewTopologyLifecycle time. Every caller-facing knob is captured
 // here (the runtime NewSession/RestoreSession take none), mirroring flow's LifecycleOption model. A
 // nil/zero argument is ignored (the default is kept), mirroring the session options' own
 // fail-safe convention.
 type LifecycleOption func(*Lifecycle)
+
+// WithLifecycleHooks captures one immutable compiled runner for every native
+// loop and journal built by NewSession or RestoreSession.
+func WithLifecycleHooks(runner *hook.Runner) LifecycleOption {
+	return func(lifecycle *Lifecycle) {
+		lifecycle.hooks = runner
+	}
+}
 
 // WithLifecycleLimits captures the in-session subagent-spawn safety caps (depth + quota) the
 // session enforces. Forwarded to both NewSession and RestoreSession as WithLimits.
@@ -258,6 +456,17 @@ func WithLifecycleFingerprint(fingerprint event.ConfigFingerprint) LifecycleOpti
 	return func(r *Lifecycle) {
 		copy := fingerprint
 		r.frozenFingerprint = &copy
+	}
+}
+
+// WithLifecycleManifest captures the rig-assembled ConfigManifest counterpart to the
+// frozen fingerprint. It is stamped onto the construction-time SessionStarted's
+// additive Manifest field, giving a newly created session a real (SchemaVersion>=1)
+// manifest baseline.
+func WithLifecycleManifest(manifest event.ConfigManifest) LifecycleOption {
+	return func(r *Lifecycle) {
+		copy := manifest
+		r.frozenManifest = &copy
 	}
 }
 
@@ -292,6 +501,30 @@ func WithLifecycleForeignBuilders(b foreign.Builder, rb foreign.RestoredBuilder)
 	}
 }
 
+// WithLifecycleForeignBuilderRegistry forwards profile-keyed foreign routing to
+// every live/restored session while preserving the legacy builder pair option.
+func WithLifecycleForeignBuilderRegistry(registry *foreign.BuilderRegistry) LifecycleOption {
+	return func(r *Lifecycle) {
+		r.baseOpts = append(r.baseOpts, WithForeignBuilderRegistry(registry))
+	}
+}
+
+// WithLifecycleRuntimeCatalog forwards the immutable parent-scoped runtime
+// snapshot to every session constructed by this lifecycle.
+func WithLifecycleRuntimeCatalog(catalog loop.RuntimeCatalog) LifecycleOption {
+	return func(r *Lifecycle) {
+		r.baseOpts = append(r.baseOpts, WithRuntimeCatalog(catalog))
+	}
+}
+
+// WithLifecycleRuntimeCatalogProvider forwards parent-specific runtime catalog
+// selection to every live/restored session.
+func WithLifecycleRuntimeCatalogProvider(provider RuntimeCatalogProvider) LifecycleOption {
+	return func(r *Lifecycle) {
+		r.baseOpts = append(r.baseOpts, WithRuntimeCatalogProvider(provider))
+	}
+}
+
 // WithLifecycleGateCaps captures the live gate-directory bounds. Zero (the default) means no
 // cap. Forwarded to both NewSession and RestoreSession as WithGateCaps.
 func WithLifecycleGateCaps(caps GateCaps) LifecycleOption {
@@ -310,14 +543,14 @@ func WithLifecycleAllowConfigMismatch() LifecycleOption {
 	}
 }
 
-// WithLifecycleSecurityLimitFactory captures the factory the Lifecycle calls to mint a FRESH
-// *security.Limit for each NewSession/RestoreSession. A nil factory is ignored (the session default-mints
-// its own internal state). See AMBIGUITY A1 on Lifecycle.security limitFactory for why the security limit
-// must be per-session and what the Lifecycle deliberately leaves to the composition root.
-func WithLifecycleSecurityLimitFactory(factory SecurityLimitFactory) LifecycleOption {
+// WithLifecycleRestoreDecider captures the restore-only application policy that answers a
+// configuration-drift assessment (the successor seam to WithLifecycleAllowConfigMismatch).
+// A nil decider is ignored, leaving RestoreSession on the fail-secure DefaultPolicyDecider{}
+// default. NewSession ignores it; only RestoreSession forwards it (as WithRestoreDecider).
+func WithLifecycleRestoreDecider(decider RestoreDecider) LifecycleOption {
 	return func(r *Lifecycle) {
-		if factory != nil {
-			r.securityLimitFactory = factory
+		if decider != nil {
+			r.restoreDecider = decider
 		}
 	}
 }
@@ -375,7 +608,12 @@ func (r *Lifecycle) NewSession(ctx context.Context, seed workspacestore.Ref) (*S
 	if err != nil {
 		return nil, &NewSessionError{Kind: NewSessionLeaseFailed, Cause: err}
 	}
-	j, err := r.store.OpenJournal(ctx, sid, lease)
+	j, err := r.store.OpenJournalWithOpeningAppend(
+		ctx,
+		sid,
+		lease,
+		journal.HookMiddleware(r.hooks, sid),
+	)
 	if err != nil {
 		releaseLease(lease)
 		return nil, &NewSessionError{Kind: NewSessionJournalFailed, Cause: err}
@@ -388,6 +626,7 @@ func (r *Lifecycle) NewSession(ctx context.Context, seed workspacestore.Ref) (*S
 		releaseLease(lease)
 		return nil, &NewSessionError{Kind: NewSessionJournalFailed, Cause: err}
 	}
+	j = journal.WithHooks(j, r.hooks, sid)
 	evAp, err := journal.NewJournalEventAppenderChecked(j, journal.WithCatalog(r.catalog))
 	if err != nil {
 		releaseLease(lease)
@@ -407,10 +646,28 @@ func (r *Lifecycle) NewSession(ctx context.Context, seed workspacestore.Ref) (*S
 	// The captured base options, then the per-session dependencies. WithSessionID(sid) makes NewSession adopt
 	// the id the journal was already bound to (the journal chicken-and-egg). WithLeaseRelease
 	// hands the session the lease's release hook for its clean-Shutdown teardown.
-	opts := make([]Option, 0, len(r.baseOpts)+6)
+	opts := make([]Option, 0, len(r.baseOpts)+8)
 	opts = append(opts, r.baseOpts...)
 	opts = append(opts, withSessionHustles(r.hustles, r.hustleLimits))
+	if r.permissionReviewConfigured {
+		opts = append(opts, withPermissionReview(r.permissionReviewClassifiers, r.permissionReviewPolicy))
+	}
+	if r.permissionReviewBreakerConfigured {
+		opts = append(opts, withPermissionReviewBreaker(r.permissionReviewBreakerLimits))
+	}
+	if r.permissionReviewEvidenceConfigured {
+		opts = append(opts, withPermissionReviewEvidence(
+			r.permissionReviewEvidenceAccess, r.permissionReviewEvidenceContainment, r.permissionReviewEvidenceAllowedKinds,
+		))
+	}
+	if r.permissionReviewSecurityCeilingConfigured {
+		opts = append(opts, withPermissionReviewSecurityCeiling(r.permissionReviewSecurityCeiling))
+	}
+	if r.permissionReviewObservationVerifierConfigured {
+		opts = append(opts, withPermissionReviewObservationVerifier(r.permissionReviewObservationVerifier))
+	}
 	opts = append(opts,
+		WithHooks(r.hooks),
 		WithSessionID(sid),
 		WithEventAppender(evAp),
 		WithCommandAppender(cmdAp),
@@ -425,18 +682,9 @@ func (r *Lifecycle) NewSession(ctx context.Context, seed workspacestore.Ref) (*S
 	} else {
 		opts = append(opts, WithFingerprintProvider(r.fingerprint))
 	}
-	// AMBIGUITY A1: mint a fresh per-session security limit state so concurrent sessions never share one
-	// mutable clamp. A configured factory returning nil fails closed; only an absent factory
-	// selects the session's internal default.
-	if r.securityLimitFactory != nil {
-		state := r.securityLimitFactory()
-		if state == nil {
-			releaseLease(lease)
-			return nil, &NewSessionError{Kind: NewSessionSecurityLimitFailed, Cause: &NilSecurityLimitError{}}
-		}
-		opts = append(opts, WithSecurityLimit(state))
+	if r.frozenManifest != nil {
+		opts = append(opts, WithManifest(*r.frozenManifest))
 	}
-
 	// Resolve the managed-workspace placement (design §"Placement details"). The session
 	// lease is already held (above), so the exclusive root lease is acquired AFTER it, as
 	// the design mandates. On root contention the session lease is released and the typed
@@ -511,26 +759,40 @@ func releaseResolvedRoot(_ context.Context, resolved *resolvedPlacement) {
 // session with no history, a *RestoreError for a lease/journal/replay failure), never a
 // panic.
 func (r *Lifecycle) RestoreSession(ctx context.Context, id uuid.UUID) (*Session, error) {
-	opts := make([]Option, 0, len(r.baseOpts)+2)
+	opts := make([]Option, 0, len(r.baseOpts)+4)
 	opts = append(opts, r.baseOpts...)
 	opts = append(opts, withSessionHustles(r.hustles, r.hustleLimits))
+	opts = append(opts, WithHooks(r.hooks))
+	if r.permissionReviewConfigured {
+		opts = append(opts, withPermissionReview(r.permissionReviewClassifiers, r.permissionReviewPolicy))
+	}
+	if r.permissionReviewBreakerConfigured {
+		opts = append(opts, withPermissionReviewBreaker(r.permissionReviewBreakerLimits))
+	}
+	if r.permissionReviewEvidenceConfigured {
+		opts = append(opts, withPermissionReviewEvidence(
+			r.permissionReviewEvidenceAccess, r.permissionReviewEvidenceContainment, r.permissionReviewEvidenceAllowedKinds,
+		))
+	}
+	if r.permissionReviewSecurityCeilingConfigured {
+		opts = append(opts, withPermissionReviewSecurityCeiling(r.permissionReviewSecurityCeiling))
+	}
+	if r.permissionReviewObservationVerifierConfigured {
+		opts = append(opts, withPermissionReviewObservationVerifier(r.permissionReviewObservationVerifier))
+	}
 	if r.frozenFingerprint != nil {
 		opts = append(opts, WithFingerprint(*r.frozenFingerprint))
 	} else {
 		opts = append(opts, WithFingerprintProvider(r.fingerprint))
 	}
+	if r.frozenManifest != nil {
+		opts = append(opts, WithManifest(*r.frozenManifest))
+	}
 	if r.allowConfigMismatch {
 		opts = append(opts, WithAllowConfigMismatch())
 	}
-	// AMBIGUITY A1: mint a fresh per-session security limit on restore too (WithSecurityLimit applies to
-	// RestoreSession, which re-seeds the injected state from the folded SecurityLimitChanged
-	// events), so a restored session gets its own clamp just like a fresh NewSession.
-	if r.securityLimitFactory != nil {
-		state := r.securityLimitFactory()
-		if state == nil {
-			return nil, &NilSecurityLimitError{}
-		}
-		opts = append(opts, WithSecurityLimit(state))
+	if r.restoreDecider != nil {
+		opts = append(opts, WithRestoreDecider(r.restoreDecider))
 	}
 	if r.placement.Configured() {
 		opts = append(opts, withPlacementSpec(r.placement))

@@ -74,10 +74,11 @@ type Hub struct {
 	// and read without the lock — appender.AppendEvent is the durable write the hub
 	// runs OUTSIDE mu (no I/O under the lock); factory mints headers for synthesized
 	// session events; reporter is the fail-secure escalation seam.
-	appender     eventAppender
-	factory      *event.Factory
-	reporter     FaultReporter
-	idleBoundary sessionIdleBoundary
+	appender       eventAppender
+	factory        *event.Factory
+	reporter       FaultReporter
+	idleBoundary   sessionIdleBoundary
+	commitObserver func(event.Event)
 }
 
 // New builds an idle hub for sessionID. The returned hub has no subscribers and a
@@ -245,6 +246,7 @@ func (h *Hub) publishEventWithActivityResult(ctx context.Context, ev event.Event
 					h.reporter.ReportFault(ctx, fault)
 					return fault
 				}
+				h.observeCommit(ev)
 				h.deliver(subs, ev, seq)
 				h.deliver(subs, idle, ds)
 				return nil
@@ -273,6 +275,7 @@ func (h *Hub) publishEventWithActivityResult(ctx context.Context, ev event.Event
 
 	// (5) Deliver live in causal order, then wake idle waiters AFTER the durable
 	// append of the SessionIdle edge.
+	h.observeCommit(ev)
 	h.deliver(subs, ev, seq)
 	if derived != nil {
 		h.deliver(subs, derived, derivedSeq)
@@ -281,10 +284,17 @@ func (h *Hub) publishEventWithActivityResult(ctx context.Context, ev event.Event
 	return committed, nil
 }
 
-// PublishInternalEventChecked durably appends one recognized private hustle
-// lifecycle event. It deliberately bypasses quiescence mutation, workspace idle
-// boundaries, and subscriber delivery: the separate hustle activity lease owns the
-// blocking state, while this method owns only the private audit record.
+func (h *Hub) observeCommit(ev event.Event) {
+	if h.commitObserver != nil {
+		h.commitObserver(ev)
+	}
+}
+
+// PublishInternalEventChecked durably appends one recognized private
+// hustle-lifecycle or permission-review event. It deliberately bypasses
+// quiescence mutation, workspace idle boundaries, and subscriber delivery:
+// the separate hustle activity lease owns the blocking state, while this
+// method owns only the private audit record.
 func (h *Hub) PublishInternalEventChecked(ctx context.Context, ev event.Event) error {
 	if err := h.validateInternalPublication(ev); err != nil {
 		return err
@@ -302,6 +312,34 @@ func (h *Hub) PublishInternalEventChecked(ctx context.Context, ev event.Event) e
 	return nil
 }
 
+// isInternalAuditEventType reports whether ev is one of the recognized
+// private audit-only event types: the ONLY types PublishInternalEventChecked
+// may durably append (validateInternalPublication's allowlist), and
+// therefore also the ones validatePublicPublication's denylist must reject
+// on the public-only path. Both switches are derived from this single
+// function so the allow/deny pair cannot silently drift apart — exactly the
+// gap that let PermissionReviewStarted/Completed ship reachable only through
+// the public path (where they were always rejected as Internal-visibility)
+// and never added to the internal allowlist that would have actually
+// accepted them. It matches both value and pointer forms for every type,
+// mirroring the pre-existing Hustle lifecycle coverage — even though
+// review_adapter.go currently only ever publishes the value form, matching
+// both here keeps this helper (and validatePublicPublication's denylist,
+// which has always matched both forms) correct regardless of which form a
+// caller uses.
+func isInternalAuditEventType(ev event.Event) bool {
+	switch ev.(type) {
+	case event.HustleStarted, *event.HustleStarted,
+		event.HustleCompleted, *event.HustleCompleted,
+		event.HustleFailed, *event.HustleFailed,
+		event.PermissionReviewStarted, *event.PermissionReviewStarted,
+		event.PermissionReviewCompleted, *event.PermissionReviewCompleted:
+		return true
+	default:
+		return false
+	}
+}
+
 func validatePublicPublication(ev event.Event) error {
 	if nilEvent(ev) {
 		return &PublishBoundaryError{Reason: PublishBoundaryNilEvent}
@@ -312,10 +350,7 @@ func validatePublicPublication(ev event.Event) error {
 			EventType: fmt.Sprintf("%T", ev),
 		}
 	}
-	switch ev.(type) {
-	case event.HustleStarted, *event.HustleStarted,
-		event.HustleCompleted, *event.HustleCompleted,
-		event.HustleFailed, *event.HustleFailed:
+	if isInternalAuditEventType(ev) {
 		return &PublishBoundaryError{
 			Reason:    PublishBoundaryType,
 			EventType: fmt.Sprintf("%T", ev),
@@ -338,9 +373,7 @@ func (h *Hub) validateInternalPublication(ev event.Event) error {
 	if ev.EventHeader().SessionID != h.sessionID {
 		return &PublishBoundaryError{Reason: PublishBoundarySession, EventType: eventType}
 	}
-	switch ev.(type) {
-	case event.HustleStarted, event.HustleCompleted, event.HustleFailed:
-	default:
+	if !isInternalAuditEventType(ev) {
 		return &PublishBoundaryError{Reason: PublishBoundaryType, EventType: eventType}
 	}
 	if err := event.ValidateEvent(ev); err != nil {

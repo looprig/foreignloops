@@ -236,11 +236,20 @@ type TurnIndex int
 // of the agent configuration the session started under (model/system-prompt/tool
 // policy), stamped at construction so a durable journal can detect a config change
 // on restore.
+//
+// Manifest is the richer, canonical description of the same configuration. During
+// the deprecation window BOTH are populated: Config remains the legacy comparison
+// baseline while Manifest carries the additive fields (workspace trust, permission
+// and confinement strictness, application fields, and per-tool schema identity) that
+// typed drift assessment consumes. It is additive (omitzero): a journal record that
+// predates the field decodes it as the zero ConfigManifest and never spuriously
+// mismatches.
 type SessionStarted struct {
 	enduring
 	sessionScoped
 	Header
-	Config ConfigFingerprint `json:"config,omitzero"`
+	Config   ConfigFingerprint `json:"config,omitzero"`
+	Manifest ConfigManifest    `json:"manifest,omitzero"`
 }
 
 // SessionActive marks the Idle -> Active edge of the session quiescence model.
@@ -297,6 +306,53 @@ type RestoreErrored struct {
 	// error value has no stable codec (mirrors TurnFailed.Err). Callers inspect it
 	// in-memory via errors.As; a journal records the failure via the event itself.
 	Err error `json:"-"`
+}
+
+// DecisionSource records who or what accepted a configuration adoption.
+type DecisionSource string
+
+const (
+	DecisionSourceUser     DecisionSource = "user"
+	DecisionSourcePolicy   DecisionSource = "policy"
+	DecisionSourceOperator DecisionSource = "operator"
+	// DecisionSourceMigration is stamped only by Harness itself when a Phase 2
+	// migration adopts a configuration; a RestoreDecider never produces it.
+	DecisionSourceMigration DecisionSource = "migration"
+)
+
+// Valid reports whether the source is one of the four closed DecisionSource
+// values. An adoption record with any other source is malformed.
+func (s DecisionSource) Valid() bool {
+	switch s {
+	case DecisionSourceUser, DecisionSourcePolicy, DecisionSourceOperator, DecisionSourceMigration:
+		return true
+	default:
+		return false
+	}
+}
+
+// ConfigurationAdopted commits a new configuration epoch: the durable record of
+// an accepted restore drift or a one-time baseline upgrade. It is appended under
+// the restore lease after the decision validates and before RestoreDone; the
+// latest SessionStarted or ConfigurationAdopted is the baseline for the next
+// restore's drift assessment. Like SessionStarted it is session-scoped and
+// Enduring — Header.SessionID is set, LoopID/TurnID/StepID are zero, and the
+// SessionID rides in the Header (there is no standalone SessionID field).
+type ConfigurationAdopted struct {
+	enduring
+	sessionScoped
+	Header
+	Epoch               ConfigEpoch    `json:"epoch"`
+	PreviousFingerprint string         `json:"previous_fingerprint,omitzero"`
+	AdoptedFingerprint  string         `json:"adopted_fingerprint"`
+	Manifest            ConfigManifest `json:"manifest"`
+	Drift               []DriftChange  `json:"drift,omitzero"`
+	Source              DecisionSource `json:"source"`
+	Actor               string         `json:"actor,omitzero"`
+	AppVersion          string         `json:"app_version,omitzero"`
+	// Message is durable user-authored data, not an instruction: it never gains
+	// authority during future prompt construction.
+	Message string `json:"message,omitzero"`
 }
 
 // WorkspaceCheckpointed records that the session's workspace was durably
@@ -356,6 +412,32 @@ type ActiveLoopChanged struct {
 	ActiveLoopID   uuid.UUID `json:"active_loop_id"`
 }
 
+// LoopRestoreTombstoneCategory is the bounded reason a restored child was kept
+// in the durable topology without a live backend.
+const (
+	LoopRestoreTombstoneRuntimeMismatch    = "runtime_mismatch"
+	LoopRestoreTombstoneRuntimeUnavailable = "runtime_unavailable"
+)
+
+func ValidLoopRestoreTombstoneCategory(category string) bool {
+	switch category {
+	case LoopRestoreTombstoneRuntimeMismatch, LoopRestoreTombstoneRuntimeUnavailable:
+		return true
+	default:
+		return false
+	}
+}
+
+// LoopRestoreTombstoned records that a non-root child survived restore as a
+// closed, failed registry entry because its durable runtime could not be
+// re-authorized against the current runtime catalog.
+type LoopRestoreTombstoned struct {
+	enduring
+	loopScoped
+	Header
+	Category string `json:"category"`
+}
+
 // LoopIdle is emitted when a loop parks with no active turn. Header.SessionID and
 // Header.LoopID are set; TurnID/StepID are zero. It drives session quiescence.
 type LoopIdle struct {
@@ -374,7 +456,8 @@ type LoopStarted struct {
 	Header
 	// Runtime is the initial resolved model identity, limits, and effort. It is
 	// durable so restore and catalog repair never consult a mutable catalog.
-	Runtime ModelRuntime `json:"runtime,omitzero"`
+	Runtime      ModelRuntime  `json:"runtime,omitzero"`
+	AgentRuntime *AgentRuntime `json:"agent_runtime,omitempty"`
 	// ParentToolUseID is the durable provider tool-use id of the Subagent tool call
 	// that spawned this loop (content.ToolUseBlock.ID), empty for loops not spawned by
 	// a tool call (e.g. the primary/root). It is the durable carrier that correlates a
@@ -401,6 +484,17 @@ type LoopStarted struct {
 	Description string `json:"description,omitzero"`
 }
 
+// AgentRuntime is the bounded, secret-free identity of the runtime selected for
+// a loop. It is additive so legacy LoopStarted records decode with nil.
+type AgentRuntime struct {
+	Harness         string `json:"harness"`
+	Profile         string `json:"profile"`
+	CredentialMode  string `json:"credential_mode"`
+	ModelAlias      string `json:"model_alias"`
+	SmallModelAlias string `json:"small_model_alias,omitempty"`
+	ACPSessionID    string `json:"acp_session_id,omitempty"`
+}
+
 // DelegateRequestAccepted is the durable actor-side acceptance of a follow-up
 // machine NoFold request, emitted before it can queue or start.
 type DelegateRequestAccepted struct {
@@ -419,6 +513,14 @@ type ForeignSessionBound struct {
 	ForeignSID string `json:"foreign_sid"`
 }
 
+// LoopAgentSessionBound records the durable foreign agent session binding for a loop.
+type LoopAgentSessionBound struct {
+	enduring
+	loopScoped
+	Header
+	ACPSessionID string `json:"acp_session_id"`
+}
+
 func (SessionStarted) isEvent()          {}
 func (SessionActive) isEvent()           {}
 func (SessionIdle) isEvent()             {}
@@ -429,10 +531,13 @@ func (HustleFailed) isEvent()            {}
 func (RestoreStarted) isEvent()          {}
 func (RestoreDone) isEvent()             {}
 func (RestoreErrored) isEvent()          {}
+func (ConfigurationAdopted) isEvent()    {}
 func (WorkspaceCheckpointed) isEvent()   {}
 func (WorkspaceRestored) isEvent()       {}
 func (ActiveLoopChanged) isEvent()       {}
+func (LoopRestoreTombstoned) isEvent()   {}
 func (LoopIdle) isEvent()                {}
 func (LoopStarted) isEvent()             {}
 func (DelegateRequestAccepted) isEvent() {}
 func (ForeignSessionBound) isEvent()     {}
+func (LoopAgentSessionBound) isEvent()   {}

@@ -163,11 +163,20 @@ func imagePart(img *content.ImageBlock) geminiPart {
 }
 
 // encodeAIParts maps a model turn's blocks to Gemini parts: text -> text,
-// tool_use -> functionCall. ThinkingBlock is the one intentional drop — the domain
-// model does not carry Gemini's thoughtSignature, so a thought part cannot be
-// faithfully echoed back (documented, not an error). Each tool call's id -> name is
-// recorded for the matching functionResponse. Any other unmodeled block type yields
-// an *UnsupportedBlockError — fail-secure, never a silent drop.
+// tool_use -> functionCall, thinking -> a thought part IF it carries a
+// thoughtSignature in ProviderState (added in an earlier task, so the
+// domain model now DOES carry Gemini's opaque continuation token — this is
+// no longer the silent, undocumented drop it once was). A ThinkingBlock with
+// an empty/nil ProviderState (e.g. cross-dialect-sourced, or a same-dialect
+// block that predates thinking) is still dropped: real Gemini 2.5+ models
+// require a replayed thought part to carry the exact signature the model
+// itself issued, and a synthesized or absent signature is not a faithful
+// echo — sending a signature-less thought part risks the target rejecting
+// the turn outright, so omitting it (as before) remains the safer, more
+// defensible choice than fabricating or guessing a value. Each tool call's
+// id -> name is recorded for the matching functionResponse. Any other
+// unmodeled block type yields an *UnsupportedBlockError — fail-secure, never
+// a silent drop.
 func encodeAIParts(m *content.AIMessage, toolNames map[string]string) ([]geminiPart, error) {
 	parts := make([]geminiPart, 0, len(m.Blocks))
 	for _, b := range m.Blocks {
@@ -182,12 +191,31 @@ func encodeAIParts(m *content.AIMessage, toolNames map[string]string) ([]geminiP
 				Args: argsJSON(b.Input),
 			}})
 		case *content.ThinkingBlock:
-			// Deliberately ignored: no thoughtSignature round-trip in the domain model.
+			if !b.ReplayableAs(providerStateFormatGemini) {
+				continue
+			}
+			sig, err := providerStateToThoughtSignature(b.ProviderState)
+			if err != nil {
+				return nil, err
+			}
+			parts = append(parts, geminiPart{Thought: true, Text: b.Thinking, ThoughtSignature: sig})
 		default:
 			return nil, &UnsupportedBlockError{Block: fmt.Sprintf("%T", b)}
 		}
 	}
 	return parts, nil
+}
+
+// providerStateToThoughtSignature unmarshals a ThinkingBlock.ProviderState
+// (which this codec always stores as the JSON-marshaled form of the wire
+// thoughtSignature string — see providerStateFromThoughtSignature, decode.go)
+// back into the plain string the wire `thoughtSignature` field carries.
+func providerStateToThoughtSignature(raw json.RawMessage) (string, error) {
+	var s string
+	if err := json.Unmarshal(raw, &s); err != nil {
+		return "", &EncodeError{Reason: "invalid ThinkingBlock.ProviderState", Err: err}
+	}
+	return s, nil
 }
 
 // functionResponsePayload is the JSON object wrapper for a tool result. Gemini's
@@ -203,7 +231,11 @@ type functionResponsePayload struct {
 // classic Gemini functionResponse has no structured error flag, so the model
 // learns of a failure through the (loop-prefixed) result text.
 func encodeToolResult(m *content.ToolResultMessage, toolNames map[string]string) (geminiPart, error) {
-	payload, err := json.Marshal(functionResponsePayload{Result: concatText(m.Blocks)})
+	text, err := toolResultText(m.Blocks)
+	if err != nil {
+		return geminiPart{}, err
+	}
+	payload, err := json.Marshal(functionResponsePayload{Result: text})
 	if err != nil {
 		return geminiPart{}, &EncodeError{Reason: "marshal tool result", Err: err}
 	}
@@ -214,15 +246,19 @@ func encodeToolResult(m *content.ToolResultMessage, toolNames map[string]string)
 	}}, nil
 }
 
-// concatText joins all text blocks into a single string.
-func concatText(blocks []content.Block) string {
+// toolResultText flattens a tool result's blocks to the plain string the
+// text-only functionResponse carries. Any non-text block yields a typed
+// *UnsupportedBlockError — fail-secure, never a silent drop.
+func toolResultText(blocks []content.Block) (string, error) {
 	var out string
 	for _, b := range blocks {
-		if t, ok := b.(*content.TextBlock); ok {
-			out += t.Text
+		t, ok := b.(*content.TextBlock)
+		if !ok {
+			return "", &UnsupportedBlockError{Block: fmt.Sprintf("%T", b)}
 		}
+		out += t.Text
 	}
-	return out
+	return out, nil
 }
 
 // buildTools maps the exposed tools into Gemini's single tool entry holding all

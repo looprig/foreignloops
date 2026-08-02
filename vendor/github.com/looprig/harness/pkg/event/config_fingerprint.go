@@ -51,12 +51,12 @@ type ConfigFingerprint struct {
 	// under (e.g. "default", "acceptEdits"). Empty for a native session. A change in
 	// posture is a behavior change that must not resume unnoticed.
 	PermissionPosture string `json:"permission_posture,omitzero"`
-	// NativePermissionPolicyRev is a content digest (hex sha256) of the NATIVE
-	// permission configuration (allowlist + hard-deny lists + MaxReadBytes + the
-	// headless mode bits), computed by tools.PolicyFingerprint at the composition
-	// root and injected. Empty for a foreign session (which uses PermissionPosture)
-	// or a caller that does not inject it. A change is a behavior change that must
-	// not resume unnoticed.
+	// NativePermissionPolicyRev is an opaque content digest (hex sha256) of the
+	// NATIVE permission and access configuration, computed and injected by the
+	// composition root (e.g. over the selected access profiles and rule policy).
+	// Harness only compares it. Empty for a foreign session (which uses
+	// PermissionPosture) or a caller that does not inject it. A change is a
+	// behavior change that must not resume unnoticed.
 	NativePermissionPolicyRev string `json:"native_permission_policy_rev,omitzero"`
 	// ExternalCapabilityRev is a content digest over the identity of the EXTERNAL
 	// capabilities an application attached to this session — tools, prompts and
@@ -82,6 +82,16 @@ type ConfigFingerprint struct {
 	// WithAllowConfigMismatch decides on. A field that promised more than that
 	// would be a promise nothing here keeps.
 	ExternalCapabilityRev string `json:"external_capability_rev,omitzero"`
+	// RuntimeProfile is the secret-free backend profile selected for this bound
+	// loop. Empty preserves native and legacy callers.
+	RuntimeProfile string `json:"runtime_profile,omitzero"`
+	// RuntimeCatalogRev identifies the parent-scoped runtime catalog snapshot.
+	RuntimeCatalogRev string `json:"runtime_catalog_rev,omitzero"`
+	// RuntimeIdentityRev is an opaque hex digest of the selected runtime tuple.
+	// It is produced by loop.BoundDefinition.RuntimeIdentity().Digest() and
+	// covers the model alias, target key, effective effort (including canonical
+	// none), profile, and catalog without persisting raw model descriptors.
+	RuntimeIdentityRev string `json:"runtime_identity_rev,omitzero"`
 }
 
 // Equal reports whether two fingerprints identify the same configuration: true iff
@@ -99,5 +109,8 @@ func (f ConfigFingerprint) Equal(other ConfigFingerprint) bool {
 		f.AgentAdapter == other.AgentAdapter &&
 		f.PermissionPosture == other.PermissionPosture &&
 		f.NativePermissionPolicyRev == other.NativePermissionPolicyRev &&
-		f.ExternalCapabilityRev == other.ExternalCapabilityRev
+		f.ExternalCapabilityRev == other.ExternalCapabilityRev &&
+		f.RuntimeProfile == other.RuntimeProfile &&
+		f.RuntimeCatalogRev == other.RuntimeCatalogRev &&
+		f.RuntimeIdentityRev == other.RuntimeIdentityRev
 }

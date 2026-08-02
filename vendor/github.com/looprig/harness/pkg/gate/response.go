@@ -1,6 +1,63 @@
 package gate
 
-import "encoding/json"
+import (
+	"encoding/json"
+	"errors"
+)
+
+// ApprovalAction is one of the three exact user-facing permission decisions.
+type ApprovalAction string
+
+const (
+	ApprovalApprove                ApprovalAction = "Approve"
+	ApprovalApproveAlwaysWorkspace ApprovalAction = "Approve always for this workspace"
+	ApprovalDeny                   ApprovalAction = "Deny"
+)
+
+// ApprovalActionDecodeError wraps malformed JSON or a non-exact action.
+type ApprovalActionDecodeError struct{ Cause error }
+
+func (e *ApprovalActionDecodeError) Error() string {
+	return "gate: decode approval action: " + e.Cause.Error()
+}
+
+func (e *ApprovalActionDecodeError) Unwrap() error { return e.Cause }
+
+type approvalActionData struct {
+	Action ApprovalAction `json:"action"`
+}
+
+// DecodeApprovalAction strictly decodes one of the three exact approval
+// actions. Unknown fields, duplicate keys, trailing JSON, and null fail closed.
+func DecodeApprovalAction(data []byte) (ApprovalAction, error) {
+	if isExplicitJSONNull(data) {
+		return "", &ApprovalActionDecodeError{Cause: errNullPayloadData}
+	}
+	if err := rejectDuplicateJSONFields(data); err != nil {
+		return "", &ApprovalActionDecodeError{Cause: err}
+	}
+	var raw approvalActionData
+	if err := decodeStrict(data, &raw); err != nil {
+		return "", &ApprovalActionDecodeError{Cause: err}
+	}
+	action, ok := ParseApprovalAction(string(raw.Action))
+	if !ok {
+		return "", &ApprovalActionDecodeError{Cause: errors.New("unknown approval action")}
+	}
+	return action, nil
+}
+
+// ParseApprovalAction returns the exact approval action named by s. It is the
+// single validation source shared by DecodeApprovalAction and the session gate
+// route; anything but the three exact actions fails closed.
+func ParseApprovalAction(s string) (ApprovalAction, bool) {
+	switch ApprovalAction(s) {
+	case ApprovalApprove, ApprovalApproveAlwaysWorkspace, ApprovalDeny:
+		return ApprovalAction(s), true
+	default:
+		return "", false
+	}
+}
 
 // ResponseSourceKind identifies who produced a gate response.
 type ResponseSourceKind string
@@ -12,6 +69,12 @@ const (
 	ResponseFromPolicy ResponseSourceKind = "policy"
 	// ResponseFromModel records a response supplied by model decision policy.
 	ResponseFromModel ResponseSourceKind = "model"
+	// ResponseFromClassifier records a response the session itself
+	// constructed from an eligible automated permission-classifier
+	// assessment (design §16.3). Only a private session-runtime method may
+	// stamp this source; a public caller's attempt to select it directly is
+	// rejected rather than honored (see internal/sessionruntime.RespondGate).
+	ResponseFromClassifier ResponseSourceKind = "classifier"
 )
 
 // ResponseRequest is the generic action and value payload used to answer a gate.

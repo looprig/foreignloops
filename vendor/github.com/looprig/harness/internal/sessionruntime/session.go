@@ -15,11 +15,11 @@ import (
 	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/harness/pkg/foreign"
 	"github.com/looprig/harness/pkg/gate"
+	"github.com/looprig/harness/pkg/hook"
 	"github.com/looprig/harness/pkg/hub"
 	"github.com/looprig/harness/pkg/hustle"
 	"github.com/looprig/harness/pkg/identity"
 	"github.com/looprig/harness/pkg/loop"
-	"github.com/looprig/harness/pkg/security"
 	"github.com/looprig/harness/pkg/tool"
 	"github.com/looprig/harness/pkg/workspacestore"
 	model "github.com/looprig/inference/model"
@@ -53,6 +53,7 @@ type Session struct {
 	sessionCtx               context.Context
 	sessionCancel            context.CancelFunc
 	constructionAbortTimeout time.Duration
+	hooks                    *hook.Runner
 
 	// loopsMu protects loops and activeLoopID. There is no session goroutine, so
 	// session methods serialize registry access with a normal RWMutex.
@@ -112,6 +113,77 @@ type Session struct {
 	hustleController  *hustleruntime.Controller
 	hustlesBound      bool
 
+	// permissionClassifiers and permissionReviewPolicy are immutable
+	// construction inputs set by withPermissionReview (internal/sessionruntime/
+	// gates.go). A zero PermissionClassifierSet (the default: no classifiers
+	// configured) means StartPermissionReview starts no review — the exact
+	// pre-Task-14 gate lifecycle is unchanged for any session that does not opt
+	// in. Unlike hustleDefinitions/hustleController, there is no separate
+	// "bind" step: StartPermissionReview builds a permissionReviewAdapter
+	// on demand from these fields plus the already-bound s.hustleController,
+	// mirroring compactorFor's on-demand construction (internal/sessionruntime/
+	// compaction_adapter.go) rather than hustleController's eager one, because
+	// review is session-wide (one registry for every loop) rather than
+	// per-loop.
+	permissionClassifiers  gate.PermissionClassifierSet
+	permissionReviewPolicy gate.PermissionReviewPolicy
+
+	// permissionReviewEvidenceAccess, permissionReviewEvidenceContainment, and
+	// permissionReviewEvidenceAllowedKinds are the immutable construction
+	// inputs set by withPermissionReviewEvidence (internal/sessionruntime/
+	// gates.go), forwarded into hustleruntime.RuntimeConfig.Evidence at
+	// hustle-controller construction (hustle.go's newHustleController). They
+	// install the consumer-supplied read-only evidence-tool access boundary
+	// every registered permission classifier's evidence tools authorize
+	// against (design §13.1). All three stay at their zero value for a
+	// session that never opts in — newHustleController then fails
+	// CONSTRUCTION closed (never silently permissive) for any registered
+	// classifier whose definition actually needs evidence tools.
+	permissionReviewEvidenceAccess       gate.EvidenceAccessEvaluator
+	permissionReviewEvidenceContainment  gate.EvidenceContainmentVerifier
+	permissionReviewEvidenceAllowedKinds []string
+
+	// permissionReviewSecurityCeiling is the immutable, consumer-supplied
+	// effective security posture (design §13.1/§21) set by
+	// withPermissionReviewSecurityCeiling (internal/sessionruntime/gates.go)
+	// and threaded into every ReviewContext loopReviewContext builds. It is a
+	// consumer-owned concept — the SAME kind of value as
+	// permissionReviewEvidenceContainment/permissionReviewEvidenceAllowedKinds
+	// above — that Harness has no way to originate itself (this module has no
+	// first-class "effective access posture" concept; CodeRig binds its own
+	// AccessProfile name here). Staying empty for a session that never opts
+	// in makes loopReviewContext return nil (defense in depth; the LOUD
+	// failure is rig.Define()-time validation pairing this with
+	// WithPermissionClassifiers, mirroring WithPermissionReviewEvidence's
+	// pairing) rather than silently stamping a placeholder value that can
+	// never equal a real consumer's own ceiling.
+	permissionReviewSecurityCeiling string
+
+	// permissionReviewObservationVerifier is the immutable, OPTIONAL
+	// consumer-supplied recheck seam (design §13.4, TOCTOU) set by
+	// withPermissionReviewObservationVerifier (internal/sessionruntime/
+	// gates.go). Unlike permissionReviewEvidence*/permissionReviewSecurityCeiling
+	// above, staying nil is a fully supported, non-degraded configuration: a
+	// session whose registered classifiers' evidence tools never record any
+	// ObservationRequirement has nothing for this seam to ever recheck.
+	// respondFromClassifier's verifyPermissionReviewObservations treats the
+	// two "nil verifier" cases very differently, though — see its own doc
+	// comment: zero recorded observations is a genuine no-op, but ONE OR MORE
+	// recorded observations with this still nil is exactly the "consumer
+	// wired an observation-recording evidence tool but forgot
+	// rig.WithPermissionReviewObservations" misconfiguration, and fails
+	// closed (treated as stale) rather than silently skipping the recheck.
+	permissionReviewObservationVerifier gate.EvidenceObservationVerifier
+
+	// review is the session's bounded, PURELY in-memory permission-review
+	// cancellation-group + circuit-breaker bookkeeping (design §15, §18;
+	// internal/sessionruntime/review_state.go). It is never persisted and
+	// never restored: a restored session is built as a fresh struct literal
+	// (restore_constructor.go's buildRestoredSession) that never sets this
+	// field, so it always starts from the zero reviewLifecycle — design
+	// §22.4's "stale live cancellation handles do not survive restore".
+	review reviewLifecycle
+
 	// limits are the in-session subagent-spawn safety caps NewLoop enforces (depth +
 	// quota). Defaulted in newSession (withDefaults) so the live values are always
 	// positive caps, and overridable via WithLimits. Read under loopsMu inside NewLoop's
@@ -161,12 +233,22 @@ type Session struct {
 	// consults it. Default false = fail-secure (a mismatch rejects the restore).
 	allowConfigMismatch bool
 
+	// restoreDecider is the restore-only application policy (set by WithRestoreDecider)
+	// that answers a configuration-drift assessment. It defaults to the fail-secure
+	// DefaultPolicyDecider{} (reject on any Warn) when the composition root supplies
+	// none. A later task consumes it in the restore path; today it is stored only.
+	restoreDecider RestoreDecider
+
 	// fingerprint is required composition wiring supplied by rig and is the single
 	// projection used by both new and restored sessions.
 	fingerprint FingerprintProvider
 	// frozenFingerprint is the rig-resolved compatibility identity used before any
 	// restore-time workspace resolution or loop/tool binding.
 	frozenFingerprint *event.ConfigFingerprint
+	// frozenManifest is the rig-assembled ConfigManifest counterpart to
+	// frozenFingerprint, stamped onto the construction-time SessionStarted's additive
+	// Manifest field. Nil leaves Manifest at its zero value.
+	frozenManifest *event.ConfigManifest
 
 	// injectedSessionID is the externally-minted sessionID the composition root supplies
 	// via WithSessionID, read ONLY by newSession to resolve the journal chicken-and-egg:
@@ -201,10 +283,14 @@ type Session struct {
 	// RestoreForeignBuilderMissing). The session depends only on these narrow function
 	// seams, never on the foreignloop concrete loop (Dependency Inversion): loopruntime.New
 	// itself only ever builds native, and the foreign backend is injected here.
-	foreignBuild         foreign.Builder
-	foreignBuildRestored foreign.RestoredBuilder
-	delegateSubscribe    func(event.EventFilter) (event.Subscription, error)
-	delegateEnqueue      func(context.Context, loop.Backend, command.UserInput) error
+	foreignBuild           foreign.Builder
+	foreignBuildRestored   foreign.RestoredBuilder
+	foreignRegistry        *foreign.BuilderRegistry
+	runtimeCatalog         loop.RuntimeCatalog
+	hasRuntimeCatalog      bool
+	runtimeCatalogProvider RuntimeCatalogProvider
+	delegateSubscribe      func(event.EventFilter) (event.Subscription, error)
+	delegateEnqueue        func(context.Context, loop.Backend, command.UserInput) error
 
 	// ws is the workspace snapshot store CheckpointWorkspace archives the session's
 	// working tree into, and wsRoot is the directory it archives. Both are wired
@@ -251,17 +337,6 @@ type Session struct {
 	snapshotPolicy      *checkpointPolicy
 	checkpoints         *checkpointController
 	checkpointAdmission *checkpointAdmissionGate
-
-	// security limit is the session's live SECURITY LIMIT ordinal source (SPEC §8/§10.2): the
-	// clamp SetSecurityLimit mutates and SecurityLimitSource exposes. It is default-minted at
-	// construction (New/Restore) so it is NEVER nil for a constructed session; the
-	// composition root overrides it via WithSecurityLimit with the SAME *security.Limit it wires
-	// into the permission checker (tools.WithSecurityLimitPostures), so a security limit change is
-	// visible to the checker on the next Check. On restore it is re-seeded from the folded
-	// SecurityLimitChanged events (last write wins). Concurrency-safe (atomic) — a
-	// checker reads Current on a loop goroutine while SetSecurityLimit applies on the
-	// dispatch goroutine.
-	securityLimit *security.Limit
 
 	// gatesMu protects gates and the per-entry state transitions. The gate
 	// directory is session-owned (the session is the source of truth for which
@@ -516,10 +591,11 @@ type loopHandle struct {
 	// full binding set before dispatching on Engine. It is therefore NOT a signal for
 	// whether a loop can host harness tools — use bound.Engine() for that. (A foreign loop
 	// is refused by ReplaceExternalTools on its engine, not on this field.)
-	bindings tool.Bindings
-	backend  loop.Backend
-	parent   loop.Provenance
-	cancel   context.CancelFunc
+	bindings   tool.Bindings
+	backend    loop.Backend
+	tombstoned bool
+	parent     loop.Provenance
+	cancel     context.CancelFunc
 
 	// liveMu guards the live view (liveMode/liveModel) — the CURRENT selection
 	// Handle.Mode()/Model() report. The loop actor is the authoritative owner of the
@@ -700,8 +776,7 @@ func (s *Session) observeBestEffortCheckpointError(err error) {
 // failed) or nil. After emitting a mode/inference change event, the actor calls it: because
 // the hub raises the fault INLINE (synchronously on the same actor goroutine, via
 // ReportFault) when the append fails, a non-nil result here means the change event did not
-// persist, so the actor declines to apply the change (fail-secure, no partial apply). It is
-// the loop-scoped counterpart to SetSecurityLimit's own post-emit fault check.
+// persist, so the actor declines to apply the change (fail-secure, no partial apply).
 func (s *Session) FaultErr() error {
 	return s.faultIfFaulted()
 }
@@ -720,6 +795,7 @@ func (s *Session) PublishEvent(ctx context.Context, ev event.Event) error {
 		return err
 	}
 	s.recordLoopMechanicalState(ev)
+	s.clearReviewTurnState(ev)
 	return nil
 }
 
@@ -732,6 +808,7 @@ func (s *Session) PublishEventChecked(ctx context.Context, ev event.Event) error
 		return err
 	}
 	s.recordLoopMechanicalState(ev)
+	s.clearReviewTurnState(ev)
 	return nil
 }
 
@@ -914,6 +991,16 @@ func (s *Session) projectFingerprint(definition loop.BoundDefinition) event.Conf
 	return s.fingerprint(definition)
 }
 
+// projectManifest returns the rig-assembled manifest baseline stamped onto
+// SessionStarted. The zero ConfigManifest stands in when no manifest was supplied
+// (the deprecation-window default), keeping the Manifest field additive.
+func (s *Session) projectManifest() event.ConfigManifest {
+	if s.frozenManifest != nil {
+		return *s.frozenManifest
+	}
+	return event.ConfigManifest{}
+}
+
 func (s *Session) ActiveLoop() loop.Handle {
 	s.loopsMu.RLock()
 	defer s.loopsMu.RUnlock()
@@ -950,6 +1037,9 @@ func (s *Session) SetActiveLoop(ctx context.Context, id uuid.UUID) error {
 	}
 	if closing {
 		return &SessionError{Kind: SessionClosing}
+	}
+	if target.backend == nil {
+		return &SessionError{Kind: SessionLoopExited}
 	}
 	select {
 	case <-target.backend.DoneChan():
@@ -1095,10 +1185,10 @@ func (s *Session) NewLoop(parent loop.Provenance, cfg loop.Definition) (uuid.UUI
 // rides as a plain parameter into the LoopStarted build only — it touches no identity /
 // Provenance / Header struct, so it never perturbs the loop tree or the quota/depth math.
 func (s *Session) newLoop(parent loop.Provenance, cfg loop.Definition, parentToolUseID string, selectedMode loop.ModeName, prepared *preparedLoop) (uuid.UUID, error) {
-	return s.newLoopWithAdmission(parent, cfg, parentToolUseID, selectedMode, prepared, nil)
+	return s.newLoopWithAdmission(parent, cfg, parentToolUseID, selectedMode, prepared, nil, nil, loop.RuntimeCatalog{}, false)
 }
 
-func (s *Session) newLoopWithAdmission(parent loop.Provenance, cfg loop.Definition, parentToolUseID string, selectedMode loop.ModeName, prepared *preparedLoop, admission *delegateAdmission) (uuid.UUID, error) {
+func (s *Session) newLoopWithAdmission(parent loop.Provenance, cfg loop.Definition, parentToolUseID string, selectedMode loop.ModeName, prepared *preparedLoop, admission *delegateAdmission, runtime *loop.Resolved, runtimeCatalog loop.RuntimeCatalog, hasRuntimeCatalog bool) (uuid.UUID, error) {
 	// Whether this spawn counts toward the cumulative spawn quota. The initial root loop is
 	// built by newSession via NewLoop with zero provenance and must not consume a quota slot;
 	// every subagent spawn
@@ -1175,23 +1265,34 @@ func (s *Session) newLoopWithAdmission(parent loop.Provenance, cfg loop.Definiti
 			release()
 			return uuid.UUID{}, &SessionError{Kind: SessionLoopIDGenerationFailed, Cause: err}
 		}
-		bindings = tool.Bindings{SessionID: s.sessionID, LoopID: loopID, SecurityLimit: s.securityLimitState(), Workspace: s.newWorkspaceBinding(), Delegate: s.delegation.controllerFor(loopID, cfg), ExtraTools: delegateExtraTools(cfg, s.delegation)}
+		bindings = tool.Bindings{SessionID: s.sessionID, LoopID: loopID, Workspace: s.newWorkspaceBinding(), Delegate: s.delegation.controllerFor(loopID, cfg), ExtraTools: delegateExtraTools(cfg, s.delegation)}
 		bound, err = cfg.Bind(s.sessionCtx, bindings)
 		if err != nil {
 			release()
 			return uuid.UUID{}, err
 		}
-	}
-	if counts {
-		s.loopsMu.RLock()
-		parentHandle := s.loops[parent.LoopID]
-		s.loopsMu.RUnlock()
-		var parentPermission loop.PermissionGate
-		if parentHandle != nil && parentHandle.bound != nil {
-			parentPermission = parentHandle.bound.Permission()
+		if runtime != nil {
+			runtimeAlias := runtime.TargetAlias
+			if runtimeAlias == "" {
+				// Resolved values created before concrete target aliases were
+				// introduced remain valid and use the model-facing alias as the
+				// compatible durable identity.
+				runtimeAlias = runtime.ModelAlias
+			}
+			bound, err = loop.OverrideBoundRuntimeSelection(bound, runtime.Profile, runtimeAlias, runtime.Target, runtime.Effort)
+			if err == nil && hasRuntimeCatalog {
+				bound, err = loop.OverrideBoundRuntimeCatalog(bound, runtimeCatalog)
+			}
+			if err != nil {
+				release()
+				return uuid.UUID{}, err
+			}
 		}
-		bound = loop.AttenuateBoundPermission(bound, parentPermission)
 	}
+	// A spawned subagent keeps its OWN definition's access gate — never the
+	// parent's. Authority differences between loops are expressed by the
+	// consumer configuring different gates per definition (or OverrideBoundAccess
+	// at a binding seam); harness performs no cross-loop attenuation.
 	var eventTarget loopEventPublisher = s
 	if admission != nil {
 		admission.sub, err = s.subscribeLoop(loopID)
@@ -1254,12 +1355,51 @@ func (s *Session) newLoopWithAdmission(parent loop.Provenance, cfg loop.Definiti
 	loopCtx, cancel := context.WithCancel(s.sessionCtx)
 	var b loop.Backend
 	var foreignSID string
+	var agentSessionHeader event.Header
 	switch bound.Engine() {
 	case loop.EngineNative:
 		var compactor loopruntime.Compactor
 		compactor, err = s.compactorFor(bound, loopID)
 		if err == nil {
-			b, err = loopruntime.NewInModeWithCompactor(loopCtx, s.sessionID, loopID, parent, eventTarget, bound, startedMode, compactor)
+			b, err = loopruntime.NewInModeWithRuntime(
+				loopCtx,
+				s.sessionID,
+				loopID,
+				parent,
+				eventTarget,
+				bound,
+				startedMode,
+				loopruntime.RuntimeDependencies{Compactor: compactor, Hooks: s.hooks, ReviewContext: s.loopReviewContext()},
+			)
+		}
+	case loop.EngineAdapter:
+		selectedBound, selectErr := loop.SelectBoundMode(bound, startedMode)
+		if selectErr != nil {
+			release()
+			cancel()
+			return uuid.UUID{}, selectErr
+		}
+		bound = selectedBound
+		if s.foreignRegistry != nil {
+			builder, _, lookupErr := s.foreignRegistry.Builder(bound.RuntimeProfile())
+			if lookupErr != nil {
+				release()
+				cancel()
+				return uuid.UUID{}, &SessionError{Kind: SessionForeignBuilderMissing, Cause: lookupErr}
+			}
+			b, foreignSID, err = builder(loopCtx, s.sessionID, loopID, parent, eventTarget, selectedBound,
+				func() (uuid.UUID, error) { return s.newID() }, s.factory)
+		} else if s.foreignBuild != nil {
+			// The legacy function-pair seam remains a valid composition path for
+			// adapter definitions. A profile-aware dispatcher supplied through
+			// WithForeignBuilders still performs its own bounded lookup; the
+			// session must not reject it merely because no registry option exists.
+			b, foreignSID, err = s.foreignBuild(loopCtx, s.sessionID, loopID, parent, eventTarget, selectedBound,
+				func() (uuid.UUID, error) { return s.newID() }, s.factory)
+		} else {
+			release()
+			cancel()
+			return uuid.UUID{}, &SessionError{Kind: SessionForeignBuilderMissing}
 		}
 	default:
 		if s.foreignBuild == nil {
@@ -1284,6 +1424,19 @@ func (s *Session) newLoopWithAdmission(parent loop.Provenance, cfg loop.Definiti
 			_ = admission.sub.Close()
 		}
 		return uuid.UUID{}, err
+	}
+	if foreignSID != "" && runtime != nil && runtime.Profile != "" {
+		agentSessionHeader, err = s.factory.Stamp(event.Header{
+			Coordinates: identity.Coordinates{SessionID: s.sessionID, LoopID: loopID},
+		})
+		if err != nil {
+			release()
+			cancel()
+			if admission != nil {
+				_ = admission.sub.Close()
+			}
+			return uuid.UUID{}, &SessionError{Kind: SessionIDGenerationFailed, Cause: err}
+		}
 	}
 	if admission != nil {
 		if err := s.appendDelegateCommand(admission.ctx, loopID, admission.command); err != nil {
@@ -1354,7 +1507,21 @@ func (s *Session) newLoopWithAdmission(parent loop.Provenance, cfg loop.Definiti
 	// ctx param, so it publishes on the session lifetime (s.sessionCtx). The header
 	// (Coordinates/Cause + minted EventID/CreatedAt) was stamped above before the loop
 	// was built.
-	ev := event.LoopStarted{Header: startedHeader, Runtime: runtimeForModel(liveModel), ParentToolUseID: parentToolUseID, ForeignSID: foreignSID, InitialMode: string(startedMode), DisplayName: bound.DisplayName(), Description: bound.Description()}
+	var agentRuntime *event.AgentRuntime
+	if runtime != nil && runtime.Profile != "" {
+		runtimeAlias := runtime.TargetAlias
+		if runtimeAlias == "" {
+			runtimeAlias = runtime.ModelAlias
+		}
+		agentRuntime = &event.AgentRuntime{
+			Harness:         string(runtime.AgentHarness),
+			Profile:         string(runtime.Profile),
+			CredentialMode:  string(runtime.Credential),
+			ModelAlias:      string(runtimeAlias),
+			SmallModelAlias: string(runtime.SmallModel),
+		}
+	}
+	ev := event.LoopStarted{Header: startedHeader, Runtime: runtimeForModel(liveModel), AgentRuntime: agentRuntime, ParentToolUseID: parentToolUseID, ForeignSID: foreignSID, InitialMode: string(startedMode), DisplayName: bound.DisplayName(), Description: bound.Description()}
 	if admission != nil {
 		ev.InitialRequestID = admission.requestID
 	}
@@ -1375,6 +1542,21 @@ func (s *Session) newLoopWithAdmission(parent loop.Provenance, cfg loop.Definiti
 			_ = admission.sub.Close()
 		}
 		return uuid.UUID{}, &SessionError{Kind: SessionContextDone, Cause: err}
+	}
+	if foreignSID != "" && runtime != nil && runtime.Profile != "" {
+		if err := publish(s.sessionCtx, event.LoopAgentSessionBound{Header: agentSessionHeader, ACPSessionID: foreignSID}); err != nil {
+			s.loopsMu.Lock()
+			if !s.constructing {
+				delete(s.loops, loopID)
+			}
+			s.loopsMu.Unlock()
+			release()
+			cancel()
+			if admission != nil {
+				_ = admission.sub.Close()
+			}
+			return uuid.UUID{}, &SessionError{Kind: SessionContextDone, Cause: err}
+		}
 	}
 	if admission != nil {
 		admission.publisher.release()
@@ -1547,12 +1729,10 @@ func newSessionTopology(ctx context.Context, topology Topology, newID idGenerato
 	if s.fingerprint == nil && s.frozenFingerprint == nil {
 		return abort(&MissingFingerprintProviderError{})
 	}
-	// Default-mint the security limit source when the composition root did not inject
-	// one via WithSecurityLimit, so SetSecurityLimit/SecurityLimitSource are always safe (never a
-	// nil-deref). A fresh session starts at the fail-secure most-restrictive ordinal (0)
-	// until a SetSecurityLimit command changes it.
-	if s.securityLimit == nil {
-		s.securityLimit = security.New()
+	// Default the restore-drift decider to the fail-secure policy when the composition
+	// root injected none via WithRestoreDecider, so the stored decider is never nil.
+	if s.restoreDecider == nil {
+		s.restoreDecider = DefaultPolicyDecider{}
 	}
 	// Apply the spawn-cap defaults AFTER the options so an unset (or WithLimits-supplied)
 	// Limits resolves to positive caps before the first NewLoop — a zero or negative
@@ -1563,7 +1743,13 @@ func newSessionTopology(ctx context.Context, topology Topology, newID idGenerato
 	// manager is attached to this session so its scoped controllers can spawn + address
 	// children through it.
 	s.topology = cloneTopology(topology)
-	s.delegation = newDelegationManager(s.topology)
+	if s.runtimeCatalogProvider != nil {
+		s.delegation = newDelegationManagerWithCatalogProvider(s.topology, s.runtimeCatalogProvider)
+	} else if s.hasRuntimeCatalog {
+		s.delegation = newDelegationManager(s.topology, s.runtimeCatalog)
+	} else {
+		s.delegation = newDelegationManager(s.topology)
+	}
 	s.delegation.attach(s)
 	// The Factory mints from closures over the LIVE newID + now fields, so a test
 	// that swaps either after construction pins the stamp too (the same seam the
@@ -1580,7 +1766,11 @@ func newSessionTopology(ctx context.Context, topology Topology, newID idGenerato
 	// nop default (headless/no-persistence). A nil appender is passed through to
 	// hub.WithAppender, which ignores it (the nop default stays), so the no-injection
 	// path is unchanged.
-	hubOpts := []hub.Option{hub.WithFactory(s.factory), hub.WithFaultReporter(s)}
+	hubOpts := []hub.Option{
+		hub.WithFactory(s.factory),
+		hub.WithFaultReporter(s),
+		hub.WithCommitObserver(s.recordLoopMechanicalState),
+	}
 	if s.injectedEventAppender != nil {
 		hubOpts = append(hubOpts, hub.WithAppender(s.injectedEventAppender))
 	}
@@ -1630,7 +1820,7 @@ func newSessionTopology(ctx context.Context, topology Topology, newID idGenerato
 		if mintErr != nil {
 			return abort(&SessionError{Kind: SessionLoopIDGenerationFailed, Cause: mintErr})
 		}
-		bindings := tool.Bindings{SessionID: id, LoopID: loopID, SecurityLimit: s.securityLimitState(), Workspace: s.newWorkspaceBinding(), Delegate: s.delegation.controllerFor(loopID, definition), ExtraTools: delegateExtraTools(definition, s.delegation)}
+		bindings := tool.Bindings{SessionID: id, LoopID: loopID, Workspace: s.newWorkspaceBinding(), Delegate: s.delegation.controllerFor(loopID, definition), ExtraTools: delegateExtraTools(definition, s.delegation)}
 		bound, bindErr := definition.Bind(sessionCtx, bindings)
 		if bindErr != nil {
 			return abort(bindErr)
@@ -1653,7 +1843,7 @@ func newSessionTopology(ctx context.Context, topology Topology, newID idGenerato
 	// orderedPrimers placed topology.ActivePrimer first (unconditionally) and prepared was
 	// built in that order, so prepared[0] is always the active primer — no rescan needed.
 	activePrepared := prepared[0]
-	if err := s.hub.PublishEventChecked(sessionCtx, event.SessionStarted{Header: startedHeader, Config: s.projectFingerprint(activePrepared.loop.bound)}); err != nil {
+	if err := s.hub.PublishEventChecked(sessionCtx, event.SessionStarted{Header: startedHeader, Config: s.projectFingerprint(activePrepared.loop.bound), Manifest: s.projectManifest()}); err != nil {
 		return abort(&SessionError{Kind: SessionContextDone, Cause: err})
 	}
 	if s.initialWorkspaceCheckpoint != "" {
@@ -1723,6 +1913,9 @@ func (s *Session) interruptLoopID(loopID uuid.UUID) error {
 	if !ok {
 		return &SessionError{Kind: SessionLoopNotFound}
 	}
+	if l == nil {
+		return &SessionError{Kind: SessionLoopExited}
+	}
 	s.interruptLoop(loopID, l)
 	return nil
 }
@@ -1747,6 +1940,9 @@ func (s *Session) cancelDelegateRequest(loopID, requestID uuid.UUID) (command.De
 	l, ok := s.loopFor(loopID)
 	if !ok {
 		return command.DelegateCancelNoop, &SessionError{Kind: SessionLoopNotFound}
+	}
+	if l == nil {
+		return command.DelegateCancelNoop, &SessionError{Kind: SessionLoopExited}
 	}
 	id, err := s.newID()
 	if err != nil {
@@ -1901,6 +2097,9 @@ func (s *Session) submitToLoop(ctx context.Context, loopID uuid.UUID, blocks []c
 	if !ok {
 		return uuid.UUID{}, &SessionError{Kind: SessionLoopNotFound}
 	}
+	if l == nil {
+		return uuid.UUID{}, &SessionError{Kind: SessionLoopExited}
+	}
 	id, err := s.newCommandID()
 	if err != nil {
 		return uuid.UUID{}, err
@@ -1932,7 +2131,7 @@ func (s *Session) submitToLoop(ctx context.Context, loopID uuid.UUID, blocks []c
 // (a later task) has one method to call and the blocks stay package-private.
 //
 // cfg is the sub-loop's loop.Definition — the CALLER builds a FRESH cfg per call (its
-// own ToolSet/PermissionChecker) so each sub-loop has independent approval state;
+// own ToolSet and access gate) so each sub-loop has independent approval state;
 // RunSubagent never reuses a shared ToolSet. parent is the spawning loop/turn/step
 // provenance (recorded on the sub-loop's registry entry and stamped on its
 // LoopStarted). The submit is stamped Agency=AgencyMachine — a subagent turn is a
@@ -2210,6 +2409,11 @@ func (s *Session) shutdown() error {
 	s.loopsMu.Unlock()
 	s.activeMu.Unlock()
 	timeouts := s.resolveShutdownTimeouts(snapshot)
+	// design §15's fourth cancellation trigger: the session shuts down. Every
+	// active permission review is signalled to stop before the shared Hustle
+	// runtime begins its own drain, so in-flight classifier calls observe
+	// cancellation as early as possible.
+	s.shutdownPermissionReviews()
 	failures := make([]error, 0, 6)
 	failures = append(failures, s.closeHustles(shutdownRoot, timeouts.hustle))
 	targets, sendErr := s.sendLoopShutdowns(shutdownRoot, snapshot, timeouts.loopSend)

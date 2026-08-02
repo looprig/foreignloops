@@ -19,6 +19,9 @@ const (
 	DefinitionInvalidPromptRevision DefinitionErrorKind = "invalid_prompt_revision"
 	DefinitionMissingPolicyRevision DefinitionErrorKind = "missing_policy_revision"
 	DefinitionInvalidPolicyRevision DefinitionErrorKind = "invalid_policy_revision"
+	DefinitionInvalidOutputSchema   DefinitionErrorKind = "invalid_output_schema"
+	DefinitionInvalidEvidenceTools  DefinitionErrorKind = "invalid_evidence_tools"
+	DefinitionInvalidRetryPolicy    DefinitionErrorKind = "invalid_retry_policy"
 )
 
 // DefinitionError reports a definition boundary failure without retaining raw
@@ -46,6 +49,7 @@ const (
 	BindInvalidDefinition    BindErrorKind = "invalid_definition"
 	BindInvalidContext       BindErrorKind = "invalid_context"
 	BindMissingModelResolver BindErrorKind = "missing_model_resolver"
+	BindInvalidEvidenceTools BindErrorKind = "invalid_evidence_tools"
 )
 
 // BindError reports why an immutable definition could not be bound.

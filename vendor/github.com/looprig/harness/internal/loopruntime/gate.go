@@ -2,11 +2,15 @@ package loopruntime
 
 import (
 	"context"
+	"strings"
+	"time"
 
 	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/command"
 	"github.com/looprig/harness/pkg/event"
 	gatedomain "github.com/looprig/harness/pkg/gate"
+	"github.com/looprig/harness/pkg/hook"
+	"github.com/looprig/harness/pkg/identity"
 	"github.com/looprig/harness/pkg/tool"
 )
 
@@ -38,6 +42,61 @@ type gateRegistrar interface {
 	CloseGate(ctx context.Context, id gatedomain.ID, reason gatedomain.CloseReason) error
 }
 
+// PermissionReviewRequest is the live-only handoff the actor gives a session's
+// review starter once a permission gate's GateOpened has committed and the
+// runner has been acked (design §14.3). It carries exactly what a classifier
+// needs to build a PermissionReviewSubject and nothing a durable record or
+// event may not: no raw tool arguments beyond what the human-facing gate
+// already displays, and no token or grant material. ReviewContext already
+// carries the loop/session/turn/step coordinates plus the gate policy
+// revision and security ceiling in effect when the batch was captured
+// (internal/loopruntime/review_context.go); a zero ReviewContext
+// (ContextRevision == "") means no live review was configured for this turn,
+// and a review starter must treat that as "nothing to review" rather than
+// guessing at defaults.
+type PermissionReviewRequest struct {
+	GateID          gatedomain.ID
+	ToolExecutionID uuid.UUID
+	Request         tool.Request
+	ReviewContext   gatedomain.ReviewContext
+}
+
+// permissionReviewStarter is the narrow, private seam a session-side adapter
+// implements to begin asynchronous permission-classifier review after a
+// gatePermission registration activates. It is obtained via the same optional
+// type-assertion pattern as gateRegistrar (NewLoop's `events.(gateRegistrar)`):
+// a publisher that does not implement it simply never starts review, which
+// keeps every headless/test path that predates this seam unchanged.
+//
+// StartPermissionReview MUST return promptly. The actor calls it inline, on
+// its own single-threaded event-loop goroutine, and does not wrap the call in
+// a goroutine of its own — the contract is "kick off async work and return",
+// not "compute a result". An implementation that blocks on classifier
+// inference here blocks the whole loop actor; the session-side adapter is
+// responsible for moving inference onto its own goroutine before returning.
+type permissionReviewStarter interface {
+	StartPermissionReview(ctx context.Context, req PermissionReviewRequest)
+}
+
+// permissionRequestFromPayload narrows a gate.Payload to the displayed
+// tool.Request a gatePermission registration always carries. A payload that is
+// not a PermissionPayload (or a nil one) reports false rather than a zero
+// Request the caller could mistake for a genuinely empty prepared request —
+// fail-closed: no valid payload means no review starts.
+func permissionRequestFromPayload(payload gatedomain.Payload) (tool.Request, bool) {
+	switch v := payload.(type) {
+	case gatedomain.PermissionPayload:
+		return v.Request, true
+	case *gatedomain.PermissionPayload:
+		if v == nil {
+			return tool.Request{}, false
+		}
+		return v.Request, true
+	default:
+		return tool.Request{}, false
+	}
+}
+
 type nopGateRegistrar struct{}
 
 func (nopGateRegistrar) PrepareGateOpen(_ context.Context, _ uuid.UUID, g gatedomain.Gate, _ gatedomain.Payload) (gatedomain.ID, error) {
@@ -63,12 +122,19 @@ func (nopGateRegistrar) CloseGate(context.Context, gatedomain.ID, gatedomain.Clo
 // kind} under the minted GateID, activates the public gate, then acks to signal
 // install-before-emit.
 type gateRegistration struct {
-	gate    gatedomain.Gate
-	payload gatedomain.Payload
-	callID  uuid.UUID
-	reply   chan<- command.Command
-	kind    gateKind
-	ack     chan<- gateInstallAck
+	ctx context.Context
+	// abandonID makes this an actor-owned removal request rather than an open
+	// request. The same synchronous channel preserves ordering with registration.
+	abandonID gatedomain.ID
+	gate      gatedomain.Gate
+	payload   gatedomain.Payload
+	// reviewContext is a live-only defensive clone for permission review. The
+	// actor never copies it into gate payloads, events, or journal records.
+	reviewContext gatedomain.ReviewContext
+	callID        uuid.UUID
+	reply         chan<- command.Command
+	kind          gateKind
+	ack           chan<- gateInstallAck
 }
 
 type gateInstallAck struct {
@@ -104,10 +170,33 @@ func accepts(kind gateKind, cmd command.Command) bool {
 type emitKey struct{}
 type callIDKey struct{}
 type gateRegKey struct{}
+type operationHookRuntimeKey struct{}
+
+type operationHookRuntime struct {
+	hooks       *hook.Runner
+	coordinates identity.Coordinates
+	agentName   identity.AgentName
+	cause       identity.Cause
+}
+
+type eventEmitter func(context.Context, event.Event)
+
+func withOperationHookRuntime(ctx context.Context, runtime operationHookRuntime) context.Context {
+	return context.WithValue(ctx, operationHookRuntimeKey{}, runtime)
+}
+
+func operationHooksFromContext(ctx context.Context) operationHookRuntime {
+	runtime, _ := ctx.Value(operationHookRuntimeKey{}).(operationHookRuntime)
+	return runtime
+}
 
 // withEmit returns a child ctx carrying the per-turn emit func. The runner injects
 // it per tool call; EmitFromContext / RequestUserInput read it back.
 func withEmit(ctx context.Context, emit func(event.Event)) context.Context {
+	return context.WithValue(ctx, emitKey{}, emit)
+}
+
+func withContextEmit(ctx context.Context, emit eventEmitter) context.Context {
 	return context.WithValue(ctx, emitKey{}, emit)
 }
 
@@ -129,22 +218,10 @@ func withGateReg(ctx context.Context, gateReg chan<- gateRegistration) context.C
 	return context.WithValue(ctx, gateRegKey{}, gateReg)
 }
 
-// WithPrepared returns a child ctx carrying the per-call PreparedArtifact a
-// Preparer tool produced for THIS call. The runner injects it per tool call; the
-// producing tool's InvokableRun reads it back via PreparedFromContext. It is nil
-// for non-Preparer tools, which never look. It is the symmetric write side of the
-// exported PreparedFromContext read side (mirroring WithProvenance/ProvenanceFrom),
-// so a Preparer tool defined in another package can be exercised in isolation
-// without driving the whole runner.
 // callIDFromContext reads the active ToolExecutionID, false when absent.
 func callIDFromContext(ctx context.Context) (uuid.UUID, bool) {
 	v, ok := ctx.Value(callIDKey{}).(uuid.UUID)
 	return v, ok
-}
-
-// toolUseIDFromContext reads the active provider tool-use id, false when absent.
-func toolUseIDFromContext(ctx context.Context) (string, bool) {
-	return ToolUseIDFrom(ctx)
 }
 
 // gateRegFromContext reads the gate-registration handle, false when absent.
@@ -158,16 +235,15 @@ func gateRegFromContext(ctx context.Context) (chan<- gateRegistration, bool) {
 // tools call this; it is the only sanctioned way for a tool in tools/ to emit an
 // event without depending on the loop internals.
 func EmitFromContext(ctx context.Context) (func(event.Event), bool) {
-	v, ok := ctx.Value(emitKey{}).(func(event.Event))
-	return v, ok
+	switch emit := ctx.Value(emitKey{}).(type) {
+	case eventEmitter:
+		return func(value event.Event) { emit(ctx, value) }, true
+	case func(event.Event):
+		return emit, true
+	default:
+		return nil, false
+	}
 }
-
-// PreparedFromContext returns the per-call PreparedArtifact the runner injected
-// for THIS call, and false when none is present (a non-Preparer tool, or the tool
-// run outside a turn). It is the sanctioned way for a Preparer tool's InvokableRun
-// to read back the artifact its own Prepare produced, without depending on loop
-// internals. A nil artifact (a Preparer that returned nil, no error) reports ok
-// false — there is nothing to read.
 
 // GateContextMissing identifies which injected ctx value RequestUserInput could
 // not find. It is a fail-secure signal: a tool that calls RequestUserInput outside
@@ -228,7 +304,7 @@ func RequestUserInput(ctx context.Context, question string, choices []string) (s
 	// Register synchronously, ctx-aware: no wedge if the actor is gone or the turn
 	// is cancelled.
 	select {
-	case gateReg <- gateRegistration{gate: g, payload: payload, callID: callID, reply: reply, kind: gateUserInput, ack: ack}:
+	case gateReg <- gateRegistration{ctx: ctx, gate: g, payload: payload, callID: callID, reply: reply, kind: gateUserInput, ack: ack}:
 	case <-ctx.Done():
 		return "", ctx.Err()
 	}
@@ -245,18 +321,142 @@ func RequestUserInput(ctx context.Context, question string, choices []string) (s
 	// Install-before-emit: only now is the session gate guaranteed active.
 	emit(event.UserInputRequested{ToolExecutionID: callID, Question: question, Choices: choices})
 
+	g.ID = installed.gateID
+	runtime := operationHooksFromContext(ctx)
+	parentCall := hook.Call{
+		Coordinates: runtime.coordinates,
+		AgentName:   runtime.agentName,
+		Cause:       runtime.cause,
+	}
+	waitCtx, waitCall, finishWait, waitErr := startGateWaitWithRunner(ctx, parentCall, g, runtime.hooks)
+	if waitErr != nil {
+		return "", waitErr
+	}
 	select {
 	case cmd := <-reply:
 		// runLoop already matched by ToolExecutionID + kind; re-validate the ToolExecutionID as cheap
 		// defence in depth, and narrow to the concrete command for the answer.
 		pui, ok := cmd.(command.ProvideUserInput)
 		if !ok || pui.GateToolExecutionID() != callID || (!pui.GateRoute.GateID.IsZero() && pui.GateRoute.GateID != installed.gateID) {
-			return "", &GateReplyMismatchError{ToolExecutionID: callID}
+			err := &GateReplyMismatchError{ToolExecutionID: callID}
+			finishGateWait(finishWait, waitCall, nil, err)
+			return "", err
 		}
+		answer := &gatedomain.Answer{
+			GateID: installed.gateID,
+			Values: map[string]string{"answer": pui.Answer},
+			Source: gateResponseSource(cmd),
+		}
+		finishGateWait(finishWait, waitCall, answer, nil)
 		return pui.Answer, nil
-	case <-ctx.Done():
-		return "", ctx.Err()
+	case <-waitCtx.Done():
+		waitErr := waitCtx.Err()
+		if ctx.Err() == nil {
+			if err := abandonInstalledGate(ctx, waitCtx, gateReg, installed.gateID); err != nil {
+				finishGateWait(finishWait, waitCall, nil, err)
+				return "", err
+			}
+		}
+		finishGateWait(finishWait, waitCall, nil, waitErr)
+		return "", waitErr
 	}
+}
+
+func abandonInstalledGate(
+	lifetimeCtx context.Context,
+	operationCtx context.Context,
+	gateReg chan<- gateRegistration,
+	gateID gatedomain.ID,
+) error {
+	ack := make(chan gateInstallAck, 1)
+	closeCtx, release := operationValuesWithLifetime(operationCtx, lifetimeCtx)
+	defer release()
+	request := gateRegistration{
+		ctx:       closeCtx,
+		abandonID: gateID,
+		ack:       ack,
+	}
+	select {
+	case gateReg <- request:
+	case <-lifetimeCtx.Done():
+		return lifetimeCtx.Err()
+	}
+	select {
+	case result := <-ack:
+		return result.err
+	case <-lifetimeCtx.Done():
+		return lifetimeCtx.Err()
+	}
+}
+
+func operationValuesWithLifetime(
+	operationCtx context.Context,
+	lifetimeCtx context.Context,
+) (context.Context, func()) {
+	values := context.WithoutCancel(operationCtx)
+	linked, cancel := context.WithCancelCause(values)
+	deadlineCancel := func() {}
+	if deadline, ok := lifetimeCtx.Deadline(); ok {
+		linked, deadlineCancel = context.WithDeadlineCause(
+			linked,
+			deadline,
+			context.DeadlineExceeded,
+		)
+	}
+	stopLifetime := context.AfterFunc(lifetimeCtx, func() {
+		cancel(context.Cause(lifetimeCtx))
+	})
+	if lifetimeCtx.Err() != nil {
+		cancel(context.Cause(lifetimeCtx))
+	}
+	return linked, func() {
+		stopLifetime()
+		deadlineCancel()
+		cancel(context.Canceled)
+	}
+}
+
+func gateResponseSource(cmd command.Command) gatedomain.ResponseSource {
+	if cmd.CommandHeader().Agency == identity.AgencyUser {
+		return gatedomain.ResponseSource{Kind: gatedomain.ResponseFromUser}
+	}
+	// Machine agency cannot distinguish policy from model provenance once the
+	// response has been translated onto the loop command wire.
+	return gatedomain.ResponseSource{}
+}
+
+func startGateWaitWithRunner(
+	ctx context.Context,
+	parent hook.Call,
+	g gatedomain.Gate,
+	hooks *hook.Runner,
+) (context.Context, hook.Call, hook.FinishFunc, error) {
+	call := hook.Call{
+		Operation:   hook.OperationGateWait,
+		StartedAt:   time.Now(),
+		Coordinates: parent.Coordinates,
+		AgentName:   parent.AgentName,
+		Cause:       parent.Cause,
+		GateWait: &hook.GateWaitData{
+			GateID:   g.ID,
+			Kind:     g.Kind,
+			Resolver: g.Resolver,
+			Blocks:   g.Blocks,
+			Effect:   g.Effect,
+		},
+	}
+	waitCtx, finish, err := hooks.Start(ctx, call)
+	return waitCtx, call, finish, err
+}
+
+func finishGateWait(
+	finish hook.FinishFunc,
+	call hook.Call,
+	answer *gatedomain.Answer,
+	err error,
+) {
+	call.GateWait.Answer = answer
+	finishHook(finish, call, hookOutcome(context.Background(), err), err)
 }
 
 // GateReplyMismatchError is returned if the command delivered on a gateUserInput
@@ -291,31 +491,52 @@ func stampGateSubjectProvenance(ctx context.Context, g gatedomain.Gate) gatedoma
 	return g
 }
 
-func permissionGate(callID uuid.UUID, req tool.PermissionRequest) gatedomain.Gate {
+// permissionGate builds the public envelope for ONE combined permission gate:
+// the prompt renders the redacted summary plus every displayed unmet capability
+// and reusable candidate description, and the controls are the exact three
+// approval actions. It never renders raw tool arguments or token material.
+func permissionGate(callID uuid.UUID, displayed tool.Request) gatedomain.Gate {
 	return gatedomain.Gate{
-		Kind:     gatedomain.KindPermission,
-		Resolver: gatedomain.ResolverLoop,
-		Blocks:   gatedomain.BlocksToolCall,
-		Effect:   gatedomain.EffectResume,
-		Subject:  gatedomain.Subject{ToolExecutionID: callID},
+		Kind:       gatedomain.KindPermission,
+		Resolver:   gatedomain.ResolverLoop,
+		Blocks:     gatedomain.BlocksToolCall,
+		Effect:     gatedomain.EffectResume,
+		Subject:    gatedomain.Subject{ToolExecutionID: callID},
+		Restorable: true,
 		Prompt: gatedomain.Prompt{
-			Title: "Approve tool call",
-			Body:  req.Description(),
-			Controls: []gatedomain.Control{
-				{Action: "approve", Label: "Approve"},
-				{Action: "deny", Label: "Deny"},
-			},
-			Schema: gatedomain.PromptSchema{Fields: []gatedomain.Field{
-				{
-					Name:     "scope",
-					Label:    "Scope",
-					Kind:     gatedomain.FieldSelect,
-					Required: true,
-					Options:  approvalScopeOptions(req.AllowedScopes()),
-				},
-			}},
+			Title:    "Approve tool call",
+			Body:     renderApprovalBody(displayed),
+			Controls: gatedomain.ApprovalControls(),
 		},
 	}
+}
+
+// renderApprovalBody projects the displayed typed request onto the prompt body:
+// the redacted summary, the unmet capability descriptions, and — because
+// "Approve always for this workspace" persists them — the exact reusable rule
+// candidates on offer. Descriptions only; never raw args, never tokens.
+func renderApprovalBody(displayed tool.Request) string {
+	var sb strings.Builder
+	sb.WriteString(displayed.Summary)
+	if len(displayed.Requirements) > 0 {
+		sb.WriteString("\n\nCapabilities:")
+		for _, requirement := range displayed.Requirements {
+			sb.WriteString("\n- ")
+			sb.WriteString(requirement.Description)
+		}
+	}
+	candidates := false
+	for _, requirement := range displayed.Requirements {
+		for _, candidate := range requirement.Candidates {
+			if !candidates {
+				sb.WriteString("\n\nApprove always saves:")
+				candidates = true
+			}
+			sb.WriteString("\n- ")
+			sb.WriteString(candidate.Description)
+		}
+	}
+	return sb.String()
 }
 
 func askUserGate(callID uuid.UUID, question string, choices []string) gatedomain.Gate {
@@ -333,31 +554,6 @@ func askUserGate(callID uuid.UUID, question string, choices []string) gatedomain
 			},
 			Schema: gatedomain.PromptSchema{Fields: askUserFields(choices)},
 		},
-	}
-}
-
-func approvalScopeOptions(scopes []tool.ApprovalScope) []gatedomain.Option {
-	out := make([]gatedomain.Option, 0, len(scopes))
-	for _, scope := range scopes {
-		value, ok := tool.ApprovalScopeValue(scope)
-		if !ok {
-			continue
-		}
-		out = append(out, gatedomain.Option{Value: value, Label: approvalScopeLabel(scope)})
-	}
-	return out
-}
-
-func approvalScopeLabel(scope tool.ApprovalScope) string {
-	switch scope {
-	case tool.ScopeOnce:
-		return "Once"
-	case tool.ScopeSession:
-		return "Session"
-	case tool.ScopeWorkspace:
-		return "Workspace"
-	default:
-		return "Unknown"
 	}
 }
 

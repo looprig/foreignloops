@@ -6,7 +6,10 @@ import (
 
 	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/event"
+	"github.com/looprig/harness/pkg/gate"
 	"github.com/looprig/harness/pkg/hustle"
+	"github.com/looprig/harness/pkg/loop"
+	"github.com/looprig/harness/pkg/tool"
 )
 
 const maxLaneQueued = 10_000
@@ -45,6 +48,22 @@ type RuntimeConfig struct {
 	Faults              FaultReporter
 	Activity            ActivityTracker
 	FinalizerContext    FinalizerContextDecorator
+	Evidence            *EvidenceRuntimeConfig
+}
+
+// EvidenceRuntimeConfig supplies only the headless, read-only capabilities
+// needed by opt-in evidence-tool definitions. There is deliberately no
+// controller-wide SecurityCeiling field here: the ceiling is bound PER
+// RunAndFinalize call from that call's own hustle.Request.SecurityCeiling
+// (execution.go), never frozen at controller construction — see
+// hustle.Request.SecurityCeiling's doc comment for why a construction-time
+// constant would be a real staleness bug for a long-running session.
+type EvidenceRuntimeConfig struct {
+	Access         gate.EvidenceAccessEvaluator
+	Containment    gate.EvidenceContainmentVerifier
+	AllowedKinds   []string
+	ReadWorkspace  *tool.ReadWorkspaceBinding
+	NewExecutionID EvidenceExecutionIDFactory
 }
 
 // HeaderStamper mints the identity fields of one internal lifecycle event.
@@ -89,3 +108,12 @@ type ValidateResult func(context.Context, hustle.Result) error
 // built from focused product capability and must never capture a Session,
 // Shutdown function, or other generic session-control capability.
 type Finalizer func(context.Context, hustle.Outcome) error
+
+// EvidenceExecutionIDFactory mints one candidate identifier for an evidence
+// tool call before authorization. It is a purely internal, Harness-owned seam
+// (uuid.New in production) — never consumer-supplied — so unlike
+// EvidenceAccessEvaluator/EvidenceContainmentVerifier it is not re-exported
+// from pkg/gate.
+type EvidenceExecutionIDFactory func() (uuid.UUID, error)
+
+var withPreparedEvidenceCall = loop.WithPreparedCall

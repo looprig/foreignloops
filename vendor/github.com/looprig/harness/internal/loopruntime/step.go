@@ -3,11 +3,15 @@ package loopruntime
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
+	"time"
 
 	"github.com/looprig/core/content"
 	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/event"
+	"github.com/looprig/harness/pkg/hook"
+	"github.com/looprig/harness/pkg/identity"
 	"github.com/looprig/inference"
 	stream "github.com/looprig/inference/stream"
 )
@@ -38,18 +42,24 @@ const (
 // TokenDeltas. runtimeConfig/dependencies stay at this boundary; stepState owns one
 // step's messages and block state.
 type stepConfig struct {
-	req    inference.Request
-	client inference.Client
-	emit   func(event.Event)
+	req       inference.Request
+	client    inference.Client
+	emit      func(event.Event)
+	hooks     *hook.Runner
+	agentName identity.AgentName
+	cause     identity.Cause
+	now       func() time.Time
 }
 
-// stepResult is the outcome of runStep: the updated step state and, on an
-// abnormal LLM cycle, a turn-terminal event. terminal is nil on success (the
-// step's single AIMessage was finalized into state.msgs[0]); it is non-nil
-// (TurnFailed / TurnInterrupted) when runTurn should stop and roll back.
+// stepResult is the outcome of runStep: the updated step state, an independently
+// owned authoritative terminal stream result when the provider supplied one,
+// and, on an abnormal LLM cycle, a turn-terminal event. terminal is nil on
+// success (the step's single AIMessage was finalized into state.msgs[0]); it is
+// non-nil (TurnFailed / TurnInterrupted) when runTurn should stop and roll back.
 type stepResult struct {
-	state    stepState
-	terminal event.Event
+	state        stepState
+	streamResult *stream.StreamResult
+	terminal     event.Event
 }
 
 // stepState is the state of one step: its identity (copied from the turn), its
@@ -117,7 +127,57 @@ func newStepState(sessionID, loopID, turnID, stepID uuid.UUID, index StepIndex) 
 // re-encodes cleanly; the raw executable view (state.blocks.ToolUses) keeps the
 // RAW folded Input so RunBatch detects the invalid JSON and reports it as a
 // pre-execution, model-visible tool-result error.
-func runStep(ctx context.Context, cfg stepConfig, turnIndex event.TurnIndex, st stepState) stepResult {
+func runStep(ctx context.Context, cfg stepConfig, turnIndex event.TurnIndex, st stepState) (result stepResult) {
+	call := hook.Call{
+		Operation: hook.OperationInference,
+		StartedAt: hookNow(cfg.now),
+		Coordinates: identity.Coordinates{
+			SessionID: st.sessionID,
+			LoopID:    st.loopID,
+			TurnID:    st.turnID,
+			StepID:    st.id,
+		},
+		AgentName: cfg.agentName,
+		Cause:     cfg.cause,
+		Inference: &hook.InferenceData{Request: &cfg.req},
+	}
+	if cfg.hooks.Handles(hook.OperationInference) {
+		call = hook.CloneCall(call)
+	}
+	hookCtx, finish, startErr := cfg.hooks.Start(ctx, call)
+	if startErr != nil {
+		st.status = stepFailed
+		finishHook(finish, call, hookOutcome(ctx, startErr), startErr)
+		return stepResult{
+			state: st,
+			terminal: event.TurnFailed{
+				TurnIndex: turnIndex,
+				Err:       safeHookError(hook.OperationInference, startErr),
+			},
+		}
+	}
+	ctx = hookCtx
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			panicErr := &operationHookPanicError{Operation: hook.OperationInference}
+			finishHook(finish, call, hook.OutcomeFailed, panicErr)
+			st.status = stepFailed
+			result = stepResult{
+				state: st,
+				terminal: event.TurnFailed{
+					TurnIndex: turnIndex,
+					Err: &event.TurnPanicError{
+						Detail: fmt.Sprintf("%v", recovered),
+					},
+				},
+			}
+			return
+		}
+		call.Inference.AIMessage = inferenceResultMessage(result)
+		call.Inference.StreamResult = result.streamResult
+		err := terminalHookError(result.terminal)
+		finishHook(finish, call, hookOutcome(ctx, err), err)
+	}()
 
 	sr, err := cfg.client.Stream(ctx, cfg.req)
 	if err != nil {
@@ -140,14 +200,16 @@ func runStep(ctx context.Context, cfg stepConfig, turnIndex event.TurnIndex, st 
 		}
 		proc.process(chunk, turnIndex)
 	}
-	usage := terminalUsage(sr)
+	streamResult := terminalStreamResult(sr)
 
 	// Materialize the single assistant message (thinking?, text?, then tool_use
 	// blocks in ascending Index order) and the raw executable tool-use view. The
 	// AIMessage's tool-use blocks are a DISTINCT allocation from rawCalls, so
 	// sanitizing the stored message never mutates the raw executable Input.
 	aiMsg := st.blocks.AIMessage()
-	aiMsg.Usage = usage
+	if streamResult != nil {
+		aiMsg.Usage = cloneUsage(streamResult.Usage)
+	}
 	rawCalls := st.blocks.ToolUses()
 
 	// A successful stream with no usable content at all (no non-empty text, no
@@ -156,7 +218,11 @@ func runStep(ctx context.Context, cfg stepConfig, turnIndex event.TurnIndex, st 
 	// empty assistant response.
 	if isEmptyAssistantMessage(aiMsg, rawCalls) {
 		st.status = stepFailed
-		return stepResult{state: st, terminal: event.TurnFailed{TurnIndex: turnIndex, Err: &event.EmptyResponseError{}}}
+		return stepResult{
+			state:        st,
+			streamResult: streamResult,
+			terminal:     event.TurnFailed{TurnIndex: turnIndex, Err: &event.EmptyResponseError{}},
+		}
 	}
 
 	// Sanitize the STORED assistant message (drop zero-length text/thinking, rewrite
@@ -165,17 +231,35 @@ func runStep(ctx context.Context, cfg stepConfig, turnIndex event.TurnIndex, st 
 	aiMsg.Blocks = sanitizeAssistantBlocks(aiMsg.Blocks)
 	st.msgs = content.AgenticMessages{aiMsg}
 	st.status = stepDone
-	return stepResult{state: st, terminal: nil}
+	return stepResult{state: st, streamResult: streamResult, terminal: nil}
 }
 
-// terminalUsage clones the authoritative provider usage captured at clean EOF.
-// A stream without terminal metadata remains unknown (nil), including a result
-// that reports other metadata but no usage.
-func terminalUsage(sr *stream.StreamReader[content.Chunk]) *content.Usage {
-	result, ok := sr.Result()
-	if !ok || result.Usage == nil {
+func inferenceResultMessage(result stepResult) *content.AIMessage {
+	if len(result.state.msgs) == 0 {
 		return nil
 	}
-	usage := *result.Usage
-	return &usage
+	message, _ := result.state.msgs[0].(*content.AIMessage)
+	return message
+}
+
+// terminalStreamResult retains an independently owned snapshot of all
+// authoritative provider metadata captured at clean EOF. A stream without
+// terminal metadata remains unknown (nil). Usage is cloned independently from
+// both the reader's snapshot and the finalized AIMessage so no producer,
+// runtime, or event graph can race through a shared pointer.
+func terminalStreamResult(sr *stream.StreamReader[content.Chunk]) *stream.StreamResult {
+	result, ok := sr.Result()
+	if !ok {
+		return nil
+	}
+	result.Usage = cloneUsage(result.Usage)
+	return &result
+}
+
+func cloneUsage(usage *content.Usage) *content.Usage {
+	if usage == nil {
+		return nil
+	}
+	cloned := *usage
+	return &cloned
 }

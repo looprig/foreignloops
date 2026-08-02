@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/looprig/harness/pkg/event"
+	"github.com/looprig/harness/pkg/hook"
 	"github.com/looprig/harness/pkg/identity"
 	"github.com/looprig/harness/pkg/loop"
 	"github.com/looprig/inference"
@@ -56,7 +57,10 @@ func resolveMode(bound loop.BoundDefinition, modeName loop.ModeName) (runtimeCon
 	resolved := runtimeConfig{
 		Client: bound.Client(), Model: model, System: loop.EffectiveSystem(bound.System(), mode.Instructions), DrainTimeout: bound.DrainTimeout(),
 		AgentName: bound.Name(), Engine: bound.Engine(), RuntimeContext: bound.RuntimeContext(),
-		Tools: ToolSet{Permission: bound.Permission(), Registry: mode.Tools, Middlewares: bound.Middlewares(), MaxToolIterations: limits.Iterations, MaxToolCallsPerTurn: limits.Calls, MaxParallelToolCalls: limits.Parallel},
+		Tools: ToolSet{Access: bound.Access(), Registry: mode.Tools, Middlewares: bound.Middlewares(), MaxToolIterations: limits.Iterations, MaxToolCallsPerTurn: limits.Calls, MaxParallelToolCalls: limits.Parallel},
+	}
+	if output, configured := bound.OutputSchema(); configured {
+		resolved.Output = cloneOutputSchema(output)
 	}
 	if capability, configured := bound.CounterCapability(); configured {
 		resolved.ContextCounter = bound.ContextCounter()
@@ -90,6 +94,7 @@ type runtimeConfig struct {
 	Model        model.Model      // secret-free model descriptor (name, endpoint, sampling) — stamped onto every Request; carries NO system prompt and NO secret
 	System       string           // per-agent system prompt — sent on every Request AND hashed into the config fingerprint; the connection secret rides the Client, never here
 	DrainTimeout time.Duration    // optional — bounds the hard-kill wait for a cancelled turn to drain; New defaults it to 5s
+	Hooks        *hook.Runner
 
 	// AgentName is the immutable attribution name the loop runs under (the agent/role
 	// driving it, e.g. "operator"). It is stamped onto the loop's LoopStarted at creation
@@ -105,9 +110,14 @@ type runtimeConfig struct {
 
 	// Tools is the runner's view of the tool subsystem (the consumer surface in
 	// deps.go). Its runaway-guard caps are defaulted by New when zero;
-	// Permission/Registry/Middlewares are left as the composition root set them
-	// (nil is valid).
+	// Access/Registry/Middlewares are left as the composition root set them
+	// (a nil Access denies every tool call, fail closed).
 	Tools ToolSet
+
+	// Output is the loop-wide final-output policy. It is cloned while resolving
+	// the bound definition and again into each turn so request assembly never
+	// aliases a public accessor or a concurrently changing effective mode.
+	Output *inference.OutputSchema
 
 	// RuntimeContext, when non-nil, yields the volatile per-turn context blocks
 	// (date/cwd/git) the loop appends at the TAIL of each turn's request — AFTER the
@@ -174,4 +184,29 @@ type runtimeConfig struct {
 	// actor after selecting a safe boundary but before priority arbitration. It lets
 	// tests make both bounded command lanes ready without timing sleeps.
 	beforeCompactionBoundary func(compactionBoundaryKind)
+
+	// reviewContext, when non-nil, turns on live-only permission-review
+	// context capture (internal/loopruntime/review_context.go) for every turn
+	// this loop runs: buildTurnConfig copies it onto each turnConfig.reviewContext
+	// unchanged. It is NOT resolved from the bound loop.Definition — no
+	// public pkg/loop/pkg/rig option sets it — because it carries no
+	// consumer-owned policy of its own (see ReviewContext's doc comment):
+	// internal/sessionruntime is the sole caller, threading it in via
+	// NewInModeWithCompactor/NewRestoredWithCompactor's reviewContext
+	// parameter whenever the session has permission classifiers registered.
+	// nil (the default for every pre-existing caller) leaves every turn's
+	// reviewContext nil, byte-identical to before this field existed.
+	reviewContext *reviewContextConfiguration
+}
+
+// RuntimeDependencies carries native runtime collaborators that are not part
+// of a loop's durable declarative definition.
+type RuntimeDependencies struct {
+	Compactor Compactor
+	Hooks     *hook.Runner
+	// ReviewContext mirrors Compactor's shape: internal/sessionruntime is the
+	// only caller that ever supplies a non-nil value (whenever the session
+	// has permission classifiers registered — see Session.loopReviewContext).
+	// nil leaves the resulting loop's turns with reviewContext == nil.
+	ReviewContext *ReviewContext
 }

@@ -4,9 +4,12 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"log/slog"
+	"reflect"
 	"time"
 
 	"github.com/looprig/core/uuid"
+	"github.com/looprig/harness/internal/loopruntime"
 	"github.com/looprig/harness/pkg/command"
 	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/harness/pkg/gate"
@@ -37,6 +40,18 @@ type gateEntry struct {
 	payload     gate.Payload
 	coordinates identity.Coordinates
 	state       gateState
+	// reviewBasis is the trusted snapshot of the live permission-review basis
+	// (GateID, ToolExecutionID, ContextRevision, GatePolicyRevision,
+	// SecurityCeiling) captured by StartPermissionReview at the moment
+	// classifier review began for this gate. It is populated independently of
+	// anything a classifier or its Hustle result reports, so
+	// respondFromClassifier can re-derive the CURRENT basis from data the
+	// session itself owns and compare it against the basis a classifier's
+	// eligible assessment was computed against — any divergence (a stale
+	// review, a policy revision that has since moved on, a mismatched tool
+	// execution) is detected here rather than trusted from the caller. Zero
+	// for gates permission review never started on.
+	reviewBasis gate.ReviewBasis
 }
 
 // gateAppender is the STRICT durable append seam for gate prepare/open/resolve.
@@ -151,6 +166,268 @@ func WithGateCaps(caps GateCaps) Option {
 	return func(s *Session) {
 		s.gateCaps = caps
 	}
+}
+
+// withPermissionReview configures the session-wide permission-classifier
+// registry and review policy, mirroring withSessionHustles
+// (internal/sessionruntime/hustle.go) for automatic permission review rather
+// than compaction/summarization Hustles. It is private: wiring a real
+// classifier set from a consumer's rig.WithPermissionClassifiers call into
+// this option is Task 16/Phase 6 work, not this seam's.
+//
+// A zero classifiers set (the default when this option is never applied)
+// leaves StartPermissionReview a no-op, so any session that does not opt in
+// keeps the exact pre-Task-14 gate lifecycle.
+func withPermissionReview(classifiers gate.PermissionClassifierSet, policy gate.PermissionReviewPolicy) Option {
+	return func(s *Session) {
+		s.permissionClassifiers = classifiers
+		s.permissionReviewPolicy = policy
+	}
+}
+
+// withPermissionReviewEvidence configures the session-wide, consumer-supplied
+// evidence-tool access boundary every registered permission classifier's
+// evidence tools authorize against (design §13.1), mirroring
+// withPermissionReview's capture-only shape. It is private: a real
+// access/verifier pair wired from a consumer's rig.WithPermissionReviewEvidence
+// call is Task 24 work, not this seam's. newHustleController (hustle.go)
+// fails construction closed if a registered classifier needs evidence tools
+// but this option was never applied.
+func withPermissionReviewEvidence(access gate.EvidenceAccessEvaluator, containment gate.EvidenceContainmentVerifier, allowedKinds []string) Option {
+	return func(s *Session) {
+		s.permissionReviewEvidenceAccess = access
+		s.permissionReviewEvidenceContainment = containment
+		s.permissionReviewEvidenceAllowedKinds = append([]string(nil), allowedKinds...)
+	}
+}
+
+// withPermissionReviewSecurityCeiling configures the session-wide,
+// consumer-supplied effective security posture (design §13.1/§21) every
+// ReviewContext loopReviewContext builds carries as SecurityCeiling, and
+// every classifier's ReviewBasis/ReviewBasis-derived hustle.Request
+// therefore inherits. It is private: the real value, wired from a
+// consumer's rig.WithPermissionReviewSecurityCeiling call, is
+// rig.Define()-time validated (mirroring withPermissionReviewEvidence's own
+// "config X requires config Y" pairing) to be non-empty whenever classifiers
+// are configured — this option's own zero value simply leaves
+// s.permissionReviewSecurityCeiling empty, which loopReviewContext then
+// treats as "review context capture stays off" (defense in depth; the loud
+// failure lives at Define()-time, not here).
+//
+// This deliberately replaces a former Harness-side sentinel constant
+// ("harness-session; ceiling-not-classified") that every session used to
+// stamp unconditionally: SecurityCeiling is architecturally the SAME KIND OF
+// VALUE as permissionReviewEvidenceContainment/permissionReviewEvidenceAllowedKinds
+// above — a consumer-owned concept Harness structurally cannot originate
+// (this module has no first-class "effective access posture" notion) — so a
+// fixed placeholder could never equal a real consumer's own ceiling string,
+// making every evidence-tool containment check that compared against it fail
+// closed 100% of the time (the Phase 6 spec-compliance review's Finding 2).
+func withPermissionReviewSecurityCeiling(ceiling string) Option {
+	return func(s *Session) {
+		s.permissionReviewSecurityCeiling = ceiling
+	}
+}
+
+// withPermissionReviewObservationVerifier configures the session-wide,
+// OPTIONAL consumer-supplied recheck seam (design §13.4, TOCTOU) every
+// classifier-originated auto-approval's recorded observations are verified
+// against immediately before respondFromClassifier claims the gate,
+// mirroring withPermissionReviewEvidence's capture-only shape. It is
+// private: the real value, wired from a consumer's
+// rig.WithPermissionReviewObservations call, is Addendum 4 work, not this
+// seam's. Unlike withPermissionReviewEvidence/withPermissionReviewSecurityCeiling,
+// omitting this option is a fully supported terminal configuration, not a
+// construction-time gap papered over by a later fail-closed check — see
+// permissionReviewObservationVerifier's doc comment (session.go) and
+// verifyPermissionReviewObservations for exactly how a nil verifier is
+// still handled safely (and when it is NOT: one or more recorded
+// observations reaching a nil verifier fails closed).
+func withPermissionReviewObservationVerifier(verifier gate.EvidenceObservationVerifier) Option {
+	return func(s *Session) {
+		s.permissionReviewObservationVerifier = verifier
+	}
+}
+
+// defaultReviewContextPolicy is the fixed default gate.ReviewContextPolicy
+// loopReviewContext installs. No consumer-facing surface carries a
+// context-snapshot budget today (this addendum deliberately adds no new
+// public option — see loopReviewContext's doc comment), so these bounds are a
+// conservative, documented default: every field sits well inside its
+// corresponding hard cap (pkg/gate.MaxReviewContextInputEntries /
+// MaxReviewContextInputBytes / MaxReviewContextEntryInputBytes) with margin
+// under the 1 MiB permission-review subject-wire ceiling
+// (gate.MaxPermissionReviewSubjectWireBytes).
+var defaultReviewContextPolicy = gate.ReviewContextPolicy{
+	Revision:             "harness-default-review-context-policy/v1",
+	MaxBytes:             512 << 10,
+	MaxEstimatedTokens:   128 << 10,
+	MaxEntries:           512,
+	MaxUserEntryBytes:    64 << 10,
+	MaxAgentEntryBytes:   64 << 10,
+	MaxToolEntryBytes:    64 << 10,
+	MaxBlockBytes:        64 << 10,
+	MaxActiveActionBytes: 64 << 10,
+}
+
+// loopReviewContext builds the auto-derived, Harness-internal review-context
+// capture configuration every Loop this session constructs receives, once
+// registered permission classifiers make automatic review reachable at all
+// (design §14.1, this addendum). It returns nil (capture stays OFF, exactly
+// as before this addendum) whenever no classifier is configured — a session
+// that never opts into permission review keeps precisely the pre-existing
+// behavior regardless of anything else on the session.
+//
+// A non-empty PermissionClassifierSet forces this ON with NO further consumer
+// input: "classifiers registered but capture off" is not a legitimate
+// selective-disable state — it is exactly the bug this addendum closes (a
+// configured reviewer that silently never reviews). If a consumer ever wants
+// selective review-routing, that belongs in the review POLICY layer
+// (gate.ReviewContextPolicy / gate.PermissionReviewPolicy, both already
+// consumer-configurable), not a capture on/off switch — so this addendum
+// adds NO new public rig/consumer-facing option.
+//
+//   - WorkspaceRoot/WorkingDirectory are auto-derived from the session's own
+//     existing workspace-root tracking (s.wsRoot), the SAME source
+//     hustleEvidenceRuntimeConfig already uses for ReadWorkspace.Root — no
+//     new consumer input. Every classifier's hustle.Definition requires
+//     evidence tools (gate.NewPermissionClassifierSet's own descriptor
+//     check), so newHustleController's pre-existing fail-closed check
+//     already refuses session construction when classifiers are configured
+//     without a populated ReadWorkspace — meaning s.wsRoot is guaranteed
+//     non-empty here whenever classifiers are configured and construction
+//     succeeded; the emptiness guard below is defense in depth, not
+//     load-bearing. Harness tracks no per-loop working directory narrower
+//     than the workspace root, so WorkingDirectory is set to the same value
+//     (a documented simplification, not a fabricated distinction).
+//   - GatePolicyRevision is s.permissionReviewPolicy.Revision — the SAME
+//     value the first addendum already wires into the session's fingerprint
+//     and review policy, not a new source.
+//   - Policy has NO existing Harness-level source (see
+//     defaultReviewContextPolicy above for why it is a documented, bounded,
+//     honest default rather than an invented classification scheme).
+//   - SecurityCeiling is s.permissionReviewSecurityCeiling — a genuinely
+//     consumer-supplied value (withPermissionReviewSecurityCeiling's doc
+//     comment), NOT a Harness-invented default: unlike Policy, Harness must
+//     never guess at this one, because a wrong guess widens (or falsely
+//     narrows) what a consumer's own evidence-containment check compares
+//     against. An empty value here — a session that never opted into
+//     WithPermissionReviewSecurityCeiling — makes this whole method return
+//     nil below rather than stamp a placeholder (defense in depth;
+//     rig.Define() is the loud, primary enforcement for any rig-constructed
+//     session).
+func (s *Session) loopReviewContext() *loopruntime.ReviewContext {
+	if len(s.permissionClassifiers.Classifiers()) == 0 || s.wsRoot == "" || s.permissionReviewSecurityCeiling == "" {
+		return nil
+	}
+	return &loopruntime.ReviewContext{
+		WorkspaceRoot:      s.wsRoot,
+		WorkingDirectory:   s.wsRoot,
+		SecurityCeiling:    s.permissionReviewSecurityCeiling,
+		GatePolicyRevision: s.permissionReviewPolicy.Revision,
+		Policy:             defaultReviewContextPolicy,
+	}
+}
+
+// StartPermissionReview implements the loop actor's private permissionReviewStarter
+// seam (internal/loopruntime/gate.go): the ONLY thing the actor calls, inline
+// and fire-and-forget, after a gatePermission registration activates and the
+// runner has been acked (design §14.2/§14.3). It MUST return promptly — the
+// actor never wraps this call in a goroutine of its own, so classifier
+// inference is moved onto a fresh goroutine here (`go adapter.review(...)`)
+// before this method returns.
+//
+// StartPermissionReview no-ops (starts no review) whenever:
+//   - no permission classifiers are configured for this session
+//     (s.permissionClassifiers is the zero PermissionClassifierSet); or
+//   - the session's shared Hustle runtime is not yet bound
+//     (s.hustleController == nil — cannot happen once a session has finished
+//     construction, but is checked rather than assumed); or
+//   - the classifier/policy configuration itself is invalid
+//     (newPermissionReviewAdapter's own validation).
+//
+// Every one of those is a "nothing to review" outcome, never a denial or an
+// approval: this method has no path to RespondGate at all (see
+// permissionReviewAdapter's type doc), so the human gate this handoff
+// accompanies is always preserved regardless of what happens here.
+func (s *Session) StartPermissionReview(ctx context.Context, req loopruntime.PermissionReviewRequest) {
+	if len(s.permissionClassifiers.Classifiers()) == 0 {
+		return
+	}
+	if s.hustleController == nil {
+		return
+	}
+	// Circuit breaker (design §18): a tripped turn OR a tripped session
+	// (reviewBreakerAllows consults both scopes) starts no further automatic
+	// review at all — no adapter, no cancellation handle, no reviewBasis
+	// stamp — leaving every current and future gate human-only, exactly like
+	// the "no classifiers configured" no-op above. A session-scoped trip
+	// blocks EVERY turn in the session, not just the one that tripped it.
+	if !s.reviewBreakerAllows(req.ReviewContext.Coordinates) {
+		return
+	}
+	adapter, err := newPermissionReviewAdapter(s.hustleController, s.permissionClassifiers, s.permissionReviewPolicy, s)
+	if err != nil {
+		slog.WarnContext(ctx, "sessionruntime: permission review adapter misconfigured; starting no review",
+			"gate_id", req.GateID, "error", err)
+		return
+	}
+	// Optional: the adapter reports one terminal circuit-breaker summary per
+	// review() call through this seam (design §18). It is not a
+	// newPermissionReviewAdapter collaborator because its absence must never
+	// fail construction.
+	adapter.observer = s
+	// Wire durable (checked) audit publication (design §16, Task 17, fixed by
+	// the Phase 6 spec-compliance review): s.hub implements
+	// PublishInternalEventChecked — the SAME private audit-record path
+	// s.newHustleController already wires as its Audit collaborator
+	// (hustle.go) for ordinary Hustle lifecycle events — not *Session's
+	// PublishEventChecked, which is the PUBLIC-only path and unconditionally
+	// rejects these Internal-visibility events (permissionReviewAuditPublisher's
+	// doc comment). s.factory already mints every other durable event's
+	// Header, and sessionHustleFaultReporter is the SAME session fault path
+	// Task 14's ordinary Hustle faults use — reused here rather than
+	// duplicated. s.hustleLimits.AuditTimeout is guaranteed positive by the
+	// time s.hustleController is non-nil (hustleruntime.New rejects a
+	// non-positive AuditTimeout at construction), matching the
+	// nil-hustleController guard above.
+	adapter.publisher = s.hub
+	adapter.stamper = s.factory
+	adapter.faults = sessionHustleFaultReporter{session: s}
+	adapter.auditTimeout = s.hustleLimits.AuditTimeout
+	s.recordPermissionReviewBasis(req)
+	// One cancellation-group context per active gate review (design §15).
+	// reviewCtx's cleanup is the ONLY place its cancellations entry is ever
+	// removed; every other trigger (gate resolve, owner close, loop/turn
+	// interrupt, session shutdown) only ever calls the stored cancel func.
+	reviewCtx, done := s.beginPermissionReviewCancellation(ctx, req.GateID)
+	go func() {
+		defer done()
+		adapter.review(reviewCtx, req)
+	}()
+}
+
+// recordPermissionReviewBasis stamps the gate directory entry with the
+// trusted, session-owned snapshot of the live review basis at the moment
+// review starts. It is a no-op for a gate that is not currently in the
+// directory (already closed, or never prepared) — StartPermissionReview is
+// fire-and-forget, so there is nothing to record a basis against and nothing
+// downstream that would ever read it.
+func (s *Session) recordPermissionReviewBasis(req loopruntime.PermissionReviewRequest) {
+	s.gatesMu.Lock()
+	defer s.gatesMu.Unlock()
+	entry, ok := s.gates[req.GateID]
+	if !ok {
+		return
+	}
+	entry.reviewBasis = gate.ReviewBasis{
+		GateID:             req.GateID,
+		ToolExecutionID:    req.ToolExecutionID,
+		ContextRevision:    req.ReviewContext.ContextRevision,
+		GatePolicyRevision: req.ReviewContext.GatePolicyRevision,
+		SecurityCeiling:    req.ReviewContext.SecurityCeiling,
+	}
+	s.gates[req.GateID] = entry
 }
 
 // PrepareGateOpen durably commits the public envelope plus private payload as a
@@ -523,6 +800,7 @@ func (s *Session) CloseGate(ctx context.Context, id gate.ID, reason gate.CloseRe
 		delete(s.gates, id)
 		s.closeGateAnswerSlotLocked(id)
 		s.gatesMu.Unlock()
+		s.cancelPermissionReview(id)
 		return nil
 	case gateOpen:
 		entry.state = gateClaiming
@@ -553,6 +831,9 @@ func (s *Session) CloseGate(ctx context.Context, id gate.ID, reason gate.CloseRe
 	// on a slot nothing will ever write to.
 	s.closeGateAnswerSlotLocked(id)
 	s.gatesMu.Unlock()
+	// The owner closed the gate (design §15's second cancellation trigger). A
+	// no-op for a gate with no active review.
+	s.cancelPermissionReview(id)
 	return nil
 }
 
@@ -580,7 +861,7 @@ func (s *Session) resolveGatePolicy(g gate.Gate) (gate.ResponsePolicy, error) {
 	if policy.Timeout == 0 && policy.OnTimeout == "" && g.Kind == gate.KindPermission {
 		policy.Timeout = 5 * time.Minute
 		policy.OnTimeout = gate.PolicyRespond
-		policy.Response = gate.ResponseTemplate{Action: "deny"}
+		policy.Response = gate.ResponseTemplate{Action: string(gate.ApprovalDeny)}
 	}
 	if s.gateCaps.MaxTimeout > 0 && policy.Timeout > s.gateCaps.MaxTimeout {
 		return gate.ResponsePolicy{}, &GateError{GateID: g.ID, Kind: GateCapacity}
@@ -672,7 +953,36 @@ func (s *Session) stampGateEvent(coords identity.Coordinates, g gate.Gate) (even
 // A failed append reverts the in-memory claim and leaves the gate answerable.
 // Command dispatch uses s.sessionCtx (not the caller's ctx) so a client
 // disconnect after the durable commit does not cancel delivery.
+//
+// A caller-supplied response whose Source.Kind is gate.ResponseFromClassifier
+// is rejected outright, before any locking or validation: only the private
+// respondFromClassifier method (called exclusively from the permission-review
+// adapter once gate.CombinePermissionAssessments reports eligibility) may
+// produce that provenance. gate.ResponseSource's fields are exported — a
+// public caller CAN construct one with Kind set to ResponseFromClassifier —
+// so this is a runtime, defense-in-depth check rather than a type-system
+// guarantee; respondFromClassifier reaches the shared core below directly and
+// is not subject to it.
 func (s *Session) RespondGate(ctx context.Context, response gate.GateResponse) error {
+	if response.Source.Kind == gate.ResponseFromClassifier {
+		return &GateError{GateID: response.GateID, Kind: GateActionInvalid}
+	}
+	return s.respondGateCore(ctx, response, nil)
+}
+
+// respondGateCore performs the exactly-once gate claim, durable resolve, and
+// command/answer delivery shared by every gate-response path (human,
+// timeout-policy, and classifier). It is durable-first exactly as RespondGate
+// documents.
+//
+// drift, when non-nil, is evaluated under gatesMu in the SAME critical
+// section that checks the gate is open and claims it — there is no window
+// between the drift check and the claim in which the world could move again.
+// It reports whether the caller's evidence has gone stale; a true result
+// silently no-ops (nil error) rather than reporting a fault, matching design
+// §14.4's "a stale classifier response is an expected race, not a session
+// fault."
+func (s *Session) respondGateCore(ctx context.Context, response gate.GateResponse, drift func(gateEntry) bool) error {
 	s.gatesMu.Lock()
 	entry, ok := s.gates[response.GateID]
 	if !ok {
@@ -682,6 +992,10 @@ func (s *Session) RespondGate(ctx context.Context, response gate.GateResponse) e
 	if entry.state != gateOpen {
 		s.gatesMu.Unlock()
 		return &GateError{GateID: response.GateID, Kind: GateNotReady}
+	}
+	if drift != nil && drift(entry) {
+		s.gatesMu.Unlock()
+		return nil
 	}
 	if !validateGateAction(entry.gate, response.Action) {
 		s.gatesMu.Unlock()
@@ -696,7 +1010,7 @@ func (s *Session) RespondGate(ctx context.Context, response gate.GateResponse) e
 	s.gates[response.GateID] = entry
 	s.gatesMu.Unlock()
 
-	resolved, err := s.buildGateResolved(entry, response, translated.audit, translated.approvalScope)
+	resolved, err := s.buildGateResolved(entry, response, translated.audit)
 	if err != nil {
 		s.revertClaiming(response.GateID)
 		return err
@@ -710,6 +1024,11 @@ func (s *Session) RespondGate(ctx context.Context, response gate.GateResponse) e
 	s.stopGateTimerLocked(response.GateID)
 	delete(s.gates, response.GateID)
 	s.gatesMu.Unlock()
+	// The gate has resolved (design §15's first cancellation trigger, which
+	// also covers a policy-timeout response — startGatePolicyTimerLocked
+	// resolves through this exact path). A no-op for a gate with no active
+	// review.
+	s.cancelPermissionReview(response.GateID)
 
 	// Delivery happens after the durable commit and after the entry is gone, so a
 	// host-owned answer and a loop command are both unrepeatable.
@@ -719,6 +1038,220 @@ func (s *Session) RespondGate(ctx context.Context, response gate.GateResponse) e
 	}
 	_ = s.dispatchGateCommand(entry, translated.cmd)
 	return nil
+}
+
+// respondFromClassifier is the ONLY place in the codebase that may construct
+// a GateResponse carrying gate.ResponseFromClassifier provenance (design
+// §14.5, §16.3, §25.2). It is unexported and called exclusively by the
+// permission-review adapter after gate.CombinePermissionAssessments reports
+// an eligible decision; there is no action parameter because Approve is the
+// only action a classifier-originated response may ever carry — structurally,
+// not by convention.
+//
+// basis is the common ReviewBasis (GateID/ToolExecutionID/ContextRevision/
+// GatePolicyRevision/SecurityCeiling; ClassifierRevision and SubjectDigest are
+// per-classifier and deliberately not part of the comparison) the eligible
+// assessment was computed against. Immediately before claiming the gate —
+// inside the SAME respondGateCore critical section that performs the claim,
+// so there is no TOCTOU window — it is compared against the trusted
+// entry.reviewBasis snapshot StartPermissionReview recorded, AND against the
+// session's CURRENT s.permissionReviewPolicy.Revision (read fresh, not from
+// the snapshot, so a policy revision changing under a long-running review is
+// still caught). Any divergence — the gate having moved to a different tool
+// execution, a context/policy/security-ceiling revision no longer matching,
+// or the gate simply being gone/claimed/closed already — makes the response
+// stale, which this method treats as an expected race rather than a fault:
+// it returns (false, nil), exactly like every other non-fault stale-response
+// outcome.
+//
+// The bool result is the review adapter's ONLY way to distinguish "the gate
+// was actually resolved via this classifier-originated response" (true) from
+// every no-op outcome — stale drift, or the gate already gone/claimed
+// (false, nil) — versus a genuine append failure (false, non-nil error);
+// design §16.2 requires this to audit AutoApproved/"stale" correctly, since
+// the GATE's fate decides AutoApproved, never the classifier's own opinion.
+// respondGateCore itself returns nil for BOTH the stale-drift no-op and a
+// genuine success, so drift's closure captures which one happened locally —
+// respondGateCore's own signature is untouched.
+//
+// observations (design §13.4, TOCTOU addendum) is checked BEFORE any of the
+// above: verifyPermissionReviewObservations runs synchronously,
+// DELIBERATELY OUTSIDE respondGateCore's gatesMu critical section, and a
+// failed/mismatched/unverifiable observation returns (false, nil) — the same
+// stale, silently-dropped contract as every drift outcome above — without
+// ever calling respondGateCore at all. See verifyPermissionReviewObservations's
+// own doc comment for why this one check cannot share drift's
+// no-TOCTOU-window claim, and exactly what residual window it leaves.
+func (s *Session) respondFromClassifier(ctx context.Context, basis gate.ReviewBasis, observations []gate.ObservationRequirement, reason string) (bool, error) {
+	if basis.GateID.IsZero() || reason == "" {
+		return false, nil
+	}
+	if !s.verifyPermissionReviewObservations(ctx, basis.GateID, observations) {
+		return false, nil
+	}
+	response := gate.GateResponse{
+		GateID: basis.GateID,
+		Action: string(gate.ApprovalApprove),
+		Source: gate.ResponseSource{Kind: gate.ResponseFromClassifier, Reason: reason},
+	}
+	stale := false
+	drift := func(entry gateEntry) bool {
+		live := entry.reviewBasis
+		isStale := live.ToolExecutionID != basis.ToolExecutionID ||
+			live.ContextRevision != basis.ContextRevision ||
+			live.SecurityCeiling != basis.SecurityCeiling ||
+			live.GatePolicyRevision != basis.GatePolicyRevision ||
+			s.permissionReviewPolicy.Revision != basis.GatePolicyRevision
+		if isStale {
+			// design §18: a classifier-originated stale response feeds the
+			// circuit breaker. The response itself is still silently
+			// dropped exactly as before — only the bookkeeping is new.
+			s.recordPermissionReviewStale(entry.coordinates)
+			stale = true
+		}
+		return isStale
+	}
+	err := s.respondGateCore(ctx, response, drift)
+	if err == nil {
+		return !stale, nil
+	}
+	var gateErr *GateError
+	if errors.As(err, &gateErr) && (gateErr.Kind == GateNotFound || gateErr.Kind == GateNotReady) {
+		// The gate was already claimed, resolved, or never existed by the time
+		// this classifier-originated response arrived: an expected race, not a
+		// session fault.
+		return false, nil
+	}
+	return false, err
+}
+
+// verifyPermissionReviewObservations rechecks every observation requirement
+// (design §13.4, TOCTOU) an eligible classifier-originated response depends
+// on, and reports whether respondFromClassifier may proceed to
+// respondGateCore at all.
+//
+// Placement (the judgment call this addendum's plan explicitly calls out to
+// document): the four PRE-EXISTING drift dimensions (ToolExecutionID/
+// ContextRevision/SecurityCeiling/GatePolicyRevision) run INSIDE
+// respondGateCore's gatesMu critical section because they are pure
+// in-memory field comparisons — cheap, non-blocking, and therefore safe to
+// perform while holding a lock every other gate response in the session
+// also needs (respondGateCore's own doc comment: "so there is no TOCTOU
+// window"). An observation recheck cannot share that placement: it calls a
+// consumer-supplied EvidenceObservationVerifier that performs real I/O
+// (re-stat a file, resolve a git ref against a live filesystem or VCS).
+// Holding gatesMu for that I/O would trade a narrow, already-small TOCTOU
+// window for a NEW, categorically worse problem — unbounded latency (or
+// outright hang, if the verifier's own I/O blocks) while holding a lock
+// every OTHER concurrent gate response in the session (human or classifier,
+// for any gate) also needs to acquire, turning one slow/broken verifier
+// into a session-wide stall. This method therefore runs synchronously but
+// OUTSIDE the lock, immediately before respondFromClassifier calls
+// s.respondGateCore — as late as reasonably possible before the claim
+// without ever holding gatesMu across I/O.
+//
+// Residual TOCTOU window: the gap between this method returning true and
+// respondGateCore's own lock-protected claim a few lines later — a handful
+// of in-process instructions, not the "seconds of evidence-gathering plus
+// classifier inference" window this whole mechanism exists to close. Design
+// §13.4 requires the pre-existing symlink-swap, containment, grant-target,
+// and sandbox checks to remain mandatory regardless — those, not this
+// method, are what bound the residual window: a target that changes in the
+// few instructions between this check and the claim is still caught by the
+// SAME enforcement that already protects every non-classifier-approved tool
+// call, exactly as design §13.4's closing sentence ("the eventual tool
+// still consumes its original prepared artifact") requires.
+//
+// The nil-verifier cases are asymmetric BY DESIGN, not an oversight:
+//   - len(observations) == 0: nothing was ever recorded (no target-sensitive
+//     evidence tool ran, or none is registered at all for this session) —
+//     there is nothing to recheck, so this returns true unconditionally,
+//     with or without a configured verifier. Forcing every session with
+//     classifiers configured to wire rig.WithPermissionReviewObservations
+//     "just in case" would violate Interface Segregation for the common
+//     case (a classifier whose evidence tools are all non-target-sensitive,
+//     e.g. only glob/grep-style multi-match tools).
+//   - len(observations) > 0 but s.permissionReviewObservationVerifier is
+//     nil: a target-sensitive evidence tool DID run and DID record an
+//     observation, but nothing is configured to recheck it. This can only
+//     happen from a genuine consumer misconfiguration (an evidence tool
+//     that records observations, wired without also calling
+//     rig.WithPermissionReviewObservations) — see that option's own doc
+//     comment for why Define()-time cannot catch this case today. Runtime
+//     must never let this silently degrade to "recheck skipped, approval
+//     proceeds" — that would be exactly the fail-open gap this whole
+//     addendum exists to close. It is treated identically to a genuine
+//     verifier-reported mismatch: stale, gate stays open, no session fault,
+//     and (like every other stale outcome here) counted against the design
+//     §18 circuit breaker so a persistent misconfiguration or attack is
+//     eventually visible rather than silently absorbed forever.
+func (s *Session) verifyPermissionReviewObservations(ctx context.Context, gateID gate.ID, observations []gate.ObservationRequirement) bool {
+	if len(observations) == 0 {
+		return true
+	}
+	if nilEvidenceObservationVerifier(s.permissionReviewObservationVerifier) {
+		s.recordPermissionReviewStale(s.gateCoordinatesForStale(gateID))
+		return false
+	}
+	// policy is assembled from the SAME two trusted, session-construction-time
+	// sources hustleEvidenceRuntimeConfig already uses for the structurally
+	// identical EvidenceContainmentPolicy (hustle.go): s.wsRoot (the
+	// canonical workspace root) and s.permissionReviewSecurityCeiling (read
+	// fresh off the session, exactly like the GatePolicyRevision comparison
+	// above — never a value captured earlier in this specific review, so a
+	// ceiling that has since moved on is still caught).
+	policy := gate.EvidenceContainmentPolicy{ReadRoot: s.wsRoot, SecurityCeiling: s.permissionReviewSecurityCeiling}
+	// Bound this specific I/O call (CLAUDE.md: "Every I/O call ... must use a
+	// context.Context with a timeout or deadline. No unbounded blocking.").
+	// ctx here traces back through respondFromClassifier ->
+	// StartPermissionReview's beginPermissionReviewCancellation, which is a
+	// bare context.WithCancel with no deadline anywhere in that chain — so
+	// without this, a consumer-supplied verifier whose re-stat/git-ref-resolve
+	// I/O hangs would hang this call forever. s.hustleLimits.AuditTimeout is
+	// the same positive-guaranteed budget review_adapter.go's publish already
+	// reuses for the adapter's own audit-publish call (StartPermissionReview
+	// sets adapter.auditTimeout from this exact field, and only after
+	// s.hustleController is confirmed non-nil, which hustleruntime.New
+	// guarantees means AuditTimeout > 0) — mirrored here rather than adding a
+	// new consumer-facing timeout knob for one recheck call. context.WithTimeout
+	// still composes with ctx's own cancellation, so an outer review
+	// cancellation (gate resolved, session shutdown) stops this just as
+	// promptly as before.
+	verifyCtx := ctx
+	if s.hustleLimits.AuditTimeout > 0 {
+		var cancel context.CancelFunc
+		verifyCtx, cancel = context.WithTimeout(ctx, s.hustleLimits.AuditTimeout)
+		defer cancel()
+	}
+	if err := s.permissionReviewObservationVerifier.VerifyEvidenceObservations(verifyCtx, policy, observations); err != nil {
+		s.recordPermissionReviewStale(s.gateCoordinatesForStale(gateID))
+		return false
+	}
+	return true
+}
+
+// gateCoordinatesForStale takes a short, non-blocking lock to read id's
+// directory-entry coordinates for circuit-breaker bookkeeping ONLY — never
+// while holding the lock across the observation verifier's own I/O (that
+// call has already returned by the time this runs). A gate already gone by
+// the time this is called (an ordinary race, not an error here) yields the
+// zero identity.Coordinates, which recordPermissionReviewStale treats like
+// any other coordinates value.
+func (s *Session) gateCoordinatesForStale(id gate.ID) identity.Coordinates {
+	s.gatesMu.Lock()
+	defer s.gatesMu.Unlock()
+	if entry, ok := s.gates[id]; ok {
+		return entry.coordinates
+	}
+	return identity.Coordinates{}
+}
+
+func nilEvidenceObservationVerifier(value gate.EvidenceObservationVerifier) bool {
+	if value == nil {
+		return true
+	}
+	reflected := reflect.ValueOf(value)
+	return reflected.Kind() == reflect.Pointer && reflected.IsNil()
 }
 
 // revertClaiming reverts a gate from claiming back to open after a failed
@@ -746,14 +1279,14 @@ func validateGateAction(g gate.Gate, action string) bool {
 	return false
 }
 
-// buildGateResolved stamps and builds the GateResolved event from the response,
-// resolved audit, and already-validated approval scope.
-func (s *Session) buildGateResolved(entry gateEntry, response gate.GateResponse, audit gate.ResponseAudit, approvalScope *tool.ApprovalScope) (event.GateResolved, error) {
+// buildGateResolved stamps and builds the GateResolved event from the response
+// and the resolved (already-redacted) audit.
+func (s *Session) buildGateResolved(entry gateEntry, response gate.GateResponse, audit gate.ResponseAudit) (event.GateResolved, error) {
 	stamped, err := s.factory.Stamp(event.Header{Coordinates: entry.coordinates})
 	if err != nil {
 		return event.GateResolved{}, &GateError{GateID: response.GateID, Kind: GateAppendFailed, Cause: err}
 	}
-	resolved := event.GateResolved{
+	return event.GateResolved{
 		Header:   stamped,
 		GateID:   response.GateID,
 		Resolver: entry.gate.Resolver,
@@ -761,11 +1294,7 @@ func (s *Session) buildGateResolved(entry gateEntry, response gate.GateResponse,
 		Action:   response.Action,
 		Source:   response.Source,
 		Audit:    audit,
-	}
-	if approvalScope != nil {
-		resolved.ApprovalScope = *approvalScope
-	}
-	return resolved, nil
+	}, nil
 }
 
 func (s *Session) buildGateClosed(entry gateEntry, id gate.ID, reason gate.CloseReason) (event.GateResolved, error) {
@@ -804,15 +1333,14 @@ func (s *Session) dispatchGateCommand(entry gateEntry, cmd command.Command) erro
 // interface because they are delivered through different seams and only the cmd
 // has a loop to fail to find.
 type translatedGateResponse struct {
-	cmd           command.Command
-	answer        *gate.Answer
-	audit         gate.ResponseAudit
-	approvalScope *tool.ApprovalScope
+	cmd    command.Command
+	answer *gate.Answer
+	audit  gate.ResponseAudit
 }
 
 // translateGateResponse validates the payload-specific parts of the response and
-// builds the translated command, redacted audit, and validated approval scope. It
-// returns a typed *GateError on validation failure (invalid grants, missing
+// builds the translated command, redacted audit, and exact approval action. It
+// returns a typed *GateError on validation failure (invalid action, missing
 // values, unknown kind).
 func (s *Session) translateGateResponse(entry gateEntry, response gate.GateResponse) (translatedGateResponse, error) {
 	cmdID, err := s.newCommandID()
@@ -935,26 +1463,53 @@ func formPayloadFromGatePayload(payload gate.Payload) (gate.FormPayload, bool) {
 	}
 }
 
-// translatePermissionResponse builds an ApproveToolCall or DenyToolCall from a
-// permission gate response. For approve, it extracts scope and accepted_grants
-// from Values and validates the grants against the payload's request.
+// translatePermissionResponse maps a permission gate response to the exact
+// approval action and its command. The action string must be one of the three
+// exact gate.ApprovalAction values (ParseApprovalAction is the same single
+// validation source the strict wire decoder uses); anything else fails secure.
+// Approve actions travel on ApproveToolCall, Deny on DenyToolCall. The durable
+// audit stores the payload request's requirement descriptions and — for a
+// workspace approval, which persists them — the displayed candidate
+// descriptions. Descriptions only: no tokens, no raw arguments, and the
+// response carries no values to smuggle either.
 func (s *Session) translatePermissionResponse(hdr command.Header, route command.GateRoute, payload gate.Payload, response gate.GateResponse) (translatedGateResponse, error) {
-	switch response.Action {
-	case "approve":
-		scope, grants, audit, err := validatePermissionApprove(payload, response)
-		if err != nil {
-			return translatedGateResponse{}, err
-		}
+	action, ok := gate.ParseApprovalAction(response.Action)
+	if !ok {
+		return translatedGateResponse{}, &GateError{GateID: response.GateID, Kind: GateActionInvalid}
+	}
+	permPayload, ok := permissionPayloadFromGatePayload(payload)
+	if !ok {
+		return translatedGateResponse{}, &GateError{GateID: response.GateID, Kind: GateActionInvalid}
+	}
+	switch action {
+	case gate.ApprovalApprove, gate.ApprovalApproveAlwaysWorkspace:
 		return translatedGateResponse{
-			cmd:           command.ApproveToolCall{Header: hdr, GateRoute: route, Scope: scope, AcceptedGrants: grants},
-			audit:         audit,
-			approvalScope: &scope,
+			cmd:   command.ApproveToolCall{Header: hdr, GateRoute: route, Action: action},
+			audit: permissionAuditFor(permPayload.Request, action),
 		}, nil
-	case "deny":
+	case gate.ApprovalDeny:
 		return translatedGateResponse{cmd: command.DenyToolCall{Header: hdr, GateRoute: route}}, nil
 	default:
 		return translatedGateResponse{}, &GateError{GateID: response.GateID, Kind: GateActionInvalid}
 	}
+}
+
+// permissionAuditFor builds the redacted durable audit for an approval: the
+// displayed requirement descriptions always, and the displayed reusable
+// candidate descriptions only for the workspace approval that persists them.
+func permissionAuditFor(displayed tool.Request, action gate.ApprovalAction) gate.PermissionAudit {
+	audit := gate.PermissionAudit{}
+	for _, requirement := range displayed.Requirements {
+		audit.RequirementDescriptions = append(audit.RequirementDescriptions, requirement.Description)
+	}
+	if action == gate.ApprovalApproveAlwaysWorkspace {
+		for _, requirement := range displayed.Requirements {
+			for _, candidate := range requirement.Candidates {
+				audit.CandidateDescriptions = append(audit.CandidateDescriptions, candidate.Description)
+			}
+		}
+	}
+	return audit
 }
 
 // translateAskUserResponse builds a ProvideUserInput from an ask-user gate
@@ -976,58 +1531,6 @@ func (s *Session) translateAskUserResponse(hdr command.Header, route command.Gat
 	}, nil
 }
 
-// validatePermissionApprove extracts scope and accepted_grants from the response
-// Values, validates the scope against the payload request's AllowedScopes,
-// validates Bash grant tokens against the request's Grants, and builds the
-// PermissionAudit from the accepted grant descriptions (not tokens). A scope the
-// request did not offer or an accepted grant not in the request's Grants fails
-// secure.
-func validatePermissionApprove(payload gate.Payload, response gate.GateResponse) (tool.ApprovalScope, []string, gate.ResponseAudit, error) {
-	rawScope, ok := response.Values["scope"]
-	if !ok {
-		return 0, nil, nil, &GateError{GateID: response.GateID, Kind: GateActionInvalid}
-	}
-	var scopeValue string
-	if err := json.Unmarshal(rawScope, &scopeValue); err != nil {
-		return 0, nil, nil, &GateError{GateID: response.GateID, Kind: GateActionInvalid, Cause: err}
-	}
-	scope, ok := tool.ParseApprovalScopeValue(scopeValue)
-	if !ok {
-		return 0, nil, nil, &GateError{GateID: response.GateID, Kind: GateActionInvalid}
-	}
-	permPayload, ok := permissionPayloadFromGatePayload(payload)
-	if !ok || permPayload.Request == nil {
-		return 0, nil, nil, &GateError{GateID: response.GateID, Kind: GateActionInvalid}
-	}
-	if !approvalScopeAllowed(scope, permPayload.Request.AllowedScopes()) {
-		return 0, nil, nil, &GateError{GateID: response.GateID, Kind: GateActionInvalid}
-	}
-
-	var grants []string
-	if raw, ok := response.Values["accepted_grants"]; ok {
-		if err := json.Unmarshal(raw, &grants); err != nil {
-			return 0, nil, nil, &GateError{GateID: response.GateID, Kind: GateActionInvalid, Cause: err}
-		}
-	}
-	bashReq, ok := permPayload.Request.(tool.BashRequest)
-	if !ok {
-		return scope, grants, gate.PermissionAudit{}, nil
-	}
-	validTokens := make(map[string]string, len(bashReq.Grants))
-	for _, g := range bashReq.Grants {
-		validTokens[g.Token] = g.Description
-	}
-	descs := make([]string, 0, len(grants))
-	for _, t := range grants {
-		desc, exists := validTokens[t]
-		if !exists {
-			return 0, nil, nil, &GateError{GateID: response.GateID, Kind: GateActionInvalid}
-		}
-		descs = append(descs, desc)
-	}
-	return scope, grants, gate.PermissionAudit{AcceptedGrantDescriptions: descs}, nil
-}
-
 func permissionPayloadFromGatePayload(payload gate.Payload) (gate.PermissionPayload, bool) {
 	switch v := payload.(type) {
 	case gate.PermissionPayload:
@@ -1040,13 +1543,4 @@ func permissionPayloadFromGatePayload(payload gate.Payload) (gate.PermissionPayl
 	default:
 		return gate.PermissionPayload{}, false
 	}
-}
-
-func approvalScopeAllowed(scope tool.ApprovalScope, allowed []tool.ApprovalScope) bool {
-	for _, candidate := range allowed {
-		if scope == candidate {
-			return true
-		}
-	}
-	return false
 }

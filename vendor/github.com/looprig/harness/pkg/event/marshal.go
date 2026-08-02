@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/looprig/core/content"
 	"github.com/looprig/core/uuid"
@@ -49,6 +50,18 @@ type UnknownEventTypeError struct{ Type string }
 
 func (e *UnknownEventTypeError) Error() string {
 	return fmt.Sprintf("event: unknown event type %q", e.Type)
+}
+
+// UnsupportedSchemaError reports a durable record whose schema version is
+// newer than this binary supports. It is the dispatch hook a future migration
+// layer catches; today it is a hard, typed restore failure.
+type UnsupportedSchemaError struct {
+	Kind    string // "event"
+	Version uint32
+}
+
+func (e *UnsupportedSchemaError) Error() string {
+	return fmt.Sprintf("event: unsupported %s schema version %d (max %d)", e.Kind, e.Version, schemaVersion)
 }
 
 // EventEncodeError wraps a failure to marshal an event's payload (a json.Marshal
@@ -165,13 +178,16 @@ func encodePayload(ev Event) ([]byte, error) {
 	case GateResolved:
 		return marshalGateResolved(e)
 	case SessionStarted, SessionActive, SessionIdle, SessionStopped,
+		ConfigurationAdopted,
 		RestoreStarted, RestoreDone, WorkspaceCheckpointed, WorkspaceRestored,
-		ActiveLoopChanged, SecurityLimitChanged,
+		ActiveLoopChanged,
+		LoopRestoreTombstoned,
 		HustleStarted, HustleCompleted, HustleFailed,
+		PermissionReviewStarted, PermissionReviewCompleted,
 		LoopIdle, LoopStarted, DelegateRequestAccepted, LoopInferenceChanged, LoopModeChanged,
 		LoopExternalToolsetChanged, ContextMeasured,
 		CompactionCommitted, CompactionRejected, CompactWaiterResolved, CompactWaiterRejected,
-		ForeignSessionBound, TurnRejected,
+		ForeignSessionBound, LoopAgentSessionBound, TurnRejected,
 		UserInputRequested, TurnInterrupted,
 		TurnStarted, TurnFoldedInto, InputCancelled, TurnDone,
 		PermissionDecided, GatePrepared, GateOpened:
@@ -225,9 +241,11 @@ func marshalStepDone(e StepDone) ([]byte, error) {
 	return out, nil
 }
 
-// permissionRequestedWire is PermissionRequested's wire form: the Request sealed
-// interface is persisted IN FULL via tool.MarshalPermissionRequest (header-only
-// would panic on TUI replay), pre-encoded into a sibling "request" key.
+// permissionRequestedWire is PermissionRequested's wire form: the typed
+// prepared Request is validated (tool.ValidateRequest) and pre-encoded into a
+// sibling "request" key; the decoder routes it through the strict
+// gate.DecodeRequest, so a malformed or legacy sealed-request record fails
+// closed at the untrusted restore boundary.
 type permissionRequestedWire struct {
 	Header
 	ToolExecutionID uuid.UUID       `json:"tool_execution_id,omitzero"`
@@ -235,13 +253,12 @@ type permissionRequestedWire struct {
 }
 
 func marshalPermissionRequested(e PermissionRequested) ([]byte, error) {
-	var req json.RawMessage
-	if e.Request != nil {
-		r, err := tool.MarshalPermissionRequest(e.Request)
-		if err != nil {
-			return nil, &EventEncodeError{Type: "PermissionRequested", Cause: err}
-		}
-		req = r
+	if err := tool.ValidateRequest(e.Request); err != nil {
+		return nil, &EventEncodeError{Type: "PermissionRequested", Cause: err}
+	}
+	req, err := json.Marshal(e.Request)
+	if err != nil {
+		return nil, &EventEncodeError{Type: "PermissionRequested", Cause: err}
 	}
 	out, err := json.Marshal(permissionRequestedWire{
 		Header:          e.Header,
@@ -346,14 +363,26 @@ func UnmarshalEvent(data []byte) (Event, error) {
 	if len(data) > maxEventBytes {
 		return nil, &EventLimitError{Got: len(data), Max: maxEventBytes}
 	}
+	if !utf8.Valid(data) {
+		return nil, &EventDecodeError{Cause: errors.New("invalid UTF-8 event envelope")}
+	}
 	if err := rejectDuplicateJSONKeys(data); err != nil {
 		return nil, &EventDecodeError{Cause: err}
 	}
 	var probe struct {
-		Type string `json:"type"`
+		Type string  `json:"type"`
+		V    *uint32 `json:"v"`
 	}
 	if err := json.Unmarshal(data, &probe); err != nil {
 		return nil, &EventDecodeError{Type: "", Cause: err}
+	}
+	// The "v" envelope key is the durable schema version. Absent means version 1
+	// (old records predate the field guarantee); a value newer than this binary
+	// supports fails closed with a typed error the future migration layer catches.
+	// A present-but-malformed "v" (non-number) already surfaced as EventDecodeError
+	// from the probe unmarshal above.
+	if probe.V != nil && *probe.V > schemaVersion {
+		return nil, &UnsupportedSchemaError{Kind: "event", Version: *probe.V}
 	}
 	ev, err := decodePayload(probe.Type, data)
 	if err != nil {
@@ -560,6 +589,8 @@ func decodePayload(tag string, data []byte) (Event, error) {
 		return decodePlain[SessionIdle](tag, data)
 	case "SessionStopped":
 		return decodePlain[SessionStopped](tag, data)
+	case "ConfigurationAdopted":
+		return decodePlain[ConfigurationAdopted](tag, data)
 	case "RestoreStarted":
 		return decodePlain[RestoreStarted](tag, data)
 	case "RestoreDone":
@@ -572,16 +603,18 @@ func decodePayload(tag string, data []byte) (Event, error) {
 		return decodePlain[WorkspaceRestored](tag, data)
 	case "ActiveLoopChanged":
 		return decodePlain[ActiveLoopChanged](tag, data)
-	case "SecurityLimitChanged":
-		return decodePlain[SecurityLimitChanged](tag, data)
-	case "SecurityCeilingChanged":
-		return decodePlain[SecurityLimitChanged](tag, data)
+	case "LoopRestoreTombstoned":
+		return decodePlain[LoopRestoreTombstoned](tag, data)
 	case "HustleStarted":
 		return decodePlain[HustleStarted](tag, data)
 	case "HustleCompleted":
 		return decodePlain[HustleCompleted](tag, data)
 	case "HustleFailed":
 		return decodePlain[HustleFailed](tag, data)
+	case "PermissionReviewStarted":
+		return decodePlain[PermissionReviewStarted](tag, data)
+	case "PermissionReviewCompleted":
+		return decodePlain[PermissionReviewCompleted](tag, data)
 	case "LoopIdle":
 		return decodePlain[LoopIdle](tag, data)
 	case "LoopStarted":
@@ -606,6 +639,8 @@ func decodePayload(tag string, data []byte) (Event, error) {
 		return decodePlain[CompactWaiterRejected](tag, data)
 	case "ForeignSessionBound":
 		return decodePlain[ForeignSessionBound](tag, data)
+	case "LoopAgentSessionBound":
+		return decodePlain[LoopAgentSessionBound](tag, data)
 	case "TurnStarted":
 		return decodePlain[TurnStarted](tag, data)
 	case "StepDone":
@@ -744,7 +779,7 @@ func decodePermissionRequested(data []byte) (Event, error) {
 	}
 	ev := PermissionRequested{Header: w.Header, ToolExecutionID: w.ToolExecutionID}
 	if len(w.Request) > 0 {
-		req, err := tool.UnmarshalPermissionRequest(w.Request)
+		req, err := gate.DecodeRequest(w.Request)
 		if err != nil {
 			return nil, &EventDecodeError{Type: "PermissionRequested", Cause: err}
 		}
@@ -783,13 +818,12 @@ func decodeRestoreErrored(data []byte) (Event, error) {
 // serializes to an absent key.
 type gateResolvedWire struct {
 	Header
-	GateID        gate.ID             `json:"gate_id,omitzero"`
-	Resolver      gate.ResolverKind   `json:"resolver,omitempty"`
-	Reason        gate.CloseReason    `json:"reason,omitempty"`
-	Action        string              `json:"action,omitempty"`
-	ApprovalScope tool.ApprovalScope  `json:"scope,omitzero"`
-	Source        gate.ResponseSource `json:"source,omitzero"`
-	Audit         json.RawMessage     `json:"audit,omitempty"`
+	GateID   gate.ID             `json:"gate_id,omitzero"`
+	Resolver gate.ResolverKind   `json:"resolver,omitempty"`
+	Reason   gate.CloseReason    `json:"reason,omitempty"`
+	Action   string              `json:"action,omitempty"`
+	Source   gate.ResponseSource `json:"source,omitzero"`
+	Audit    json.RawMessage     `json:"audit,omitempty"`
 }
 
 func marshalGateResolved(e GateResolved) ([]byte, error) {
@@ -802,14 +836,13 @@ func marshalGateResolved(e GateResolved) ([]byte, error) {
 		auditJSON = a
 	}
 	out, err := json.Marshal(gateResolvedWire{
-		Header:        e.Header,
-		GateID:        e.GateID,
-		Resolver:      e.Resolver,
-		Reason:        e.Reason,
-		Action:        e.Action,
-		ApprovalScope: e.ApprovalScope,
-		Source:        e.Source,
-		Audit:         auditJSON,
+		Header:   e.Header,
+		GateID:   e.GateID,
+		Resolver: e.Resolver,
+		Reason:   e.Reason,
+		Action:   e.Action,
+		Source:   e.Source,
+		Audit:    auditJSON,
 	})
 	if err != nil {
 		return nil, &EventEncodeError{Type: "GateResolved", Cause: err}
@@ -823,13 +856,12 @@ func decodeGateResolved(data []byte) (Event, error) {
 		return nil, &EventDecodeError{Type: "GateResolved", Cause: err}
 	}
 	ev := GateResolved{
-		Header:        w.Header,
-		GateID:        w.GateID,
-		Resolver:      w.Resolver,
-		Reason:        w.Reason,
-		Action:        w.Action,
-		ApprovalScope: w.ApprovalScope,
-		Source:        w.Source,
+		Header:   w.Header,
+		GateID:   w.GateID,
+		Resolver: w.Resolver,
+		Reason:   w.Reason,
+		Action:   w.Action,
+		Source:   w.Source,
 	}
 	if len(w.Audit) > 0 {
 		audit, err := gate.UnmarshalResponseAudit(w.Audit)

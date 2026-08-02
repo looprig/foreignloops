@@ -32,6 +32,23 @@ func (e *ConfigError) Error() string {
 	return message
 }
 
+// ConfigEvidenceKindError reports that a registered hustle definition's
+// evidence tools may declare a Requirement.Kind the consumer's
+// runtime.evidence.AllowedKinds allowlist does not cover. It is raised at
+// controller CONSTRUCTION (newRuntimeController), not on the definition's
+// first real evidence-tool call, so a missing kind names itself immediately
+// rather than surfacing later as an opaque EvidenceFailureForbiddenCapability
+// deep inside a live classifier review.
+type ConfigEvidenceKindError struct {
+	Name hustle.Name
+	Kind string
+}
+
+func (e *ConfigEvidenceKindError) Error() string {
+	return "hustleruntime: hustle " + string(e.Name) + " evidence tools declare kind " +
+		e.Kind + " not present in runtime.evidence.allowed_kinds"
+}
+
 // AdmissionErrorReason identifies a rejection before lane ownership commits.
 type AdmissionErrorReason string
 
@@ -200,6 +217,130 @@ func (e *OutputError) Error() string {
 
 func (e *OutputError) Unwrap() error { return e.Cause }
 
+// ToolResponseFailureReason is a closed, security-safe classification for an
+// invalid structured-output-with-tools response. Values describe only the
+// response shape; they never retain provider-controlled content.
+type ToolResponseFailureReason string
+
+const (
+	ToolResponseFailureInvalidShape       ToolResponseFailureReason = "invalid_shape"
+	ToolResponseFailureFinishReason       ToolResponseFailureReason = "finish_reason"
+	ToolResponseFailureUnknownTool        ToolResponseFailureReason = "unknown_tool"
+	ToolResponseFailureMalformedArguments ToolResponseFailureReason = "malformed_arguments"
+	ToolResponseFailureMissingCallID      ToolResponseFailureReason = "missing_call_id"
+	ToolResponseFailureDuplicateCallID    ToolResponseFailureReason = "duplicate_call_id"
+	ToolResponseFailureMixed              ToolResponseFailureReason = "mixed_response"
+	ToolResponseFailureDuplicateTerminal  ToolResponseFailureReason = "duplicate_terminal"
+	ToolResponseFailureInvalidTerminal    ToolResponseFailureReason = "invalid_terminal"
+	ToolResponseFailureTooLarge           ToolResponseFailureReason = "too_large"
+)
+
+// Valid reports whether the reason is a recognized response-shape failure.
+func (r ToolResponseFailureReason) Valid() bool {
+	switch r {
+	case ToolResponseFailureInvalidShape,
+		ToolResponseFailureFinishReason,
+		ToolResponseFailureUnknownTool,
+		ToolResponseFailureMalformedArguments,
+		ToolResponseFailureMissingCallID,
+		ToolResponseFailureDuplicateCallID,
+		ToolResponseFailureMixed,
+		ToolResponseFailureDuplicateTerminal,
+		ToolResponseFailureInvalidTerminal,
+		ToolResponseFailureTooLarge:
+		return true
+	default:
+		return false
+	}
+}
+
+// ToolResponseError reports one bounded response-shape classification. It
+// deliberately has no cause or caller-controlled metadata.
+type ToolResponseError struct {
+	Reason ToolResponseFailureReason
+}
+
+// Valid reports whether the error contains exactly one recognized reason.
+func (e *ToolResponseError) Valid() bool {
+	return e != nil && e.Reason.Valid()
+}
+
+func (e *ToolResponseError) Error() string {
+	if e.Valid() {
+		return "hustleruntime: invalid tool response (" + string(e.Reason) + ")"
+	}
+	return "hustleruntime: invalid tool response"
+}
+
+// EvidenceFailureReason is a closed, security-safe classification for evidence
+// binding, preparation, authorization, and execution failures.
+type EvidenceFailureReason string
+
+const (
+	EvidenceFailureInvalidBinding        EvidenceFailureReason = "invalid_binding"
+	EvidenceFailureUnknownTool           EvidenceFailureReason = "unknown_tool"
+	EvidenceFailureUnprepared            EvidenceFailureReason = "unprepared"
+	EvidenceFailurePreparation           EvidenceFailureReason = "preparation"
+	EvidenceFailureInvalidRequest        EvidenceFailureReason = "invalid_request"
+	EvidenceFailureAmbiguousIdentity     EvidenceFailureReason = "ambiguous_identity"
+	EvidenceFailureForbiddenCapability   EvidenceFailureReason = "forbidden_capability"
+	EvidenceFailureContainmentRefused    EvidenceFailureReason = "containment_refused"
+	EvidenceFailureAccessRefused         EvidenceFailureReason = "access_refused"
+	EvidenceFailureExecution             EvidenceFailureReason = "execution"
+	EvidenceFailureInvalidResult         EvidenceFailureReason = "invalid_result"
+	EvidenceFailureResultTooLarge        EvidenceFailureReason = "result_too_large"
+	EvidenceFailureEvidenceTooLarge      EvidenceFailureReason = "evidence_too_large"
+	EvidenceFailureRoundsExceeded        EvidenceFailureReason = "rounds_exceeded"
+	EvidenceFailureCallsExceeded         EvidenceFailureReason = "calls_exceeded"
+	EvidenceFailureCallsPerRoundExceeded EvidenceFailureReason = "calls_per_round_exceeded"
+	EvidenceFailureCanceled              EvidenceFailureReason = "canceled"
+	EvidenceFailureDeadline              EvidenceFailureReason = "deadline"
+	EvidenceFailureInternal              EvidenceFailureReason = "internal"
+)
+
+// Valid reports whether the reason is a recognized evidence failure.
+func (r EvidenceFailureReason) Valid() bool {
+	switch r {
+	case EvidenceFailureInvalidBinding,
+		EvidenceFailureUnknownTool,
+		EvidenceFailureUnprepared,
+		EvidenceFailurePreparation,
+		EvidenceFailureInvalidRequest,
+		EvidenceFailureAmbiguousIdentity,
+		EvidenceFailureForbiddenCapability,
+		EvidenceFailureContainmentRefused,
+		EvidenceFailureAccessRefused,
+		EvidenceFailureExecution,
+		EvidenceFailureInvalidResult,
+		EvidenceFailureResultTooLarge,
+		EvidenceFailureEvidenceTooLarge,
+		EvidenceFailureRoundsExceeded,
+		EvidenceFailureCallsExceeded,
+		EvidenceFailureCallsPerRoundExceeded,
+		EvidenceFailureCanceled,
+		EvidenceFailureDeadline,
+		EvidenceFailureInternal:
+		return true
+	default:
+		return false
+	}
+}
+
+// EvidenceError deliberately retains no tool arguments, results, dependency
+// errors, or panic values.
+type EvidenceError struct {
+	Reason EvidenceFailureReason
+}
+
+func (e *EvidenceError) Valid() bool { return e != nil && e.Reason.Valid() }
+
+func (e *EvidenceError) Error() string {
+	if e.Valid() {
+		return "hustleruntime: evidence call failed (" + string(e.Reason) + ")"
+	}
+	return "hustleruntime: evidence call failed"
+}
+
 // CallbackPanicError is the redacted recovery product for a consumer callback.
 // It deliberately retains no panic value.
 type CallbackPanicError struct {
@@ -228,6 +369,16 @@ type WorkerPanicError struct {
 }
 
 func (e *WorkerPanicError) Error() string { return "hustleruntime: inference client panicked" }
+
+// EvidenceWorkerPanicError is the redacted recovery product for an unexpected
+// panic anywhere inside evidence catalog binding or evidence execution.
+type EvidenceWorkerPanicError struct {
+	RunID hustle.RunID
+}
+
+func (e *EvidenceWorkerPanicError) Error() string {
+	return "hustleruntime: evidence worker panicked"
+}
 
 // AuditOperation identifies the checked lifecycle publication step which
 // failed.

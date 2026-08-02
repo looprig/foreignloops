@@ -25,6 +25,17 @@ type RestoredState struct {
 	Msgs      content.AgenticMessages
 	TurnIndex event.TurnIndex
 
+	// DerivedPrefix counts the leading messages in Msgs that are a
+	// compaction-generated summary rather than genuine human-authored
+	// conversation (folded from the same CompactionCommitted event that
+	// replaces Msgs entirely — sessionruntime's foldLoop). It seeds
+	// loopState.msgsDerivedPrefix (see that field's doc comment for the full
+	// rationale): without it, a restored loop's next turn would clone Msgs
+	// into cfg.base with no marker at all, and capturePermissionReviewContext
+	// would credit a model-generated compaction summary with
+	// gate.ReviewContextOriginUser — genuine human authorization.
+	DerivedPrefix int
+
 	// Mode is the loop's LAST durably-selected mode (folded from LoopModeChanged, last write
 	// wins); HasMode distinguishes "the loop changed mode" (reapply Mode, which may be the
 	// base "") from "the loop never changed mode" (come up under the definition's initial
@@ -63,12 +74,13 @@ type RestoredState struct {
 // RestoredState (empty Msgs, zero TurnIndex) yields a loop indistinguishable from a
 // freshly New'd one.
 func NewRestored(loopCtx context.Context, sessionID, loopID uuid.UUID, parent loop.Provenance, events eventPublisher, bound loop.BoundDefinition, seed RestoredState) (*Loop, error) {
-	return NewRestoredWithCompactor(loopCtx, sessionID, loopID, parent, events, bound, seed, nil)
+	return NewRestoredWithCompactor(loopCtx, sessionID, loopID, parent, events, bound, seed, nil, nil)
 }
 
 // NewRestoredWithCompactor is the restored counterpart to
 // NewInModeWithCompactor. It installs the focused executor while preserving the
-// restore-folded mode and inference runtime.
+// restore-folded mode and inference runtime. reviewContext mirrors
+// NewInModeWithCompactor's parameter of the same name — see its doc comment.
 func NewRestoredWithCompactor(
 	loopCtx context.Context,
 	sessionID, loopID uuid.UUID,
@@ -77,6 +89,30 @@ func NewRestoredWithCompactor(
 	bound loop.BoundDefinition,
 	seed RestoredState,
 	compactor Compactor,
+	reviewContext *ReviewContext,
+) (*Loop, error) {
+	return NewRestoredWithRuntime(
+		loopCtx,
+		sessionID,
+		loopID,
+		parent,
+		events,
+		bound,
+		seed,
+		RuntimeDependencies{Compactor: compactor, ReviewContext: reviewContext},
+	)
+}
+
+// NewRestoredWithRuntime is the restored counterpart to
+// NewInModeWithRuntime.
+func NewRestoredWithRuntime(
+	loopCtx context.Context,
+	sessionID, loopID uuid.UUID,
+	parent loop.Provenance,
+	events eventPublisher,
+	bound loop.BoundDefinition,
+	seed RestoredState,
+	deps RuntimeDependencies,
 ) (*Loop, error) {
 	// Resolve config at the RESTORED mode (last LoopModeChanged) rather than the definition's
 	// initial mode, so a loop that changed mode before teardown resumes under it. When the
@@ -102,9 +138,10 @@ func NewRestoredWithCompactor(
 		cfg.Model.Sampling = cfg.Model.Sampling.Clone()
 		cfg.Model.Sampling.Effort = seed.Runtime.Effort
 	}
-	if err := installCompactionExecutor(loopCtx, &cfg, compactor); err != nil {
+	if err := installRuntimeDependencies(loopCtx, &cfg, deps); err != nil {
 		return nil, err
 	}
+	cfg.reviewContext = deps.ReviewContext.toInternal()
 	return newLoopWithSeed(loopCtx, sessionID, loopID, parent, events, cfg, bound, modeName, &seed)
 }
 

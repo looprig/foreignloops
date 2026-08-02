@@ -1,13 +1,9 @@
 package delegationtool
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
-	"fmt"
-	"io"
-	"strconv"
-	"strings"
+	"errors"
 
 	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/identity"
@@ -21,7 +17,7 @@ import (
 // parent-scoped tool.DelegateController.Execute — the tool's only runtime binding.
 //
 // SCHEMA IS NOT A SECURITY BOUNDARY. The exposed JSON schema is DERIVED from the
-// active delegation style (SyncOnly ⇒ only `start` with `wait` fixed true; Managed ⇒
+// active delegation style (SyncOnly ⇒ only `start` with `run_in_background` fixed false; Managed ⇒
 // all five actions) purely to guide the model. The parent-scoped controller
 // re-enforces the same action set, ownership, mode, and permission ceiling regardless
 // of crafted JSON, so the tool forwards a well-formed envelope faithfully and lets the
@@ -34,10 +30,12 @@ import (
 // AUDIT. AuditSummary is the constant "Subagent": the agent name and message may carry
 // sensitive context and must never reach the audit event.
 
-// subagentToolName is the EXACT tool name. It is an UNKNOWN class to classifyTool
-// (no path/command boundary), so it reaches AutoApprove only via the manifest's
-// HardApprove list (which names "Subagent").
+// subagentToolName is the EXACT tool name. The tool's PrepareCall returns an
+// empty typed request (no requirements), so the combined access gate allows it
+// without a prompt; there is no path or command boundary to classify.
 const subagentToolName = "Subagent"
+
+const maxSubagentResultBytes = 256 << 10
 
 // SubagentAction is the model-facing delegation verb carried by the envelope.
 type SubagentAction string
@@ -51,26 +49,12 @@ const (
 )
 
 // SubagentCatalogEntry is one delegate the tool advertises in its Info().Desc: the
-// name the model passes as {agent} and a one-line description. The rig projects the
+// name the model passes as {subagent_type} and a one-line description. The rig projects the
 // parent definition's delegate set onto this at the composition root.
 type SubagentCatalogEntry struct {
 	Name        identity.AgentName
 	Description string
 	Modes       []loop.ModeName
-}
-
-// SubagentArgs is the typed decode of the untrusted argsJSON. Absent typed pointers
-// distinguish "not supplied" from a supplied zero value: an absent request_id is nil,
-// while a supplied zero UUID is present-but-invalid.
-type SubagentArgs struct {
-	Action         SubagentAction     `json:"action,omitempty"`
-	Agent          identity.AgentName `json:"agent,omitempty"`
-	Mode           loop.ModeName      `json:"mode,omitempty"`
-	DelegateID     *uuid.UUID         `json:"delegate_id,omitempty"`
-	RequestID      *uuid.UUID         `json:"request_id,omitempty"`
-	Message        string             `json:"message,omitempty"`
-	Wait           *bool              `json:"wait,omitempty"`
-	TimeoutSeconds *int               `json:"timeout_seconds,omitempty"`
 }
 
 const subagentDescPrefix = "Delegate a sub-task to an in-session child agent by name via one action envelope, and optionally wait for its response."
@@ -82,89 +66,34 @@ type SubagentTool struct {
 	controller tool.DelegateController
 	style      loop.DelegationStyle
 	catalog    []SubagentCatalogEntry
+
+	runtimeCatalog    loop.RuntimeCatalog
+	hasRuntimeCatalog bool
 }
 
 // NewSubagent constructs a SubagentTool bound to the parent-scoped controller, with the
 // delegation style and delegate catalog derived from the parent definition at the
 // composition root.
-func NewSubagent(controller tool.DelegateController, style loop.DelegationStyle, catalog []SubagentCatalogEntry) *SubagentTool {
-	return &SubagentTool{controller: controller, style: style, catalog: cloneSubagentCatalog(catalog)}
+func NewSubagent(controller tool.DelegateController, style loop.DelegationStyle, catalog []SubagentCatalogEntry, runtimeCatalog ...loop.RuntimeCatalog) *SubagentTool {
+	// A missing variadic argument is an explicit empty/native catalog, not a
+	// legacy escape hatch. This keeps preparation fail-closed for runtime
+	// selectors even when a product has no optional adapter profiles.
+	s := &SubagentTool{controller: controller, style: style, catalog: cloneSubagentCatalog(catalog), hasRuntimeCatalog: true}
+	if len(runtimeCatalog) > 0 {
+		s.runtimeCatalog = runtimeCatalog[0]
+	}
+	return s
+}
+
+// NewSubagentWithRuntimeCatalog is the explicit construction path for the
+// parent-scoped preparation boundary. NewSubagent remains source-compatible
+// for native/legacy callers that do not provide a catalog.
+func NewSubagentWithRuntimeCatalog(controller tool.DelegateController, style loop.DelegationStyle, catalog []SubagentCatalogEntry, runtimeCatalog loop.RuntimeCatalog) *SubagentTool {
+	return NewSubagent(controller, style, catalog, runtimeCatalog)
 }
 
 func (s *SubagentTool) schema() string {
-	fieldOrder := []string{"action", "agent", "mode", "delegate_id", "request_id", "message", "wait", "timeout_seconds"}
-	properties := map[string]any{
-		"action": map[string]any{"type": "string", "enum": []string{"start", "send", "wait", "interrupt", "status"}},
-		"agent":  map[string]any{"type": "string"}, "mode": map[string]any{"type": "string"},
-		"delegate_id": map[string]any{"type": "string"}, "request_id": map[string]any{"type": "string"},
-		"message": map[string]any{"type": "string"}, "wait": map[string]any{"type": "boolean"},
-		"timeout_seconds": map[string]any{"type": "integer", "minimum": 0},
-	}
-	startVariants := make([]any, 0, len(s.catalog))
-	for _, entry := range s.catalog {
-		modes := make([]string, len(entry.Modes))
-		for i, mode := range entry.Modes {
-			modes[i] = string(mode)
-		}
-		variantProps := map[string]any{"agent": map[string]any{"const": string(entry.Name)}}
-		if len(modes) > 0 {
-			variantProps["mode"] = map[string]any{"type": "string", "enum": modes}
-		}
-		startVariants = append(startVariants, map[string]any{"type": "object", "properties": variantProps})
-	}
-	actionBranch := func(action string, required, allowed []string) map[string]any {
-		allowedSet := map[string]struct{}{"action": {}}
-		for _, name := range allowed {
-			allowedSet[name] = struct{}{}
-		}
-		forbidden := make([]string, 0)
-		for _, name := range fieldOrder {
-			if _, ok := allowedSet[name]; !ok {
-				forbidden = append(forbidden, name)
-			}
-		}
-		then := map[string]any{"not": map[string]any{"anyOf": requiredProperties(forbidden)}}
-		if len(required) > 0 {
-			then["required"] = required
-		}
-		return map[string]any{
-			"if":   map[string]any{"required": []string{"action"}, "properties": map[string]any{"action": map[string]any{"const": action}}},
-			"then": then,
-		}
-	}
-	startAllowed := []string{"agent", "mode", "message", "wait", "timeout_seconds"}
-	startBranch := actionBranch("start", []string{"agent", "message"}, startAllowed)
-	if len(startVariants) > 0 {
-		startBranch["then"].(map[string]any)["oneOf"] = startVariants
-	}
-	defaultStartBranch := map[string]any{
-		"if":   map[string]any{"not": map[string]any{"required": []string{"action"}}},
-		"then": startBranch["then"],
-	}
-	branches := []any{
-		startBranch,
-		defaultStartBranch,
-		actionBranch("send", []string{"delegate_id", "message"}, []string{"delegate_id", "message", "wait", "timeout_seconds"}),
-		actionBranch("wait", []string{"delegate_id", "request_id"}, []string{"delegate_id", "request_id", "timeout_seconds"}),
-		actionBranch("interrupt", []string{"delegate_id"}, []string{"delegate_id"}),
-		actionBranch("status", nil, []string{"delegate_id"}),
-	}
-	if s.style == loop.DelegationSyncOnly {
-		properties["action"] = map[string]any{"type": "string", "enum": []string{"start"}}
-		properties["wait"] = map[string]any{"const": true}
-		branches = branches[:2]
-	}
-	schema := map[string]any{"type": "object", "additionalProperties": false, "properties": properties, "allOf": branches}
-	encoded, _ := json.Marshal(schema)
-	return string(encoded)
-}
-
-func requiredProperties(names []string) []any {
-	result := make([]any, len(names))
-	for i, name := range names {
-		result[i] = map[string]any{"required": []string{name}}
-	}
-	return result
+	return buildSubagentSchema(s.style, s.catalog, s.runtimeCatalog)
 }
 
 func cloneSubagentCatalog(catalog []SubagentCatalogEntry) []SubagentCatalogEntry {
@@ -175,40 +104,10 @@ func cloneSubagentCatalog(catalog []SubagentCatalogEntry) []SubagentCatalogEntry
 	return result
 }
 
-// subagentDesc renders the static prefix followed by an <available_agents> block
+// subagentDesc renders the static prefix followed by an <available_subagents> block
 // listing each catalog entry. An empty catalog renders just the prefix.
 func (s *SubagentTool) subagentDesc() string {
-	if len(s.catalog) == 0 {
-		return subagentDescPrefix
-	}
-	var b strings.Builder
-	b.WriteString(subagentDescPrefix)
-	b.WriteString("\n<available_agents>\n")
-	for _, e := range s.catalog {
-		b.WriteString("- ")
-		b.WriteString(string(e.Name))
-		if strings.TrimSpace(e.Description) != "" {
-			b.WriteString(": ")
-			b.WriteString(e.Description)
-		}
-		if len(e.Modes) > 0 {
-			b.WriteString(" (modes: ")
-			for i, mode := range e.Modes {
-				if i > 0 {
-					b.WriteString(", ")
-				}
-				if mode == "" {
-					b.WriteString("default")
-				} else {
-					b.WriteString(string(mode))
-				}
-			}
-			b.WriteString(")")
-		}
-		b.WriteString("\n")
-	}
-	b.WriteString("</available_agents>")
-	return b.String()
+	return buildSubagentDescription(s.catalog, s.runtimeCatalog)
 }
 
 // Info returns the self-description. Name MUST equal "Subagent"; the schema is derived
@@ -225,149 +124,57 @@ func (s *SubagentTool) Info(context.Context) (*tool.ToolInfo, error) {
 // sensitive context and never reach the audit event.
 func (s *SubagentTool) AuditSummary(string) string { return "Subagent" }
 
-// InvokableRun parses the untrusted envelope, validates it at the boundary, translates
-// it into a tool.DelegateRequest, and forwards it to the parent-scoped controller.
-// Every failure is a tool-result error STRING; it never returns a Go error.
-func (s *SubagentTool) InvokableRun(ctx context.Context, argsJSON string) (*tool.ToolResult, error) {
-	args, present, err := decodeSubagentArgs(argsJSON)
+// PrepareCall owns envelope validation and produces the typed delegation artifact.
+// Delegation needs no OS capability, resource grant, or durable rule, so the
+// combined gate still auto-allows it; execution only consumes the artifact.
+func (s *SubagentTool) PrepareCall(ctx context.Context, _ uuid.UUID, argsJSON string) (tool.Request, tool.PreparedArtifact, error) {
+	envelope, err := prepareEnvelope(argsJSON)
 	if err != nil {
-		return tool.TextResult("error: invalid arguments: not a valid Subagent envelope"), nil
+		return tool.Request{}, nil, err
 	}
-	action := args.Action
-	if action == "" {
-		action = actionStart
+	if s.style == loop.DelegationSyncOnly && (envelope.Action != actionStart || envelope.RunInBackground) {
+		return tool.Request{}, nil, preparationFailure(errCategoryInvalidValue)
 	}
-	if errText := validateEnvelopeFields(action, present); errText != "" {
-		return tool.TextResult(errText), nil
+	delegateRequest, runtime, err := s.prepareDelegateCall(ctx, envelope)
+	if err != nil {
+		return tool.Request{}, nil, err
 	}
-	if s.style == loop.DelegationSyncOnly && (action != actionStart || (args.Wait != nil && !*args.Wait)) {
-		return tool.TextResult("error: subagent action is unavailable for sync-only delegation"), nil
-	}
-	req, errText := buildDelegateRequest(action, args)
-	if errText != "" {
-		return tool.TextResult(errText), nil
-	}
-	// The tool learns its own provider tool-use id from ctx so a tool-spawned child can
-	// be correlated to the Subagent call. The discarded bool is PRESENCE (an absent id
-	// yields ""), not a swallowed error.
-	tuid, _ := loop.ToolUseIDFrom(ctx)
-	req.ParentToolUseID = tuid
+	delegateRequest.Runtime = runtime
+	return tool.Request{}, tool.DelegateArtifact{Request: delegateRequest, Runtime: runtime}, nil
+}
 
+// InvokableRun consumes only the runner-installed prepared artifact. Raw argsJSON is
+// intentionally ignored: decoding at execution would create a second, untrusted
+// interpretation of the call after the permission gate.
+func (s *SubagentTool) InvokableRun(ctx context.Context, _ string) (*tool.ToolResult, error) {
+	prepared, ok := loop.PreparedCallFromContext(ctx)
+	if !ok {
+		return tool.TextResult("error: subagent call unavailable"), nil
+	}
+	artifact, ok := prepared.Artifact.(tool.DelegateArtifact)
+	if !ok {
+		return tool.TextResult("error: subagent call unavailable"), nil
+	}
+	req := artifact.Request
+	req.Runtime = artifact.Runtime
+	// ParentToolUseID is an execution-context fact, not part of the prepared
+	// model-facing envelope. Clear any stale value before adding the trusted
+	// runner context value.
+	req.ParentToolUseID = ""
+	if toolUseID, present := loop.ToolUseIDFrom(ctx); present {
+		req.ParentToolUseID = toolUseID
+	}
 	result, err := s.controller.Execute(ctx, req)
 	if err != nil {
-		return tool.TextResult("error: subagent failed: " + err.Error()), nil
+		var modelFacing interface{ ModelFacingError() string }
+		if errors.As(err, &modelFacing) {
+			if message := modelFacing.ModelFacingError(); message != "" {
+				return tool.TextResult("error: " + message), nil
+			}
+		}
+		return tool.TextResult("error: subagent request failed"), nil
 	}
 	return tool.TextResult(formatResult(req, result)), nil
-}
-
-func decodeSubagentArgs(input string) (SubagentArgs, map[string]json.RawMessage, error) {
-	var args SubagentArgs
-	decoder := json.NewDecoder(bytes.NewBufferString(input))
-	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(&args); err != nil {
-		return SubagentArgs{}, nil, err
-	}
-	if err := decoder.Decode(&struct{}{}); err != io.EOF {
-		return SubagentArgs{}, nil, fmt.Errorf("trailing JSON")
-	}
-	var present map[string]json.RawMessage
-	if err := json.Unmarshal([]byte(input), &present); err != nil {
-		return SubagentArgs{}, nil, err
-	}
-	return args, present, nil
-}
-
-func validateEnvelopeFields(action SubagentAction, present map[string]json.RawMessage) string {
-	allowed := map[SubagentAction]map[string]struct{}{
-		actionStart:     fields("action", "agent", "mode", "message", "wait", "timeout_seconds"),
-		actionSend:      fields("action", "delegate_id", "message", "wait", "timeout_seconds"),
-		actionWait:      fields("action", "delegate_id", "request_id", "timeout_seconds"),
-		actionInterrupt: fields("action", "delegate_id"),
-		actionStatus:    fields("action", "delegate_id"),
-	}
-	set, ok := allowed[action]
-	if !ok {
-		return ""
-	}
-	for name := range present {
-		if _, ok := set[name]; !ok {
-			return "error: field " + strconv.Quote(name) + " is forbidden for action " + strconv.Quote(string(action))
-		}
-	}
-	return ""
-}
-
-func fields(names ...string) map[string]struct{} {
-	result := make(map[string]struct{}, len(names))
-	for _, name := range names {
-		result[name] = struct{}{}
-	}
-	return result
-}
-
-// buildDelegateRequest validates the envelope for the selected action and returns the
-// typed request, or a non-empty error string on a boundary rejection (fail-secure: a
-// rejected envelope never reaches the controller).
-func buildDelegateRequest(action SubagentAction, args SubagentArgs) (tool.DelegateRequest, string) {
-	if args.TimeoutSeconds != nil && *args.TimeoutSeconds < 0 {
-		return tool.DelegateRequest{}, "error: 'timeout_seconds' must be non-negative"
-	}
-	req := tool.DelegateRequest{
-		Agent:          string(args.Agent),
-		Mode:           string(args.Mode),
-		Message:        args.Message,
-		RequestID:      args.RequestID,
-		TimeoutSeconds: args.TimeoutSeconds,
-	}
-	if args.DelegateID != nil {
-		req.DelegateID = *args.DelegateID
-	}
-	switch action {
-	case actionStart:
-		if strings.TrimSpace(string(args.Agent)) == "" {
-			return tool.DelegateRequest{}, "error: a non-empty 'agent' is required for start"
-		}
-		if strings.TrimSpace(args.Message) == "" {
-			return tool.DelegateRequest{}, "error: a non-empty 'message' is required for start"
-		}
-		req.Operation = tool.DelegateStart
-		req.Wait = waitOrDefault(args.Wait, true)
-	case actionSend:
-		if req.DelegateID.IsZero() {
-			return tool.DelegateRequest{}, "error: a 'delegate_id' is required for send"
-		}
-		if strings.TrimSpace(args.Message) == "" {
-			return tool.DelegateRequest{}, "error: a non-empty 'message' is required for send"
-		}
-		req.Operation = tool.DelegateSend
-		req.Wait = waitOrDefault(args.Wait, true)
-	case actionWait:
-		if req.DelegateID.IsZero() {
-			return tool.DelegateRequest{}, "error: a 'delegate_id' is required for wait"
-		}
-		if args.RequestID == nil || args.RequestID.IsZero() {
-			return tool.DelegateRequest{}, "error: a non-zero 'request_id' is required for wait"
-		}
-		req.Operation = tool.DelegateWait
-		req.Wait = true
-	case actionInterrupt:
-		if req.DelegateID.IsZero() {
-			return tool.DelegateRequest{}, "error: a 'delegate_id' is required for interrupt"
-		}
-		req.Operation = tool.DelegateInterrupt
-	case actionStatus:
-		req.Operation = tool.DelegateStatus
-	default:
-		return tool.DelegateRequest{}, "error: unknown action " + strconv.Quote(string(action))
-	}
-	return req, ""
-}
-
-func waitOrDefault(wait *bool, def bool) bool {
-	if wait == nil {
-		return def
-	}
-	return *wait
 }
 
 // formatResult renders the controller's typed result as the model-facing tool string.
@@ -377,11 +184,11 @@ func formatResult(req tool.DelegateRequest, result tool.DelegateResult) string {
 		if req.Wait {
 			return formatWaited(result)
 		}
-		return formatQueued(result)
+		return formatQueued(result, req.Runtime)
 	case tool.DelegateWait:
 		return formatWaited(result)
 	case tool.DelegateInterrupt:
-		return `{"delegate_id":` + strconv.Quote(result.DelegateID.String()) + `,"status":` + strconv.Quote(statusLabel(result.Status)) + `}`
+		return marshalResult(interruptResult{DelegateID: result.DelegateID.String(), Status: statusLabel(result.Status)})
 	case tool.DelegateStatus:
 		return formatStatus(result)
 	default:
@@ -393,7 +200,7 @@ func formatResult(req tool.DelegateRequest, result tool.DelegateResult) string {
 func formatWaited(result tool.DelegateResult) string {
 	switch result.Status {
 	case tool.DelegateStatusCompleted:
-		return result.Output
+		return boundSubagentOutput(result.Output)
 	case tool.DelegateStatusFailed:
 		return "error: delegate failed"
 	case tool.DelegateStatusInterrupted:
@@ -401,14 +208,32 @@ func formatWaited(result tool.DelegateResult) string {
 	case tool.DelegateStatusTimedOut:
 		return "error: delegate timed out"
 	default:
-		return "error: delegate returned invalid status: " + statusLabel(result.Status)
+		return "error: delegate returned invalid status"
 	}
 }
 
-func formatQueued(result tool.DelegateResult) string {
-	return `{"delegate_id":` + strconv.Quote(result.DelegateID.String()) +
-		`,"request_id":` + strconv.Quote(result.RequestID.String()) +
-		`,"status":"queued"}`
+func boundSubagentOutput(value string) string {
+	if len(value) <= maxSubagentResultBytes {
+		return value
+	}
+	return value[:maxSubagentResultBytes]
+}
+
+func formatQueued(result tool.DelegateResult, runtime *tool.DelegateRuntime) string {
+	var advertised *runtimeResult
+	if runtime != nil && runtime.Advertised.Any() {
+		advertised = &runtimeResult{}
+		if runtime.Advertised.Harness {
+			advertised.AgentHarness = runtime.Harness
+		}
+		if runtime.Advertised.Model {
+			advertised.Model = runtime.Model
+		}
+		if runtime.Advertised.Effort {
+			advertised.Effort = runtime.Effort
+		}
+	}
+	return marshalResult(queuedResult{DelegateID: result.DelegateID.String(), RequestID: result.RequestID.String(), Status: "queued", Runtime: advertised})
 }
 
 // formatStatus renders bounded mechanical status only (state + pending counts) — never
@@ -416,22 +241,56 @@ func formatQueued(result tool.DelegateResult) string {
 // rendered when Children is populated.
 func formatStatus(result tool.DelegateResult) string {
 	if result.Children != nil {
-		var b strings.Builder
-		b.WriteString(`{"children":[`)
+		children := make([]statusChildResult, len(result.Children))
 		for i, child := range result.Children {
-			if i > 0 {
-				b.WriteString(",")
-			}
-			b.WriteString(`{"delegate_id":` + strconv.Quote(child.DelegateID.String()) +
-				`,"status":` + strconv.Quote(statusLabel(child.Status)) +
-				`,"pending_requests":` + strconv.Itoa(child.PendingRequests) + `}`)
+			children[i] = statusChildResult{DelegateID: child.DelegateID.String(), Status: statusLabel(child.Status), PendingRequests: child.PendingRequests}
 		}
-		b.WriteString(`]}`)
-		return b.String()
+		return marshalResult(statusListResult{Children: children, Truncated: result.ChildrenTruncated})
 	}
-	return `{"delegate_id":` + strconv.Quote(result.DelegateID.String()) +
-		`,"status":` + strconv.Quote(statusLabel(result.Status)) +
-		`,"pending_requests":` + strconv.Itoa(result.PendingRequests) + `}`
+	return marshalResult(statusResult{DelegateID: result.DelegateID.String(), Status: statusLabel(result.Status), PendingRequests: result.PendingRequests})
+}
+
+type runtimeResult struct {
+	AgentHarness string `json:"agent_harness,omitempty"`
+	Model        string `json:"model,omitempty"`
+	Effort       string `json:"effort,omitempty"`
+}
+
+type queuedResult struct {
+	DelegateID string         `json:"delegate_id"`
+	RequestID  string         `json:"request_id"`
+	Status     string         `json:"status"`
+	Runtime    *runtimeResult `json:"runtime,omitempty"`
+}
+
+type interruptResult struct {
+	DelegateID string `json:"delegate_id"`
+	Status     string `json:"status"`
+}
+
+type statusResult struct {
+	DelegateID      string `json:"delegate_id"`
+	Status          string `json:"status"`
+	PendingRequests int    `json:"pending_requests"`
+}
+
+type statusChildResult struct {
+	DelegateID      string `json:"delegate_id"`
+	Status          string `json:"status"`
+	PendingRequests int    `json:"pending_requests"`
+}
+
+type statusListResult struct {
+	Children  []statusChildResult `json:"children"`
+	Truncated bool                `json:"truncated,omitempty"`
+}
+
+func marshalResult(value any) string {
+	encoded, err := json.Marshal(value)
+	if err != nil {
+		return "error: subagent result unavailable"
+	}
+	return string(encoded)
 }
 
 func statusLabel(status tool.DelegateStatusValue) string {
@@ -456,8 +315,10 @@ func statusLabel(status tool.DelegateStatusValue) string {
 }
 
 // compile-time assertions: SubagentTool is an InvokableTool and Auditable. It is
-// deliberately NOT a PermissionPrompter (AutoApprove) and NOT a WriteTarget.
+// deliberately NOT a WriteTarget, and its preparation yields an empty request
+// (delegation is auto-approved; the child's own gate governs its tools).
 var (
 	_ tool.InvokableTool = (*SubagentTool)(nil)
+	_ tool.CallPreparer  = (*SubagentTool)(nil)
 	_ tool.Auditable     = (*SubagentTool)(nil)
 )

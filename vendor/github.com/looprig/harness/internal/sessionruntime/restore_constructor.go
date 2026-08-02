@@ -2,6 +2,7 @@ package sessionruntime
 
 import (
 	"context"
+	"errors"
 	"time"
 
 	"github.com/looprig/core/uuid"
@@ -13,7 +14,6 @@ import (
 	"github.com/looprig/harness/pkg/identity"
 	"github.com/looprig/harness/pkg/journal"
 	"github.com/looprig/harness/pkg/loop"
-	"github.com/looprig/harness/pkg/security"
 	"github.com/looprig/harness/pkg/sessionstore"
 	"github.com/looprig/harness/pkg/tool"
 	"github.com/looprig/harness/pkg/workspacestore"
@@ -56,20 +56,32 @@ func (s *Session) attachRestoredLoop(started event.LoopStarted, parent loop.Prov
 		var compactor loopruntime.Compactor
 		compactor, err = s.compactorFor(bound, started.LoopID)
 		if err == nil {
-			backend, err = loopruntime.NewRestoredWithCompactor(
-				loopCtx, s.sessionID, started.LoopID, parent, s, bound, restoredStateFrom(folded, ri), compactor,
+			backend, err = loopruntime.NewRestoredWithRuntime(
+				loopCtx,
+				s.sessionID,
+				started.LoopID,
+				parent,
+				s,
+				bound,
+				restoredStateFrom(folded, ri),
+				loopruntime.RuntimeDependencies{Compactor: compactor, Hooks: s.hooks, ReviewContext: s.loopReviewContext()},
 			)
 		}
 	default:
-		if foreignSID == "" {
+		agentSessionID := ri.AgentSessionID
+		if agentSessionID == "" {
+			agentSessionID = foreignSID
+		}
+		if agentSessionID == "" {
 			cancel()
 			return &RestoreError{Kind: RestoreForeignSIDMissing}
 		}
-		if s.foreignBuildRestored == nil {
+		restoredBuilder, builderErr := s.restoredBuilder(bound)
+		if builderErr != nil {
 			cancel()
-			return &RestoreError{Kind: RestoreForeignBuilderMissing}
+			return builderErr
 		}
-		backend, err = s.foreignBuildRestored(loopCtx, s.sessionID, started.LoopID, parent, s, bound, func() (uuid.UUID, error) { return s.newID() }, s.factory, foreign.RestoredForeign{ForeignSID: foreignSID, TurnIndex: folded.TurnIndex, Msgs: folded.Msgs})
+		backend, err = restoredBuilder(loopCtx, s.sessionID, started.LoopID, parent, s, bound, func() (uuid.UUID, error) { return s.newID() }, s.factory, foreign.RestoredForeign{ForeignSID: foreignSID, AgentSessionID: agentSessionID, TurnIndex: folded.TurnIndex, Msgs: folded.Msgs})
 	}
 	if err != nil {
 		cancel()
@@ -80,6 +92,20 @@ func (s *Session) attachRestoredLoop(started event.LoopStarted, parent loop.Prov
 	s.loops[started.LoopID] = &loopHandle{id: started.LoopID, owner: s, bound: bound, bindings: bindings, backend: backend, parent: parent, cancel: cancel, liveMode: liveMode, liveModel: liveModel, state: tool.DelegateStatusIdle}
 	s.loopsMu.Unlock()
 	return nil
+}
+
+func (s *Session) restoredBuilder(bound loop.BoundDefinition) (foreign.RestoredBuilder, error) {
+	if s.foreignRegistry != nil && bound.Engine() == loop.EngineAdapter && bound.RuntimeProfile() != "" {
+		_, restored, err := s.foreignRegistry.Builder(bound.RuntimeProfile())
+		if err != nil {
+			return nil, &RestoreError{Kind: RestoreForeignBuilderMissing, Cause: err}
+		}
+		return restored, nil
+	}
+	if s.foreignBuildRestored == nil {
+		return nil, &RestoreError{Kind: RestoreForeignBuilderMissing}
+	}
+	return s.foreignBuildRestored, nil
 }
 
 func restoreTopologySession(
@@ -122,10 +148,18 @@ func restoreTopologySession(
 	if constructionAbortTimeout <= 0 {
 		constructionAbortTimeout = defaultConstructionAbortTimeout
 	}
-	if probe.securityLimit == nil {
-		probe.securityLimit = security.New()
-	}
 	allowMismatch := probe.allowConfigMismatch
+	// Default the restore-drift decider to the fail-secure policy when the composition root
+	// injected none via WithRestoreDecider, so the NEW-PATH decision is never a nil-deref.
+	if probe.restoreDecider == nil {
+		probe.restoreDecider = DefaultPolicyDecider{}
+	}
+	// The compatibility path is chosen by whether a LIVE manifest is configured: a
+	// SchemaVersion>=1 candidate (rig sessions) takes the NEW drift-assessed path; a zero
+	// (SchemaVersion 0) candidate — existing tests and non-rig callers — takes the LEGACY
+	// fingerprint path unchanged.
+	candidate := probe.projectManifest()
+	newPath := candidate.SchemaVersion >= 1
 	if probe.fingerprint == nil && probe.frozenFingerprint == nil {
 		return nil, &RestoreError{Kind: RestoreLoopFailed, Cause: &MissingFingerprintProviderError{}}
 	}
@@ -137,7 +171,12 @@ func restoreTopologySession(
 	if err != nil {
 		return nil, &RestoreError{Kind: RestoreLeaseFailed, Cause: err}
 	}
-	j, err := store.OpenJournal(ctx, sessionID, lease)
+	j, err := store.OpenJournalWithOpeningAppend(
+		ctx,
+		sessionID,
+		lease,
+		journal.HookMiddleware(probe.hooks, sessionID),
+	)
 	if err != nil {
 		releaseLease(lease)
 		return nil, &RestoreError{Kind: RestoreJournalFailed, Cause: err}
@@ -151,6 +190,7 @@ func restoreTopologySession(
 		releaseLease(lease)
 		return nil, &RestoreError{Kind: RestoreJournalFailed, Cause: err}
 	}
+	j = journal.WithHooks(j, probe.hooks, sessionID)
 	// The replayer is bound to the stream BEGINNING (FromSeq 0). Restore intentionally
 	// drains RECORDS, not events, so the private GatePreparedRecord is visible while the
 	// normal event-based folds are derived from EventRecord payloads. Opening it is a
@@ -221,22 +261,30 @@ func restoreTopologySession(
 	if repairErr != nil {
 		return recordErrored(&RestoreError{Kind: RestoreReplayFailed, Cause: repairErr})
 	}
-	securityLevel, hasSecurityLimit := lastSecurityLimit(all)
-	if hasSecurityLimit {
-		probe.securityLimit.Set(securityLevel)
-	}
 
-	persisted, err := firstConfigFingerprint(all)
-	if err != nil {
-		return recordErrored(err)
-	}
-	// A rig supplies a frozen fingerprint, allowing the mismatch decision to happen
-	// immediately after replay and before root acquisition, binding, or reconstruction.
+	// NEW PATH: the drift baseline is the LATEST adopted manifest (or a legacy projection of
+	// the first SessionStarted); LEGACY PATH: the persisted config fingerprint from the first
+	// SessionStarted governs the byte-for-byte-unchanged compatibility check.
+	var baseline adoptedBaseline
+	var persisted event.ConfigFingerprint
 	var frozenContextStale bool
-	if probe.frozenFingerprint != nil {
-		frozenContextStale, err = restoredContextDisposition(persisted, *probe.frozenFingerprint, allowMismatch)
+	if newPath {
+		baseline, err = latestAdoptedBaseline(all)
 		if err != nil {
 			return recordErrored(err)
+		}
+	} else {
+		persisted, err = firstConfigFingerprint(all)
+		if err != nil {
+			return recordErrored(err)
+		}
+		// A rig supplies a frozen fingerprint, allowing the mismatch decision to happen
+		// immediately after replay and before root acquisition, binding, or reconstruction.
+		if probe.frozenFingerprint != nil {
+			frozenContextStale, err = restoredContextDisposition(persisted, *probe.frozenFingerprint, allowMismatch)
+			if err != nil {
+				return recordErrored(err)
+			}
 		}
 	}
 	// (4a) Discover every durable root (zero-Cause LoopStarted) and the ordered starts, and
@@ -246,6 +294,73 @@ func restoreTopologySession(
 	roots, starts, err := discoverRoots(all, topology, allowMismatch)
 	if err != nil {
 		return recordErrored(err)
+	}
+	// NEW-PATH drift decision — placed HERE, right after root discovery and BEFORE workspace
+	// placement (the root lease) and loop binding, so a rejection has ZERO side effects
+	// (mirroring where the frozen-fingerprint mismatch rejects on the legacy path). The
+	// assessment compares the live candidate against the adopted baseline and folds the
+	// root-loop AgentName check in: a persisted-vs-configured name difference broadens what
+	// the session answers to, so it classifies Warn and is seen by the decider. The
+	// configured name is read off the definition (identical to the bound name, but available
+	// before binding). A decider error or a rejection routes through the SAME fail-secure
+	// exit a fingerprint mismatch uses (recordErrored: append RestoreErrored, release the
+	// leases, return the typed error). On accept, an adoption is durably recorded after
+	// RestoreStarted below when the config actually changed or the schema was upgraded.
+	var assessment event.DriftAssessment
+	var decision RestoreDecision
+	newPathStale := false
+	adoptOnAccept := false
+	if newPath {
+		assessment = event.AssessDrift(baseline.Manifest, candidate)
+		persistedName := roots[topology.ActivePrimer].AgentName
+		if configuredName := activeDefinition.Name(); persistedName != configuredName {
+			// A persisted-vs-configured root-loop NAME difference has its OWN category
+			// (DriftAgentName) — a broader "what does the session answer to" change,
+			// distinct from the agent KIND (DriftAgentKind). Still Warn, so the default
+			// policy decider's severity-keyed behavior is unchanged.
+			assessment.Changes = append(assessment.Changes, event.DriftChange{
+				Category: event.DriftAgentName,
+				Old:      string(persistedName),
+				New:      string(configuredName),
+				Severity: event.DriftWarn,
+			})
+		}
+		dec, derr := probe.restoreDecider.DecideRestore(ctx, assessment)
+		if derr != nil {
+			// A decider FAILURE (a returned error or a timeout — a timeout is a rejection)
+			// fails secure AS a rejection, but stays classifiable: RestoreRejectedError
+			// carries the assessment and wraps the cause (Unwrap), so a caller keeps the
+			// structured drift AND can errors.As/errors.Is through to the underlying error
+			// (e.g. context.DeadlineExceeded). Source is left zero — Error() defaults it to
+			// "policy".
+			return recordErrored(&RestoreRejectedError{Assessment: assessment, Cause: derr})
+		}
+		if !dec.Accept {
+			return recordErrored(&RestoreRejectedError{Assessment: assessment, Source: dec.Source})
+		}
+		// Normalize the ACCEPTING decision so a custom RestoreDecider can never brick a
+		// restore with an invalid durable ConfigurationAdopted (it would fail validation on
+		// EVERY subsequent restore → permanently unrestorable). An accepting decision that
+		// omitted a Source is, by default, a policy decision; an over-long Message/Actor is
+		// TRUNCATED, never rejected — a long audit note must not make the session
+		// unrestorable. Only the accept path builds a durable event; a reject uses dec solely
+		// for RestoreRejectedError. A decider-supplied `migration` source is ALSO normalized to
+		// policy: DecisionSourceMigration is Valid() but reserved for Harness itself (a Phase-2
+		// migration) — a RestoreDecider must never stamp a false migration adoption.
+		if !dec.Source.Valid() || dec.Source == event.DecisionSourceMigration {
+			dec.Source = event.DecisionSourcePolicy
+		}
+		if len(dec.Message) > event.MaxConfigMessageLen {
+			dec.Message = dec.Message[:event.MaxConfigMessageLen]
+		}
+		if len(dec.Actor) > event.MaxConfigActorLen {
+			dec.Actor = dec.Actor[:event.MaxConfigActorLen]
+		}
+		decision = dec
+		// Context is stale iff a real config difference exists — a pure baseline upgrade with
+		// no changes keeps the durable context measurement.
+		newPathStale = len(assessment.Changes) > 0
+		adoptOnAccept = len(assessment.Changes) > 0 || assessment.BaselineUpgrade
 	}
 	// Stand up the delegation manager BEFORE binding any loop so each restored loop's
 	// Subagent tool is bound against a parent-scoped controller; it is attached to the
@@ -266,14 +381,33 @@ func restoreTopologySession(
 		withResolvedPlacement(resolved)(probe)
 	}
 
-	manager := newDelegationManager(topology)
+	var manager *delegationManager
+	if probe.runtimeCatalogProvider != nil {
+		manager = newDelegationManagerWithCatalogProvider(topology, probe.runtimeCatalogProvider)
+	} else if probe.hasRuntimeCatalog {
+		manager = newDelegationManager(topology, probe.runtimeCatalog)
+	} else {
+		manager = newDelegationManager(topology)
+	}
 	contextDisposition := func(bound loop.BoundDefinition) (bool, error) {
+		if newPath {
+			// The NEW-path decision (above) already assessed drift; context staleness reuses
+			// that result so the fold never re-derives it.
+			return newPathStale, nil
+		}
 		if probe.frozenFingerprint != nil {
 			return frozenContextStale, nil
 		}
 		return restoredContextDisposition(persisted, probe.projectFingerprint(bound), allowMismatch)
 	}
-	plans, activePlan, err := planLoops(sessionCtx, sessionID, topology, activeDefinition, roots, starts, allRecords, allowMismatch, contextDisposition, manager, probe.securityLimit, probe.newWorkspaceBinding)
+	// On the NEW path the AgentName difference is decided by the decider (folded into the
+	// assessment above), never hard-failed at bind time, so planLoops must not reject it —
+	// it relaxes the same name check WithAllowConfigMismatch relaxes.
+	planAllowMismatch := allowMismatch
+	if newPath {
+		planAllowMismatch = true
+	}
+	plans, activePlan, err := planLoops(sessionCtx, sessionID, topology, activeDefinition, roots, starts, allRecords, planAllowMismatch, contextDisposition, manager, probe.newWorkspaceBinding)
 	if err != nil {
 		return recordErrored(err)
 	}
@@ -292,10 +426,6 @@ func restoreTopologySession(
 	// session-scoped. Consumed at the pre-RestoreDone seam below.
 	wsRef, hasWorkspacePointer := effectiveCurrentWorkspace(all)
 
-	// The last durable security limit ordinal to re-seed on resume (if the session ever
-	// changed it) — folded from the SAME unnarrowed discovery drain (SecurityLimitChanged
-	// is session-scoped), last write wins. Absent means the session resumes at the fail-
-	// secure most-restrictive default. Seeded into the restored session below.
 	// Gate recovery folds the same record replay so private GatePreparedRecord payloads are
 	// visible. Unsupported or payload-less open gates are durably closed below, after
 	// RestoreStarted, before RestoreDone makes the restored session reachable.
@@ -306,6 +436,31 @@ func restoreTopologySession(
 		Header: event.Header{Coordinates: identity.Coordinates{SessionID: sessionID}},
 	}); err != nil {
 		return recordErrored(&RestoreError{Kind: RestoreAppendFailed, Cause: err})
+	}
+	// Durable adoption (NEW path, on accept, when the configuration actually changed or the
+	// baseline schema was upgraded): appended AFTER RestoreStarted and BEFORE RestoreDone
+	// through the SAME lease-checked journal that appends RestoreStarted, so the session
+	// never comes up under an unrecorded configuration. A failed append aborts the restore
+	// through the same fail-secure exit.
+	if newPath && adoptOnAccept {
+		prevFingerprint := ""
+		if baseline.Manifest.SchemaVersion >= 1 {
+			prevFingerprint = baseline.Manifest.Fingerprint()
+		}
+		adopted := event.ConfigurationAdopted{
+			Header:              event.Header{Coordinates: identity.Coordinates{SessionID: sessionID}},
+			Epoch:               baseline.Epoch + 1,
+			PreviousFingerprint: prevFingerprint,
+			AdoptedFingerprint:  candidate.Fingerprint(),
+			Manifest:            candidate,
+			Drift:               assessment.Changes,
+			Source:              decision.Source,
+			Actor:               decision.Actor,
+			Message:             decision.Message,
+		}
+		if err := appendConfigurationAdopted(ctx, j, factory, adopted); err != nil {
+			return recordErrored(err)
+		}
 	}
 	if err := appendCompactWaiterRepairs(ctx, j, factory, compactWaiterRepairs); err != nil {
 		return recordErrored(&RestoreError{Kind: RestoreAppendFailed, Cause: err})
@@ -342,12 +497,6 @@ func restoreTopologySession(
 		}
 		crashClosures = append(crashClosures, closure)
 	}
-	// Correlation is seeded only after every checked crash closure committed, so an open
-	// wait:false request resolves as Interrupted after restore rather than unknown.
-	if err := seedResolvedDelegateRecords(manager, allRecords, all, crashClosures); err != nil {
-		return recordErrored(&RestoreError{Kind: RestoreReplayFailed, Cause: err})
-	}
-
 	// (6b) Materialize the workspace ref selected by the latest durable transition BEFORE
 	// declaring the restore done, so
 	// RestoreDone is appended only if the workspace is also restored (fail closed — the
@@ -378,7 +527,7 @@ func restoreTopologySession(
 	// re-acquire without waiting out the TTL. We append WithLeaseRelease AFTER the caller's
 	// opts so the restore owns the lease lifecycle (a caller cannot accidentally override
 	// the releaser with a stale one).
-	leaseOpts := append(append([]Option(nil), opts...), WithSecurityLimit(probe.securityLimit), WithLeaseRelease(lease.Release))
+	leaseOpts := append(append([]Option(nil), opts...), WithLeaseRelease(lease.Release))
 	if resolved != nil {
 		// Hand the restored session the coordinator + exclusive root-lease release so its
 		// Shutdown releases the root lease before the session lease (LIFO), and so its loops'
@@ -394,7 +543,7 @@ func restoreTopologySession(
 	// stamped it on LoopStarted; late-bound adapters record it with ForeignSessionBound.
 	// buildRestoredSession fails closed on an empty sid for a foreign engine.
 	foreignSID := findForeignSID(rootEvents)
-	s, err := buildRestoredSession(sessionCtx, sessionCancel, bound, activePlan.bindings, sessionID, rootLoopID, foreignSID, spawnedCount, securityLevel, hasSecurityLimit, folded, activeInference, restoredGates.open, j, factory, newID, now, leaseOpts...)
+	s, err := buildRestoredSession(sessionCtx, sessionCancel, bound, activePlan.bindings, sessionID, rootLoopID, foreignSID, spawnedCount, folded, activeInference, restoredGates.open, j, factory, newID, now, leaseOpts...)
 	if err != nil {
 		if constructionCleanupOwned(err) {
 			return nil, err
@@ -412,6 +561,20 @@ func restoreTopologySession(
 	// session context (tearing down the seeded loops) before recording a RestoreErrored.
 	if err := attachAndActivate(s, all, plans, rootLoopID); err != nil {
 		return abortAccepted(s, err)
+	}
+	// Correlation is seeded only after every checked crash closure committed AND every
+	// restored loop was attached. A child can fail during restored backend construction
+	// after the initial fold (and be tombstoned by attachAndActivate), so seeding before
+	// attachment would leave that child's durable requests with stale Interrupted or
+	// Completed results instead of Failed.
+	tombstoned := make(map[uuid.UUID]struct{})
+	for _, plan := range plans {
+		if plan.tombstoned || plan.runtimeMismatch != nil {
+			tombstoned[plan.started.LoopID] = struct{}{}
+		}
+	}
+	if err := seedResolvedDelegateRecords(manager, allRecords, all, crashClosures, tombstoned); err != nil {
+		return abortAccepted(s, &RestoreError{Kind: RestoreReplayFailed, Cause: err})
 	}
 	// RestoreDone is the commit point: every loop is bound, crash-closed, built,
 	// attached, and the active selection has been validated before this append.
@@ -451,16 +614,19 @@ func runRestoreFailureCleanup(timeout time.Duration, appendErrored func(context.
 // turnIndex + open-turn flag). planLoops builds one per durable loop; the restore
 // constructor crash-closes, seeds, and attaches from these.
 type loopPlan struct {
-	started event.LoopStarted
-	bound   loop.BoundDefinition
+	started    event.LoopStarted
+	definition loop.Definition
+	bound      loop.BoundDefinition
 	// bindings is the EXACT tool.Bindings this loop was bound with. It is retained so a
 	// later external-toolset replacement builds its tools with the same capabilities (and
 	// the same WorkspaceObservations instance) the declared tools got — rebuilding a fresh
 	// binding would hand external tools a separate observation set and break TOCTOU
 	// tracking across the toolset.
-	bindings tool.Bindings
-	events   []event.Event
-	folded   foldResult
+	bindings        tool.Bindings
+	events          []event.Event
+	folded          foldResult
+	runtimeMismatch *RestoreRuntimeMismatchError
+	tombstoned      bool
 }
 
 // discoverRoots scans the full UNNARROWED replay for every LoopStarted, collecting the
@@ -519,9 +685,8 @@ func discoverRoots(all []event.Event, topology Topology, allowMismatch bool) (ma
 // unknown (subagents of a single-definition run). It is the single Bind of each loop,
 // performed inside the restore lease. It returns the ordered plans and the active plan, or a
 // typed error the caller records as a RestoreErrored.
-func planLoops(sessionCtx context.Context, sessionID uuid.UUID, topology Topology, activeDefinition loop.Definition, roots map[identity.AgentName]event.LoopStarted, starts []event.LoopStarted, allRecords []journal.JournalRecord, allowMismatch bool, contextDisposition func(loop.BoundDefinition) (bool, error), manager *delegationManager, securityLimitSource security.LimitSource, wsBind func() *tool.WorkspaceBinding) ([]loopPlan, loopPlan, error) {
+func planLoops(sessionCtx context.Context, sessionID uuid.UUID, topology Topology, activeDefinition loop.Definition, roots map[identity.AgentName]event.LoopStarted, starts []event.LoopStarted, allRecords []journal.JournalRecord, allowMismatch bool, contextDisposition func(loop.BoundDefinition) (bool, error), manager *delegationManager, wsBind func() *tool.WorkspaceBinding) ([]loopPlan, loopPlan, error) {
 	plans := make([]loopPlan, 0, len(starts))
-	boundByLoop := make(map[uuid.UUID]loop.BoundDefinition, len(starts))
 	activeIndex := -1
 	for _, started := range starts {
 		definition, ok := topology.definition(started.AgentName)
@@ -539,7 +704,7 @@ func planLoops(sessionCtx context.Context, sessionID uuid.UUID, topology Topolog
 			// invents a missing definition here).
 			return nil, loopPlan{}, &RestoreError{Kind: RestoreLoopFailed, Cause: &AgentNameMismatchError{Persisted: started.AgentName}}
 		}
-		bindings := tool.Bindings{SessionID: sessionID, LoopID: started.LoopID, SecurityLimit: securityLimitSource, Workspace: wsBind(), Delegate: manager.controllerFor(started.LoopID, definition), ExtraTools: delegateExtraTools(definition, manager)}
+		bindings := tool.Bindings{SessionID: sessionID, LoopID: started.LoopID, Workspace: wsBind(), Delegate: manager.controllerFor(started.LoopID, definition), ExtraTools: delegateExtraTools(definition, manager)}
 		bound, bindErr := definition.Bind(sessionCtx, bindings)
 		if bindErr != nil {
 			return nil, loopPlan{}, &RestoreError{Kind: RestoreLoopFailed, Cause: bindErr}
@@ -547,17 +712,12 @@ func planLoops(sessionCtx context.Context, sessionID uuid.UUID, topology Topolog
 		if nameErr := checkAgentName(started.AgentName, bound.Name(), allowMismatch); nameErr != nil {
 			return nil, loopPlan{}, nameErr
 		}
-		if parentID := started.Cause.Coordinates.LoopID; !parentID.IsZero() {
-			parentBound := boundByLoop[parentID]
-			var parentPermission loop.PermissionGate
-			if parentBound != nil {
-				parentPermission = parentBound.Permission()
-			}
-			bound = loop.AttenuateBoundPermission(bound, parentPermission)
-		}
-		boundByLoop[started.LoopID] = bound
+		// A restored subagent keeps its OWN definition's access gate: authority
+		// differences between loops are expressed by the consumer configuring
+		// different gates per definition (or OverrideBoundAccess at a binding
+		// seam), never by harness-side attenuation against the parent.
 		loopEvents := eventsFromRecords(allRecords, started.LoopID)
-		plans = append(plans, loopPlan{started: started, bound: bound, bindings: bindings, events: loopEvents})
+		plans = append(plans, loopPlan{started: started, definition: definition, bound: bound, bindings: bindings, events: loopEvents})
 		if started.LoopID == roots[topology.ActivePrimer].LoopID {
 			activeIndex = len(plans) - 1
 		}
@@ -575,8 +735,90 @@ func planLoops(sessionCtx context.Context, sessionID uuid.UUID, topology Topolog
 			return nil, loopPlan{}, foldErr
 		}
 		plans[i].folded = folded
+		ri := foldLoopInference(plans[i].events)
+		catalog, hasCatalog := manager.catalogFor(plans[i].definition)
+		bound, runtimeErr := restoreRuntimeBinding(plans[i].started, plans[i].bound, ri, catalog, hasCatalog, findForeignSID(plans[i].events) != "")
+		if runtimeErr != nil {
+			var mismatch *RestoreRuntimeMismatchError
+			if !errors.As(runtimeErr, &mismatch) || i == activeIndex {
+				return nil, loopPlan{}, runtimeErr
+			}
+			plans[i].runtimeMismatch = mismatch
+		} else {
+			plans[i].bound = bound
+		}
+		plans[i].tombstoned = hasLoopRestoreTombstone(plans[i].events)
+		if plans[i].tombstoned && i == activeIndex {
+			return nil, loopPlan{}, &RestoreError{Kind: RestoreLoopFailed, Cause: &SessionError{Kind: SessionLoopExited}}
+		}
 	}
 	return plans, plans[activeIndex], nil
+}
+
+func hasLoopRestoreTombstone(events []event.Event) bool {
+	for _, ev := range events {
+		if _, ok := ev.(event.LoopRestoreTombstoned); ok {
+			return true
+		}
+	}
+	return false
+}
+
+// restoreRuntimeBinding re-authorizes a durable adapter selection against the
+// current parent-scoped catalog before any backend constructor observes Engine.
+// A journaled AgentRuntime is authoritative even when the current definition
+// initially binds as native; OverrideBoundRuntimeSelection turns that view into
+// the adapter view only after every durable selector and target identity matches.
+func restoreRuntimeBinding(started event.LoopStarted, bound loop.BoundDefinition, ri restoredInference, catalog loop.RuntimeCatalog, hasCatalog bool, hasForeignSID bool) (loop.BoundDefinition, error) {
+	if ri.AgentRuntime == nil {
+		if bound.Engine() != loop.EngineNative || hasForeignSID {
+			return nil, &RestoreRuntimeMismatchError{Kind: RestoreRuntimeMissing}
+		}
+		return bound, nil
+	}
+	if !hasCatalog {
+		return nil, &RestoreRuntimeMismatchError{Kind: RestoreRuntimeUnavailable}
+	}
+	if !ri.HasRuntime {
+		return nil, &RestoreRuntimeMismatchError{Kind: RestoreRuntimeTargetMismatch}
+	}
+	runtime := ri.AgentRuntime
+	resolved, err := catalog.ResolveTargetAlias(
+		started.AgentName,
+		loop.AgentHarnessName(runtime.Harness),
+		loop.ModelAlias(runtime.ModelAlias),
+		ri.Runtime.Effort,
+	)
+	if err != nil {
+		return nil, &RestoreRuntimeMismatchError{Kind: RestoreRuntimeUnavailable, Cause: err}
+	}
+	if resolved.Profile != loop.RuntimeProfileName(runtime.Profile) ||
+		resolved.AgentHarness != loop.AgentHarnessName(runtime.Harness) ||
+		resolved.SmallModel != loop.ModelAlias(runtime.SmallModelAlias) {
+		return nil, &RestoreRuntimeMismatchError{Kind: RestoreRuntimeUnavailable}
+	}
+	if string(resolved.Credential) != runtime.CredentialMode {
+		return nil, &RestoreRuntimeMismatchError{Kind: RestoreRuntimeCredentialMismatch}
+	}
+	if resolved.Target.Key() != ri.Runtime.Key {
+		return nil, &RestoreRuntimeMismatchError{Kind: RestoreRuntimeTargetMismatch}
+	}
+	if resolved.Effort != ri.Runtime.Effort {
+		return nil, &RestoreRuntimeMismatchError{Kind: RestoreRuntimeEffortMismatch}
+	}
+	runtimeAlias := resolved.TargetAlias
+	if runtimeAlias == "" {
+		runtimeAlias = resolved.ModelAlias
+	}
+	bound, err = loop.OverrideBoundRuntimeSelection(bound, resolved.Profile, runtimeAlias, resolved.Target, resolved.Effort)
+	if err != nil {
+		return nil, &RestoreRuntimeMismatchError{Kind: RestoreRuntimeUnavailable}
+	}
+	bound, err = loop.OverrideBoundRuntimeCatalog(bound, catalog)
+	if err != nil {
+		return nil, &RestoreRuntimeMismatchError{Kind: RestoreRuntimeUnavailable}
+	}
+	return bound, nil
 }
 
 // attachAndActivate registers every non-root restored loop, resolves the durable active
@@ -587,19 +829,45 @@ func planLoops(sessionCtx context.Context, sessionID uuid.UUID, topology Topolog
 // fault); the caller cancels the session context and records a RestoreErrored. On success
 // s.activeLoopID reflects the durable active loop.
 func attachAndActivate(s *Session, all []event.Event, plans []loopPlan, rootLoopID uuid.UUID) error {
-	for _, plan := range plans {
+	for i := range plans {
+		plan := &plans[i]
 		if plan.started.LoopID == rootLoopID {
 			continue
 		}
 		parent := loop.Provenance{LoopID: plan.started.Cause.Coordinates.LoopID, TurnID: plan.started.Cause.Coordinates.TurnID, StepID: plan.started.Cause.Coordinates.StepID}
+		if plan.runtimeMismatch != nil || plan.tombstoned {
+			if err := s.attachRestoredTombstonedLoop(*plan, parent); err != nil {
+				return err
+			}
+			continue
+		}
 		if err := s.attachRestoredLoop(plan.started, parent, plan.bound, plan.bindings, plan.folded, foldLoopInference(plan.events), findForeignSID(plan.events)); err != nil {
-			return err
+			mismatch, runtimeFailure := classifyRestoredChildRuntimeFailure(err)
+			if !runtimeFailure {
+				return err
+			}
+			// A runtime-classified failure can arise after the preflight fold (for
+			// example, an adapter session/load failure). Keep the same per-child
+			// degraded-restore rule as catalog drift: preserve the folded child
+			// identity, publish one bounded tombstone, and continue restoring
+			// siblings. The active-loop check below still makes an active child
+			// failure session-fatal.
+			plan.runtimeMismatch = mismatch
+			if tombstoneErr := s.attachRestoredTombstonedLoop(*plan, parent); tombstoneErr != nil {
+				return tombstoneErr
+			}
+			plan.tombstoned = true
 		}
 	}
 	activeID := rootLoopID
 	for _, ev := range all {
 		if changed, ok := ev.(event.ActiveLoopChanged); ok {
 			activeID = changed.ActiveLoopID
+		}
+	}
+	for _, plan := range plans {
+		if (plan.tombstoned || plan.runtimeMismatch != nil) && plan.started.LoopID == activeID {
+			return &RestoreError{Kind: RestoreLoopFailed, Cause: &SessionError{Kind: SessionLoopExited}}
 		}
 	}
 	if _, ok := s.Loop(activeID); !ok {
@@ -614,6 +882,72 @@ func attachAndActivate(s *Session, all []event.Event, plans []loopPlan, rootLoop
 	}
 	s.loopsMu.Unlock()
 	return nil
+}
+
+func classifyRestoredChildRuntimeFailure(err error) (*RestoreRuntimeMismatchError, bool) {
+	var mismatch *RestoreRuntimeMismatchError
+	if errors.As(err, &mismatch) {
+		return mismatch, true
+	}
+	var restoreErr *RestoreError
+	if !errors.As(err, &restoreErr) {
+		return nil, false
+	}
+	switch restoreErr.Kind {
+	case RestoreForeignBuilderMissing, RestoreForeignSIDMissing:
+		return &RestoreRuntimeMismatchError{Kind: RestoreRuntimeUnavailable}, true
+	default:
+		return nil, false
+	}
+}
+
+func (s *Session) attachRestoredTombstonedLoop(plan loopPlan, parent loop.Provenance) error {
+	var tombstone event.LoopRestoreTombstoned
+	if !plan.tombstoned {
+		hdr, err := s.factory.Stamp(event.Header{Coordinates: identity.Coordinates{SessionID: s.sessionID, LoopID: plan.started.LoopID}})
+		if err != nil {
+			return &RestoreError{Kind: RestoreIDGenerationFailed, Cause: err}
+		}
+		tombstone = event.LoopRestoreTombstoned{Header: hdr, Category: restoreTombstoneCategory(plan.runtimeMismatch)}
+	}
+	_, cancel := context.WithCancel(s.sessionCtx)
+	liveMode, liveModel := liveViewFor(plan.bound, foldLoopInference(plan.events))
+	handle := &loopHandle{
+		id: plan.started.LoopID, owner: s, bound: plan.bound, bindings: plan.bindings,
+		parent: parent, cancel: cancel, liveMode: liveMode, liveModel: liveModel,
+		state: tool.DelegateStatusFailed, tombstoned: true,
+	}
+	s.loopsMu.Lock()
+	if existing, ok := s.loops[plan.started.LoopID]; ok && existing.tombstoned {
+		s.loopsMu.Unlock()
+		cancel()
+		return nil
+	}
+	s.loops[plan.started.LoopID] = handle
+	s.loopsMu.Unlock()
+	if plan.tombstoned {
+		return nil
+	}
+	// Register the failed handle before fanout. Subscribers may synchronously inspect
+	// ownership/status after receiving the durable tombstone, and must never observe the
+	// event before the loop is addressable.
+	if err := s.PublishEventChecked(context.Background(), tombstone); err != nil {
+		s.loopsMu.Lock()
+		if current, ok := s.loops[plan.started.LoopID]; ok && current == handle {
+			delete(s.loops, plan.started.LoopID)
+		}
+		s.loopsMu.Unlock()
+		cancel()
+		return &RestoreError{Kind: RestoreAppendFailed, Cause: err}
+	}
+	return nil
+}
+
+func restoreTombstoneCategory(mismatch *RestoreRuntimeMismatchError) string {
+	if mismatch != nil && mismatch.Kind == RestoreRuntimeUnavailable {
+		return event.LoopRestoreTombstoneRuntimeUnavailable
+	}
+	return event.LoopRestoreTombstoneRuntimeMismatch
 }
 
 // buildRestoredSession assembles the live Session for a successful restore: the hub
@@ -634,8 +968,6 @@ func buildRestoredSession(
 	sessionID, rootLoopID uuid.UUID,
 	foreignSID string,
 	spawnedCount int,
-	securityLevel security.Level,
-	hasSecurityLimit bool,
 	folded foldResult,
 	ri restoredInference,
 	restoredGates map[gate.ID]gateEntry,
@@ -645,6 +977,10 @@ func buildRestoredSession(
 	now event.Clock,
 	opts ...Option,
 ) (*Session, error) {
+	commandAppender, err := journal.NewJournalCommandAppenderChecked(j)
+	if err != nil {
+		return nil, &RestoreError{Kind: RestoreJournalFailed, Cause: err}
+	}
 	s := &Session{
 		sessionID:                sessionID,
 		sessionCtx:               sessionCtx,
@@ -653,7 +989,7 @@ func buildRestoredSession(
 		loops:                    make(map[uuid.UUID]*loopHandle),
 		newID:                    newID,
 		now:                      now,
-		cmdAppender:              nopCommandAppender{},
+		cmdAppender:              commandAppender,
 		factory:                  factory,
 		// Re-seed the cumulative spawn counter from the durable non-root LoopStarted count
 		// so the quota survives restart (§16.3). Set before the session is reachable, so no
@@ -670,10 +1006,10 @@ func buildRestoredSession(
 		gateAppender:        nopGateAppender{},
 		checkpointAdmission: newCheckpointAdmissionGate(),
 	}
-	// Apply the same opts the probe read (WithCommandAppender wires the durable intent
-	// log; WithAllowConfigMismatch is a no-op here — already consumed; WithLimits sets the
-	// spawn caps the restored session enforces against the re-seeded counter). A nil
-	// appender option leaves the nop default installed.
+	// Apply the same opts the probe read (WithCommandAppender may replace the durable
+	// journal adapter for a direct/test caller; WithAllowConfigMismatch is a no-op here —
+	// already consumed; WithLimits sets the spawn caps the restored session enforces
+	// against the re-seeded counter). A nil appender option leaves the journal adapter.
 	for _, opt := range opts {
 		opt(s)
 	}
@@ -691,17 +1027,6 @@ func buildRestoredSession(
 		return abort(&RestoreError{Kind: RestoreJournalFailed, Cause: err})
 	}
 	s.gateAppender = gateAppender
-	// Default-mint the security limit source (unless WithSecurityLimit injected the shared one),
-	// then re-seed it from the folded SecurityLimitChanged events so the recovered session
-	// — and any checker sharing this source — comes up under the security limit it crashed at (last
-	// write wins). No lock is needed: the session is not yet reachable. An absent security limit
-	// (never changed) leaves the fail-secure most-restrictive default.
-	if s.securityLimit == nil {
-		s.securityLimit = security.New()
-	}
-	if hasSecurityLimit {
-		s.securityLimit.Set(securityLevel)
-	}
 	// Resolve the spawn-cap defaults AFTER the options, mirroring newSession, so a restore
 	// (with or without WithLimits) has positive depth/quota caps from the first NewLoop.
 	s.limits = s.limits.withDefaults()
@@ -713,7 +1038,12 @@ func buildRestoredSession(
 	if err != nil {
 		return abort(&RestoreError{Kind: RestoreJournalFailed, Cause: err})
 	}
-	hubOpts := []hub.Option{hub.WithAppender(appender), hub.WithFactory(factory), hub.WithFaultReporter(s)}
+	hubOpts := []hub.Option{
+		hub.WithAppender(appender),
+		hub.WithFactory(factory),
+		hub.WithFaultReporter(s),
+		hub.WithCommitObserver(s.recordLoopMechanicalState),
+	}
 	s.hub = hub.New(sessionID, hubOpts...)
 	s.gateAppender = &liveGateAppender{prepared: gateAppender, publisher: s}
 	if err := s.bindSessionHustles(); err != nil {
@@ -746,24 +1076,37 @@ func buildRestoredSession(
 		var compactor loopruntime.Compactor
 		compactor, err = s.compactorFor(cfg, rootLoopID)
 		if err == nil {
-			l, err = loopruntime.NewRestoredWithCompactor(
-				loopCtx, sessionID, rootLoopID, loop.Provenance{}, s, cfg, restoredStateFrom(folded, ri), compactor,
+			l, err = loopruntime.NewRestoredWithRuntime(
+				loopCtx,
+				sessionID,
+				rootLoopID,
+				loop.Provenance{},
+				s,
+				cfg,
+				restoredStateFrom(folded, ri),
+				loopruntime.RuntimeDependencies{Compactor: compactor, Hooks: s.hooks, ReviewContext: s.loopReviewContext()},
 			)
 		}
 	default:
-		if foreignSID == "" {
+		agentSessionID := ri.AgentSessionID
+		if agentSessionID == "" {
+			agentSessionID = foreignSID
+		}
+		if agentSessionID == "" {
 			cancel()
 			restoreErr := &RestoreError{Kind: RestoreForeignSIDMissing}
 			return abort(restoreErr)
 		}
-		if s.foreignBuildRestored == nil {
+		restoredBuilder, builderErr := s.restoredBuilder(cfg)
+		if builderErr != nil {
 			cancel()
-			restoreErr := &RestoreError{Kind: RestoreForeignBuilderMissing}
-			return abort(restoreErr)
+			return abort(builderErr)
 		}
-		l, err = s.foreignBuildRestored(loopCtx, sessionID, rootLoopID, loop.Provenance{}, s, cfg,
+		// Legacy journals expose one foreign SID. Phase 6 dedicated journal wiring may
+		// replace the agent-side value with a separately journaled AgentSessionID.
+		l, err = restoredBuilder(loopCtx, sessionID, rootLoopID, loop.Provenance{}, s, cfg,
 			func() (uuid.UUID, error) { return newID() }, factory,
-			foreign.RestoredForeign{ForeignSID: foreignSID, TurnIndex: folded.TurnIndex, Msgs: folded.Msgs})
+			foreign.RestoredForeign{ForeignSID: foreignSID, AgentSessionID: agentSessionID, TurnIndex: folded.TurnIndex, Msgs: folded.Msgs})
 	}
 	if err != nil {
 		cancel()
@@ -772,7 +1115,7 @@ func buildRestoredSession(
 	}
 	liveMode, liveModel := liveViewFor(cfg, ri)
 	// bindings is activePlan.bindings — the EXACT tool.Bindings cfg was bound with in
-	// planLoops (same SecurityLimit source, the same WorkspaceBinding instance, and this
+	// planLoops (the same WorkspaceBinding instance and this
 	// loop's scoped delegate controller). Retaining it here is what lets a later
 	// ReplaceExternalTools build its tools with the capabilities the declared tools got,
 	// exactly as the live path (session.go) and attachRestoredLoop do for every other loop.
@@ -795,6 +1138,29 @@ func appendRestoreEvent(ctx context.Context, j journal.SessionJournal, factory *
 	}
 	if _, err := j.Append(ctx, journal.NewEventRecord(withRestoreHeader(ev, stamped))); err != nil {
 		return err
+	}
+	return nil
+}
+
+// appendConfigurationAdopted stamps (fresh EventID + CreatedAt, preserving the
+// session-scoped Coordinates) and validates a ConfigurationAdopted, then appends it through
+// the lease-checked journal. It is the restore-lifecycle counterpart to appendRestoreEvent
+// for the one event appendRestoreEvent's withRestoreHeader does not handle; a mint or
+// validation failure surfaces as a typed restore error the caller records as a
+// RestoreErrored. A build/validation failure and a journal-append failure are named
+// distinctly (RestoreAdoptionInvalid vs RestoreAppendFailed) so a caller can tell a
+// malformed adoption apart from a lost lease or storage error.
+func appendConfigurationAdopted(ctx context.Context, j journal.SessionJournal, factory *event.Factory, adopted event.ConfigurationAdopted) error {
+	hdr, err := factory.Stamp(adopted.EventHeader())
+	if err != nil {
+		return &RestoreError{Kind: RestoreIDGenerationFailed, Cause: err}
+	}
+	adopted.Header = hdr
+	if err := event.ValidateEvent(adopted); err != nil {
+		return &RestoreError{Kind: RestoreAdoptionInvalid, Cause: err}
+	}
+	if _, err := j.Append(ctx, journal.NewEventRecord(adopted)); err != nil {
+		return &RestoreError{Kind: RestoreAppendFailed, Cause: err}
 	}
 	return nil
 }

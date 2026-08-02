@@ -1,8 +1,10 @@
 package hustle
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"math"
@@ -10,15 +12,42 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/looprig/core/uuid"
+	"github.com/looprig/harness/pkg/tool"
 	"github.com/looprig/inference"
 	model "github.com/looprig/inference/model"
 )
 
 const (
-	maxPayloadBytes    = 16 * 1024 * 1024
-	reservedNamePrefix = "_looprig."
+	maxPayloadBytes                  = 16 * 1024 * 1024
+	maxOutputSchemaNameBytes         = 64
+	maxStructuredOutputRevisionBytes = 128
+	maxToolLoopCount                 = 4096
+	reservedNamePrefix               = "_looprig."
+)
+
+const (
+	// MaxEvidenceToolDefinitions bounds the number of definitions in one
+	// evidence policy before any catalog-sized allocation or digest work.
+	MaxEvidenceToolDefinitions = 64
+	// MaxEvidenceProducedToolNames bounds all concrete tool names declared by
+	// one evidence policy, including names spread across bundle definitions.
+	MaxEvidenceProducedToolNames = 128
+	// MaxEvidenceToolNameBytes bounds definition and concrete tool names by
+	// encoded UTF-8 bytes, not runes.
+	MaxEvidenceToolNameBytes = 64
+	// MaxEvidenceToolPolicyRevisionBytes bounds the canonical policy revision
+	// by encoded UTF-8 bytes.
+	MaxEvidenceToolPolicyRevisionBytes = 128
+)
+
+const (
+	evidencePolicyDigestDomain            = "looprig/hustle/evidence-policy/v1"
+	evidenceDefinitionCatalogDigestDomain = "looprig/hustle/evidence-definition-catalog/v1"
+	evidenceProducedNamesDigestDomain     = "looprig/hustle/evidence-produced-names/v1"
+	boundEvidenceToolDigestDomain         = "looprig/hustle/bound-evidence-tool/v1"
 )
 
 // Name is the stable registration name of one hustle definition.
@@ -62,6 +91,30 @@ type Limits struct {
 	OutputBytes int
 }
 
+// ToolLoopLimits bounds one opt-in evidence-tool conversation. Every field is
+// required for an enabled policy; the zero value means evidence tools are off.
+type ToolLoopLimits struct {
+	MaxRounds        int
+	MaxCalls         int
+	MaxCallsPerRound int
+	MaxResultBytes   int
+	MaxEvidenceBytes int
+}
+
+// EvidenceToolPolicy is the immutable-definition input for a bounded evidence
+// loop. Definitions are copied when the option is created and by Clone.
+type EvidenceToolPolicy struct {
+	Revision    string
+	Limits      ToolLoopLimits
+	Definitions []tool.Definition
+}
+
+// Clone returns a policy with an independently owned definition slice.
+func (p EvidenceToolPolicy) Clone() EvidenceToolPolicy {
+	p.Definitions = append([]tool.Definition(nil), p.Definitions...)
+	return p
+}
+
 // InferenceBinding pairs a client with its validated, secret-free model.
 type InferenceBinding struct {
 	Client inference.Client
@@ -78,6 +131,16 @@ type Bindings struct {
 	Models ModelResolver
 }
 
+// EvidenceBindings supplies only the invocation origin and structurally
+// read-only workspace capability needed to build one run's evidence catalog.
+// It intentionally cannot carry mutation, delegation, gate, grant, session,
+// observation, or loop-control capabilities.
+type EvidenceBindings struct {
+	SessionID     uuid.UUID
+	LoopID        uuid.UUID
+	ReadWorkspace *tool.ReadWorkspaceBinding
+}
+
 // DefinitionDescriptor is the complete secret-free behavioral projection used
 // by rig identity and durable audit records.
 type DefinitionDescriptor struct {
@@ -88,9 +151,21 @@ type DefinitionDescriptor struct {
 	NamedModelPolicyRevision string
 	PromptRevision           string
 	PromptSHA256             [sha256.Size]byte
-	PolicyRevision           string
-	TimeoutNanos             int64
-	Limits                   Limits
+	OutputSchemaName         string `json:",omitzero"`
+	// OutputSchemaSHA256 covers Description, compact Schema JSON, and Strict.
+	// It is a behavioral digest; no raw output policy crosses this boundary.
+	OutputSchemaSHA256              [sha256.Size]byte `json:",omitzero"`
+	StructuredOutputRevision        string            `json:",omitzero"`
+	PolicyRevision                  string
+	TimeoutNanos                    int64
+	Limits                          Limits
+	EvidenceToolPolicyRevision      string            `json:",omitzero"`
+	EvidenceToolDefinitionsSHA256   [sha256.Size]byte `json:",omitzero"`
+	EvidenceProducedToolNamesSHA256 [sha256.Size]byte `json:",omitzero"`
+	EvidenceToolLimits              ToolLoopLimits    `json:",omitzero"`
+	EvidenceToolDefinitionCount     int               `json:",omitzero"`
+	StructuredOutputWithTools       bool              `json:",omitzero"`
+	RetryPolicy                     RetryPolicy       `json:",omitzero"`
 }
 
 // Validate checks the complete descriptor-only constructor domain without
@@ -120,6 +195,16 @@ func (d DefinitionDescriptor) Validate() error {
 	if strings.TrimSpace(d.PolicyRevision) == "" {
 		return &DefinitionError{Kind: DefinitionInvalidPolicyRevision, Field: "policy_revision"}
 	}
+	if err := validateDescriptorOutput(d); err != nil {
+		return err
+	}
+	if err := validateDescriptorEvidenceTools(d); err != nil {
+		return err
+	}
+	if !d.RetryPolicy.Valid() ||
+		d.RetryPolicy != RetryPolicyNone && d.EvidenceToolPolicyRevision == "" {
+		return &DefinitionError{Kind: DefinitionInvalidRetryPolicy, Field: "retry_policy"}
+	}
 	if d.ModelSource == ModelSourceNamed {
 		if err := d.NamedModelKey.Validate(); err != nil {
 			return &DefinitionError{Kind: DefinitionInvalidModel, Field: "named_model_key", Cause: err}
@@ -135,6 +220,84 @@ func (d DefinitionDescriptor) Validate() error {
 	return nil
 }
 
+func validateDescriptorEvidenceTools(descriptor DefinitionDescriptor) error {
+	zeroDigest := [sha256.Size]byte{}
+	hasEvidence := descriptor.EvidenceToolPolicyRevision != "" ||
+		descriptor.EvidenceToolDefinitionsSHA256 != zeroDigest ||
+		descriptor.EvidenceProducedToolNamesSHA256 != zeroDigest ||
+		descriptor.EvidenceToolLimits != (ToolLoopLimits{}) ||
+		descriptor.EvidenceToolDefinitionCount != 0 ||
+		descriptor.StructuredOutputWithTools
+	if !hasEvidence {
+		return nil
+	}
+	if err := validateEvidencePolicyRevision(descriptor.EvidenceToolPolicyRevision); err != nil {
+		return err
+	}
+	if descriptor.EvidenceToolDefinitionsSHA256 == zeroDigest {
+		return invalidEvidenceTools("evidence_tool_definitions_sha256")
+	}
+	if descriptor.EvidenceProducedToolNamesSHA256 == zeroDigest {
+		return invalidEvidenceTools("evidence_produced_tool_names_sha256")
+	}
+	if descriptor.EvidenceToolDefinitionCount <= 0 ||
+		descriptor.EvidenceToolDefinitionCount > MaxEvidenceToolDefinitions {
+		return invalidEvidenceTools("evidence_tool_definition_count")
+	}
+	if err := validateToolLoopLimits(descriptor.EvidenceToolLimits); err != nil {
+		return err
+	}
+	if !descriptor.StructuredOutputWithTools {
+		return invalidEvidenceTools("structured_output_with_tools")
+	}
+	if descriptor.OutputSchemaName == "" {
+		return invalidEvidenceTools("output_schema")
+	}
+	if descriptor.Participation != ParticipationBlocking {
+		return invalidEvidenceTools("participation")
+	}
+	return nil
+}
+
+func validateDescriptorOutput(descriptor DefinitionDescriptor) error {
+	zeroDigest := [sha256.Size]byte{}
+	hasOutput := descriptor.OutputSchemaName != "" || descriptor.OutputSchemaSHA256 != zeroDigest || descriptor.StructuredOutputRevision != ""
+	if !hasOutput {
+		return nil
+	}
+	if !validOutputSchemaName(descriptor.OutputSchemaName) {
+		return &DefinitionError{Kind: DefinitionInvalidOutputSchema, Field: "output_schema_name"}
+	}
+	if descriptor.OutputSchemaSHA256 == zeroDigest {
+		return &DefinitionError{Kind: DefinitionInvalidOutputSchema, Field: "output_schema_sha256"}
+	}
+	if strings.TrimSpace(descriptor.StructuredOutputRevision) == "" || len(descriptor.StructuredOutputRevision) > maxStructuredOutputRevisionBytes {
+		return &DefinitionError{Kind: DefinitionInvalidOutputSchema, Field: "structured_output_revision"}
+	}
+	return nil
+}
+
+func validOutputSchemaName(name string) bool {
+	if name == "" || len(name) > maxOutputSchemaNameBytes || name == inference.StructuredOutputToolName {
+		return false
+	}
+	for index := range len(name) {
+		value := name[index]
+		letter := value >= 'A' && value <= 'Z' || value >= 'a' && value <= 'z'
+		if index == 0 {
+			if !letter && value != '_' {
+				return false
+			}
+			continue
+		}
+		digit := value >= '0' && value <= '9'
+		if !letter && !digit && value != '_' && value != '-' {
+			return false
+		}
+	}
+	return true
+}
+
 // Option contributes one immutable definition property.
 type Option func(*definitionOptions) error
 
@@ -147,6 +310,8 @@ type definitionState struct {
 	timeout      time.Duration
 	systemPrompt string
 	named        InferenceBinding
+	output       *inference.OutputSchema
+	evidence     EvidenceToolPolicy
 }
 
 type definitionOptions struct {
@@ -159,6 +324,9 @@ type definitionOptions struct {
 	systemPrompt   string
 	promptRevision string
 	policyRevision string
+	output         *inference.OutputSchema
+	evidence       EvidenceToolPolicy
+	retryPolicy    RetryPolicy
 	seen           map[string]struct{}
 }
 
@@ -260,6 +428,54 @@ func WithPolicyRevision(revision string) Option {
 	}
 }
 
+// WithOutputSchema freezes one optional provider-neutral structured-output
+// policy. The option owns a clone immediately so caller mutations made before
+// Define cannot alter the definition.
+func WithOutputSchema(output inference.OutputSchema) Option {
+	frozen := output.Clone()
+	return func(options *definitionOptions) error {
+		if err := options.singleton("output_schema"); err != nil {
+			return err
+		}
+		clone := frozen.Clone()
+		options.output = &clone
+		return nil
+	}
+}
+
+// WithEvidenceTools enables a bounded evidence-tool loop. The option owns a
+// defensive copy immediately; the zero policy explicitly leaves tools off.
+func WithEvidenceTools(policy EvidenceToolPolicy) Option {
+	if len(policy.Definitions) > MaxEvidenceToolDefinitions {
+		return func(options *definitionOptions) error {
+			if err := options.singleton("evidence_tools"); err != nil {
+				return err
+			}
+			return invalidEvidenceTools("definitions")
+		}
+	}
+	frozen := policy.Clone()
+	return func(options *definitionOptions) error {
+		if err := options.singleton("evidence_tools"); err != nil {
+			return err
+		}
+		options.evidence = frozen.Clone()
+		return nil
+	}
+}
+
+// WithRetryPolicy selects one immutable retry policy. Classified retry is
+// intentionally limited to evidence-backed reviewer definitions.
+func WithRetryPolicy(policy RetryPolicy) Option {
+	return func(options *definitionOptions) error {
+		if err := options.singleton("retry_policy"); err != nil {
+			return err
+		}
+		options.retryPolicy = policy
+		return nil
+	}
+}
+
 // Define validates and freezes one text-only hustle definition.
 func Define(opts ...Option) (Definition, error) {
 	resolved := &definitionOptions{seen: make(map[string]struct{})}
@@ -310,7 +526,138 @@ func validateDefinitionOptions(options *definitionOptions) error {
 	if strings.TrimSpace(options.policyRevision) == "" {
 		return &DefinitionError{Kind: DefinitionInvalidPolicyRevision, Field: "policy_revision"}
 	}
+	if options.output != nil {
+		if err := inference.ValidateOutputSchema(*options.output); err != nil {
+			return &DefinitionError{Kind: DefinitionInvalidOutputSchema, Field: "output_schema", Cause: err}
+		}
+	}
+	if evidencePolicyEnabled(options.evidence) {
+		if err := validateEvidenceToolPolicy(options.evidence); err != nil {
+			return err
+		}
+		if options.output == nil {
+			return invalidEvidenceTools("output_schema")
+		}
+		if options.participation != ParticipationBlocking {
+			return invalidEvidenceTools("participation")
+		}
+	}
+	if !options.retryPolicy.Valid() ||
+		options.retryPolicy != RetryPolicyNone && !evidencePolicyEnabled(options.evidence) {
+		return &DefinitionError{Kind: DefinitionInvalidRetryPolicy, Field: "retry_policy"}
+	}
 	return nil
+}
+
+func validateEvidenceToolPolicy(policy EvidenceToolPolicy) error {
+	if err := validateEvidencePolicyRevision(policy.Revision); err != nil {
+		return err
+	}
+	if err := validateToolLoopLimits(policy.Limits); err != nil {
+		return err
+	}
+	if len(policy.Definitions) == 0 || len(policy.Definitions) > MaxEvidenceToolDefinitions {
+		return invalidEvidenceTools("definitions")
+	}
+	definitionNames := make(map[string]struct{}, len(policy.Definitions))
+	producedNames := make(map[string]struct{}, min(MaxEvidenceProducedToolNames, len(policy.Definitions)))
+	producedNameCount := 0
+	metadataBytes := 0
+	for index, definition := range policy.Definitions {
+		if nilToolDefinition(definition) {
+			return invalidEvidenceTools("definitions[" + strconv.Itoa(index) + "]")
+		}
+		name := definition.Name()
+		if !canonicalEvidenceToolName(name) {
+			return invalidEvidenceTools("definitions[" + strconv.Itoa(index) + "].name")
+		}
+		if _, exists := definitionNames[name]; exists {
+			return invalidEvidenceTools("definitions[" + strconv.Itoa(index) + "].name")
+		}
+		definitionNames[name] = struct{}{}
+		if definition.Requirements()&^tool.RequiresWorkspaceRead != 0 {
+			return invalidEvidenceTools("definitions[" + strconv.Itoa(index) + "].requirements")
+		}
+		names := definition.ProducedToolNames()
+		infos := definition.ToolInfos()
+		if len(names) == 0 {
+			return invalidEvidenceTools("definitions[" + strconv.Itoa(index) + "].produced_tool_names")
+		}
+		if len(infos) == 0 || len(infos) != len(names) {
+			return invalidEvidenceTools("definitions[" + strconv.Itoa(index) + "].tool_infos")
+		}
+		if len(names) > MaxEvidenceProducedToolNames-producedNameCount {
+			return invalidEvidenceTools("produced_tool_names")
+		}
+		producedNameCount += len(names)
+		for nameIndex, producedName := range names {
+			if !canonicalEvidenceToolName(producedName) {
+				return invalidEvidenceTools("definitions[" + strconv.Itoa(index) + "].produced_tool_names[" + strconv.Itoa(nameIndex) + "]")
+			}
+			if _, exists := producedNames[producedName]; exists {
+				return invalidEvidenceTools("definitions[" + strconv.Itoa(index) + "].produced_tool_names[" + strconv.Itoa(nameIndex) + "]")
+			}
+			producedNames[producedName] = struct{}{}
+			canonicalSchema, err := validateEvidenceToolInfo(infos[nameIndex])
+			if err != nil || infos[nameIndex].Name != producedName {
+				return invalidEvidenceTools("definitions[" + strconv.Itoa(index) + "].tool_infos[" + strconv.Itoa(nameIndex) + "]")
+			}
+			for _, size := range []int{len(infos[nameIndex].Name), len(infos[nameIndex].Desc), len(canonicalSchema)} {
+				var withinLimit bool
+				metadataBytes, withinLimit = addEvidenceMetadataBytes(metadataBytes, size)
+				if !withinLimit {
+					return invalidEvidenceTools("tool_metadata")
+				}
+			}
+		}
+	}
+	return nil
+}
+
+func evidencePolicyEnabled(policy EvidenceToolPolicy) bool {
+	return policy.Revision != "" || policy.Limits != (ToolLoopLimits{}) || len(policy.Definitions) != 0
+}
+
+func validateEvidencePolicyRevision(revision string) error {
+	if !utf8.ValidString(revision) || revision == "" || revision != strings.TrimSpace(revision) ||
+		len(revision) > MaxEvidenceToolPolicyRevisionBytes || strings.ContainsRune(revision, '\x00') {
+		return invalidEvidenceTools("evidence_tool_policy_revision")
+	}
+	return nil
+}
+
+func validateToolLoopLimits(limits ToolLoopLimits) error {
+	if limits.MaxRounds <= 0 || limits.MaxRounds > maxToolLoopCount ||
+		limits.MaxCalls <= 0 || limits.MaxCalls > maxToolLoopCount ||
+		limits.MaxCallsPerRound <= 0 || limits.MaxCallsPerRound > limits.MaxCalls ||
+		limits.MaxResultBytes <= 0 || limits.MaxResultBytes > maxPayloadBytes ||
+		limits.MaxEvidenceBytes <= 0 || limits.MaxEvidenceBytes > maxPayloadBytes ||
+		limits.MaxResultBytes > limits.MaxEvidenceBytes {
+		return invalidEvidenceTools("evidence_tool_limits")
+	}
+	return nil
+}
+
+func canonicalEvidenceToolName(name string) bool {
+	return utf8.ValidString(name) && name != "" && len(name) <= MaxEvidenceToolNameBytes &&
+		name == strings.TrimSpace(name) && !strings.ContainsRune(name, '\x00')
+}
+
+func nilToolDefinition(definition tool.Definition) bool {
+	if definition == nil {
+		return true
+	}
+	value := reflect.ValueOf(definition)
+	switch value.Kind() {
+	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Pointer, reflect.Slice:
+		return value.IsNil()
+	default:
+		return false
+	}
+}
+
+func invalidEvidenceTools(field string) error {
+	return &DefinitionError{Kind: DefinitionInvalidEvidenceTools, Field: field}
 }
 
 func validateInferenceBinding(binding InferenceBinding) error {
@@ -373,6 +720,32 @@ func freezeDefinition(options *definitionOptions) (Definition, error) {
 		Name: options.name, Participation: options.participation, ModelSource: options.modelSource,
 		PromptRevision: options.promptRevision, PromptSHA256: sha256.Sum256([]byte(options.systemPrompt)),
 		PolicyRevision: options.policyRevision, TimeoutNanos: int64(options.timeout), Limits: options.limits,
+		RetryPolicy: options.retryPolicy,
+	}
+	var output *inference.OutputSchema
+	if options.output != nil {
+		clone := options.output.Clone()
+		output = &clone
+		outputDigest, err := digestOutputPolicy(clone)
+		if err != nil {
+			return Definition{}, err
+		}
+		descriptor.OutputSchemaName = clone.Name
+		descriptor.OutputSchemaSHA256 = outputDigest
+		descriptor.StructuredOutputRevision = inference.StructuredOutputRevision
+	}
+	evidence := options.evidence.Clone()
+	if evidencePolicyEnabled(evidence) {
+		definitionDigest, namesDigest, err := digestEvidenceToolPolicy(evidence)
+		if err != nil {
+			return Definition{}, err
+		}
+		descriptor.EvidenceToolPolicyRevision = evidence.Revision
+		descriptor.EvidenceToolDefinitionsSHA256 = definitionDigest
+		descriptor.EvidenceProducedToolNamesSHA256 = namesDigest
+		descriptor.EvidenceToolLimits = evidence.Limits
+		descriptor.EvidenceToolDefinitionCount = len(evidence.Definitions)
+		descriptor.StructuredOutputWithTools = true
 	}
 	if options.modelSource == ModelSourceNamed {
 		descriptor.NamedModelKey = named.Model.Key()
@@ -387,8 +760,88 @@ func freezeDefinition(options *definitionOptions) (Definition, error) {
 	}
 	return Definition{state: &definitionState{
 		descriptor: descriptor, policyDigest: policyDigest, timeout: options.timeout,
-		systemPrompt: options.systemPrompt, named: named,
+		systemPrompt: options.systemPrompt, named: named, output: output,
+		evidence: evidence,
 	}}, nil
+}
+
+func digestEvidenceToolPolicy(policy EvidenceToolPolicy) ([sha256.Size]byte, [sha256.Size]byte, error) {
+	definitions := appendCanonicalString(nil, evidenceDefinitionCatalogDigestDomain)
+	definitions = appendCanonicalString(definitions, policy.Revision)
+	definitions = appendToolLoopLimits(definitions, policy.Limits)
+	definitions = binary.BigEndian.AppendUint64(definitions, uint64(len(policy.Definitions)))
+	names := appendCanonicalString(nil, evidenceProducedNamesDigestDomain)
+	names = binary.BigEndian.AppendUint64(names, uint64(len(policy.Definitions)))
+	for _, definition := range policy.Definitions {
+		produced := definition.ProducedToolNames()
+		infos := definition.ToolInfos()
+		if len(produced) == 0 || len(produced) != len(infos) {
+			return [sha256.Size]byte{}, [sha256.Size]byte{}, &RevisionError{}
+		}
+		definitions = appendCanonicalString(definitions, definition.Name())
+		definitions = binary.BigEndian.AppendUint64(definitions, uint64(definition.Requirements()))
+		definitions = binary.BigEndian.AppendUint64(definitions, uint64(len(infos)))
+		names = binary.BigEndian.AppendUint64(names, uint64(len(produced)))
+		for index := range infos {
+			canonicalSchema, err := validateEvidenceToolInfo(infos[index])
+			if err != nil || infos[index].Name != produced[index] {
+				return [sha256.Size]byte{}, [sha256.Size]byte{}, &RevisionError{Cause: err}
+			}
+			definitions = appendCanonicalString(definitions, produced[index])
+			definitions = appendCanonicalString(definitions, infos[index].Desc)
+			definitions = appendCanonicalBytes(definitions, canonicalSchema)
+			names = appendCanonicalString(names, produced[index])
+		}
+	}
+	return sha256.Sum256(definitions), sha256.Sum256(names), nil
+}
+
+func appendToolLoopLimits(material []byte, limits ToolLoopLimits) []byte {
+	material = appendCanonicalInt(material, limits.MaxRounds)
+	material = appendCanonicalInt(material, limits.MaxCalls)
+	material = appendCanonicalInt(material, limits.MaxCallsPerRound)
+	material = appendCanonicalInt(material, limits.MaxResultBytes)
+	return appendCanonicalInt(material, limits.MaxEvidenceBytes)
+}
+
+func appendCanonicalString(material []byte, value string) []byte {
+	return appendCanonicalBytes(material, []byte(value))
+}
+
+func appendCanonicalBytes(material, value []byte) []byte {
+	material = binary.BigEndian.AppendUint64(material, uint64(len(value)))
+	return append(material, value...)
+}
+
+func appendCanonicalInt(material []byte, value int) []byte {
+	// #nosec G115 -- validated non-negative policy values fit into int64.
+	return binary.BigEndian.AppendUint64(material, uint64(value))
+}
+
+// digestOutputPolicy hashes the deterministic, secret-free identity of every
+// model-facing output-policy field except Name, which is carried separately in
+// the descriptor. Schema JSON is compacted first, so insignificant whitespace
+// cannot create policy drift. Description and Strict are included because both
+// affect provider behavior; only their digest crosses the durable boundary.
+func digestOutputPolicy(output inference.OutputSchema) ([sha256.Size]byte, error) {
+	var compactSchema bytes.Buffer
+	if err := json.Compact(&compactSchema, output.Schema); err != nil {
+		return [sha256.Size]byte{}, &RevisionError{Cause: err}
+	}
+	projection := struct {
+		Description string          `json:"description"`
+		Schema      json.RawMessage `json:"schema"`
+		Strict      bool            `json:"strict"`
+	}{
+		Description: output.Description,
+		Schema:      compactSchema.Bytes(),
+		Strict:      output.Strict,
+	}
+	encoded, err := json.Marshal(projection)
+	if err != nil {
+		return [sha256.Size]byte{}, &RevisionError{Cause: err}
+	}
+	return sha256.Sum256(encoded), nil
 }
 
 func digestModelPolicy(model model.Model) (string, error) {
@@ -404,6 +857,11 @@ func digestDescriptorPolicy(descriptor DefinitionDescriptor) (string, error) {
 	encoded, err := json.Marshal(descriptor)
 	if err != nil {
 		return "", &RevisionError{Cause: err}
+	}
+	if descriptor.EvidenceToolPolicyRevision != "" {
+		material := appendCanonicalString(nil, evidencePolicyDigestDomain)
+		material = appendCanonicalBytes(material, encoded)
+		encoded = material
 	}
 	digest := sha256.Sum256(encoded)
 	return hex.EncodeToString(digest[:]), nil
@@ -457,6 +915,23 @@ func (d Definition) PolicyRevision() string {
 	return d.state.policyDigest
 }
 
+// RetryPolicy returns the immutable bounded retry behavior.
+func (d Definition) RetryPolicy() RetryPolicy {
+	if d.state == nil {
+		return RetryPolicyNone
+	}
+	return d.state.descriptor.RetryPolicy
+}
+
+// EvidenceToolPolicy returns an independently owned policy slice when evidence
+// tools are enabled.
+func (d Definition) EvidenceToolPolicy() (EvidenceToolPolicy, bool) {
+	if d.state == nil || !evidencePolicyEnabled(d.state.evidence) {
+		return EvidenceToolPolicy{}, false
+	}
+	return d.state.evidence.Clone(), true
+}
+
 // Bind validates runtime collaborators and returns a read-only bound view.
 func (d Definition) Bind(ctx context.Context, bindings Bindings) (BoundDefinition, error) {
 	if d.state == nil {
@@ -480,6 +955,10 @@ type BoundDefinition interface {
 	Descriptor() DefinitionDescriptor
 	ResolveInference(context.Context, uuid.UUID) (InferenceBinding, error)
 	SystemPrompt() string
+	OutputSchema() (*inference.OutputSchema, bool)
+	EvidenceToolPolicy() (EvidenceToolPolicy, bool)
+	RetryPolicy() RetryPolicy
+	BindEvidenceTools(context.Context, EvidenceBindings) ([]BoundEvidenceTool, error)
 	boundDefinition()
 }
 
@@ -494,7 +973,29 @@ func (b *boundDefinitionState) Timeout() time.Duration           { return b.defi
 func (b *boundDefinitionState) Limits() Limits                   { return b.definition.Limits() }
 func (b *boundDefinitionState) Descriptor() DefinitionDescriptor { return b.definition.Descriptor() }
 func (b *boundDefinitionState) SystemPrompt() string             { return b.definition.state.systemPrompt }
-func (*boundDefinitionState) boundDefinition()                   {}
+func (b *boundDefinitionState) EvidenceToolPolicy() (EvidenceToolPolicy, bool) {
+	return b.definition.EvidenceToolPolicy()
+}
+func (b *boundDefinitionState) RetryPolicy() RetryPolicy { return b.definition.RetryPolicy() }
+func (b *boundDefinitionState) BindEvidenceTools(
+	ctx context.Context,
+	bindings EvidenceBindings,
+) ([]BoundEvidenceTool, error) {
+	if b == nil {
+		return nil, &BindError{Kind: BindInvalidDefinition}
+	}
+	return bindEvidenceTools(ctx, b.definition.state.evidence, bindings)
+}
+func (*boundDefinitionState) boundDefinition() {}
+
+// OutputSchema returns a fresh clone of the immutable structured-output policy.
+func (b *boundDefinitionState) OutputSchema() (*inference.OutputSchema, bool) {
+	if b.definition.state.output == nil {
+		return nil, false
+	}
+	clone := b.definition.state.output.Clone()
+	return &clone, true
+}
 
 // ResolveInference returns a fresh model clone. Current-loop definitions call
 // their exact UUID resolver on every invocation and never fall back.

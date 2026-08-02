@@ -12,6 +12,7 @@ import (
 	"github.com/looprig/harness/pkg/command"
 	"github.com/looprig/harness/pkg/event"
 	gatedomain "github.com/looprig/harness/pkg/gate"
+	"github.com/looprig/harness/pkg/hook"
 	"github.com/looprig/harness/pkg/identity"
 	"github.com/looprig/harness/pkg/loop"
 	"github.com/looprig/harness/pkg/tool"
@@ -52,6 +53,12 @@ type Loop struct {
 	// defensive clone. It is the restore-verification + dormant-snapshot read primitive
 	// (see Snapshot). The actor is the sole reader, selecting on it alongside commands.
 	snapshots chan<- snapshotRequest
+
+	// hooks retains the immutable runner installed in the actor configuration.
+	// The actor executes from loopConfig.cfg; retaining the same pointer on the
+	// handle makes native/foreign construction isolation inspectable without
+	// exposing hook configuration through loop.Backend.
+	hooks *hook.Runner
 }
 
 // CommandSink returns the actor's command input.
@@ -148,6 +155,14 @@ type loopConfig struct {
 	// gates is the session-owned durable gate registrar. Loop-only tests that wire
 	// only an eventPublisher use nopGateRegistrar.
 	gates gateRegistrar
+
+	// reviewStarter is the session-owned permission-review seam (nil unless the
+	// events publisher also implements permissionReviewStarter). The actor calls
+	// it, fire-and-forget, immediately after a gatePermission registration
+	// activates — see the gateReg case in runLoop. A nil reviewStarter (headless
+	// mode, or a publisher that never opted in) starts no review, preserving the
+	// exact pre-Task-14 gate lifecycle.
+	reviewStarter permissionReviewStarter
 
 	// bound is the immutable loop definition the actor validates a SetLoopMode against
 	// (resolving the target mode's model/effort/tools/instructions). It is nil for the
@@ -257,13 +272,20 @@ func New(loopCtx context.Context, sessionID, loopID uuid.UUID, parent loop.Prove
 // mode-selective spawn, so a child begins in the requested mode without a synthetic
 // LoopModeChanged. An unknown mode name fails with the same typed BindError Bind uses.
 func NewInMode(loopCtx context.Context, sessionID, loopID uuid.UUID, parent loop.Provenance, events eventPublisher, bound loop.BoundDefinition, initialMode loop.ModeName) (*Loop, error) {
-	return NewInModeWithCompactor(loopCtx, sessionID, loopID, parent, events, bound, initialMode, nil)
+	return NewInModeWithCompactor(loopCtx, sessionID, loopID, parent, events, bound, initialMode, nil, nil)
 }
 
 // NewInModeWithCompactor is the focused native composition seam for a loop whose
 // definition installs compaction. The caller supplies only the summary capability;
 // loopruntime derives the executor from the bound loop's own counter, capabilities,
 // and policy. Generic hustle selection and coordination remain private.
+//
+// reviewContext mirrors compactor's shape: internal/sessionruntime is the only
+// caller that ever supplies a non-nil value (whenever the session has
+// permission classifiers registered — see Session.loopReviewContext), so it
+// travels as a parameter here rather than through the bound loop.Definition,
+// exactly like compactor does. nil leaves the resulting loop's turns with
+// reviewContext == nil, identical to every caller before this addendum.
 func NewInModeWithCompactor(
 	loopCtx context.Context,
 	sessionID, loopID uuid.UUID,
@@ -272,19 +294,52 @@ func NewInModeWithCompactor(
 	bound loop.BoundDefinition,
 	initialMode loop.ModeName,
 	compactor Compactor,
+	reviewContext *ReviewContext,
+) (*Loop, error) {
+	return NewInModeWithRuntime(
+		loopCtx,
+		sessionID,
+		loopID,
+		parent,
+		events,
+		bound,
+		initialMode,
+		RuntimeDependencies{Compactor: compactor, ReviewContext: reviewContext},
+	)
+}
+
+// NewInModeWithRuntime constructs a native loop with its runtime-only
+// dependencies while keeping the declarative definition immutable.
+func NewInModeWithRuntime(
+	loopCtx context.Context,
+	sessionID, loopID uuid.UUID,
+	parent loop.Provenance,
+	events eventPublisher,
+	bound loop.BoundDefinition,
+	initialMode loop.ModeName,
+	deps RuntimeDependencies,
 ) (*Loop, error) {
 	cfg, err := configFromBound(bound, initialMode)
 	if err != nil {
 		return nil, err
 	}
-	if err := installCompactionExecutor(loopCtx, &cfg, compactor); err != nil {
+	if err := installRuntimeDependencies(loopCtx, &cfg, deps); err != nil {
 		return nil, err
 	}
+	cfg.reviewContext = deps.ReviewContext.toInternal()
 	resolved := initialMode
 	if resolved == "" {
 		resolved = bound.InitialMode()
 	}
 	return newLoopWithSeed(loopCtx, sessionID, loopID, parent, events, cfg, bound, resolved, nil)
+}
+
+func installRuntimeDependencies(ctx context.Context, cfg *runtimeConfig, deps RuntimeDependencies) error {
+	if err := installCompactionExecutor(ctx, cfg, deps.Compactor); err != nil {
+		return err
+	}
+	cfg.Hooks = deps.Hooks
+	return nil
 }
 
 func newWithConfig(loopCtx context.Context, sessionID, loopID uuid.UUID, parent Provenance, events eventPublisher, cfg runtimeConfig) (*Loop, error) {
@@ -342,6 +397,10 @@ func newLoopWithSeed(loopCtx context.Context, sessionID, loopID uuid.UUID, paren
 	if !ok {
 		gates = nopGateRegistrar{}
 	}
+	// reviewStarter is optional: most events publishers (headless mode, or a
+	// session build without permission classifiers configured) do not implement
+	// it, and a failed assertion simply leaves it nil.
+	reviewStarter, _ := events.(permissionReviewStarter)
 	commands := make(chan command.Command)
 	priorityCommands := make(chan command.Command, compactionPriorityCommandCapacity)
 	contextRequests := make(chan contextMeasureRequest)
@@ -377,6 +436,7 @@ func newLoopWithSeed(loopCtx context.Context, sessionID, loopID uuid.UUID, paren
 		events:           events,
 		eventFactory:     cfg.eventFactory,
 		gates:            gates,
+		reviewStarter:    reviewStarter,
 		bound:            bound,
 	}
 	state := newLoopState(sessionID, loopID, parent)
@@ -399,6 +459,12 @@ func newLoopWithSeed(loopCtx context.Context, sessionID, loopID uuid.UUID, paren
 		// The system prompt is NOT in msgs — it rides cfg.System, sent every turn
 		// — so seeding msgs alone reproduces loopState exactly as it was committed.
 		state.msgs = cloneMessages(seed.Msgs)
+		// Clamped defensively: seed.DerivedPrefix comes from the session's fold
+		// (sessionruntime's foldLoop), which should never produce a value
+		// outside [0, len(Msgs)], but a restore-time seeding path must never
+		// let an out-of-range value make msgsDerivedPrefix slicing panic
+		// downstream (installActiveTurn/capturePermissionReviewContext).
+		state.msgsDerivedPrefix = clampDerivedPrefix(seed.DerivedPrefix, len(state.msgs))
 		state.turnIndex = seed.TurnIndex
 		if seed.HasRuntime {
 			state.runtime = seed.Runtime
@@ -419,7 +485,14 @@ func newLoopWithSeed(loopCtx context.Context, sessionID, loopID uuid.UUID, paren
 		}
 	}
 	go runLoop(lc, state)
-	return &Loop{Commands: commands, Done: done, priorityCommands: priorityCommands, gateReg: gateReg, snapshots: snapshots}, nil
+	return &Loop{
+		Commands:         commands,
+		Done:             done,
+		priorityCommands: priorityCommands,
+		gateReg:          gateReg,
+		snapshots:        snapshots,
+		hooks:            cfg.Hooks,
+	}, nil
 }
 
 type loopStatus int
@@ -493,6 +566,30 @@ type loopState struct {
 	hasContext        bool
 	contextTracker    contextTracker
 	contextGeneration uint64
+	// turnHookCtx is the hook-derived observation parent, not the cancellable
+	// active-turn child. The actor uses it after runTurn hands back and cancels its
+	// child so terminal durability retains hook values without a false cancellation.
+	turnHookCall   hook.Call
+	turnHookFinish hook.FinishFunc
+	turnHookCtx    context.Context
+
+	// msgsDerivedPrefix counts the leading messages in msgs that were generated
+	// by context replacement (a compaction summary) rather than authored by a
+	// human — the CROSS-TURN, cross-restore counterpart of turnState's own
+	// derivedUserPrefix (turn.go), which only tracks a mid-turn replacement and
+	// resets every new turn. actorContextReplacement.apply
+	// (context_replacement.go) sets this to 1 whenever it replaces msgs with a
+	// compaction summary (a *content.UserMessage the compaction Hustle's model
+	// call produced, never something a human typed); newLoopWithSeed seeds it
+	// from RestoredState.DerivedPrefix on restore. installActiveTurn reads it
+	// at the SAME point it clones msgs into a turn's cfg.base, so
+	// capturePermissionReviewContext (review_context.go) can keep treating a
+	// compaction summary as review evidence without ever crediting it with
+	// gate.ReviewContextOriginUser (genuine human authority) — design §8.3's
+	// central defense, which a turn-scoped-only guard cannot uphold once the
+	// summary survives into a LATER turn's base or a restored loop's seeded
+	// history.
+	msgsDerivedPrefix int
 
 	// effective is the loop's CURRENT turn-affecting configuration (mode/model/effort/
 	// system/tools). startTurn captures a copy of it into the per-turn turnConfig, so a
@@ -541,6 +638,20 @@ type loopState struct {
 // loopID, parent provenance). The session event publisher is a dependency, not
 // state, so it lives in loopConfig — not here. pendingGates is initialized so the
 // actor can route gate commands without a nil-map panic.
+// clampDerivedPrefix bounds a leading-derived-message count to [0, total],
+// defense in depth against an out-of-range value from a restore seed —
+// installActiveTurn/capturePermissionReviewContext slice on this count, so it
+// must never exceed the length of the messages it describes.
+func clampDerivedPrefix(prefix, total int) int {
+	if prefix < 0 {
+		return 0
+	}
+	if prefix > total {
+		return total
+	}
+	return prefix
+}
+
 func newLoopState(sessionID, loopID uuid.UUID, parent Provenance) loopState {
 	return loopState{
 		id:           loopID,
@@ -577,7 +688,10 @@ func cancelReasonFor(terminal event.Event) event.CancelReason {
 // StepDone event to emit at the same actor-owned point. ack is buffered(1); the
 // actor closes it after committing+emitting so the parked runTurn unblocks. The
 // turn goroutine selects on ack AND turnCtx.Done so an Interrupt/Shutdown frees it.
+// ctx is the Step-derived observation context used by the actor for the durable
+// StepDone/TurnFoldedInto boundary; it is never reconstructed from ambient state.
 type commitRequest struct {
+	ctx    context.Context
 	commit turnCommit
 	ack    chan<- error
 }
@@ -635,6 +749,12 @@ func runLoop(cfg loopConfig, state loopState) {
 	admissions := cfg.admissions
 	requestCancelActive := false
 	compactions := newCompactionControl(compactionControlWaiterCapacity)
+	var requestStartAdmission func() bool
+	resumeQueuedAfterCompaction := func() {
+		if state.status == loopIdle && !compactions.blocksInput() && requestStartAdmission != nil {
+			requestStartAdmission()
+		}
+	}
 	var idleCompaction *idleCompactionPreparation
 	compactionFinalizations := newCompactionFinalizer(compactionFinalizerConfig{
 		Publisher: cfg.events, Factory: cfg.eventFactory, SessionID: state.sessionID, LoopID: state.id,
@@ -673,45 +793,49 @@ func runLoop(cfg loopConfig, state loopState) {
 		}
 		return stamped, nil
 	}
-	publish := func(ev event.Event) {
+	publishContext := func(publishCtx context.Context, ev event.Event) {
 		stamped, err := stamp(ev)
 		if err != nil {
 			return
 		}
-		if err := cfg.events.PublishEvent(ctx, stamped); err != nil {
+		if publishCtx == nil {
+			publishCtx = ctx
+		}
+		if err := cfg.events.PublishEvent(publishCtx, stamped); err != nil {
 			slog.Error("loop event publish to session fan-in failed", "error", err)
 		}
 	}
-	publishTurnStarted := func(ev event.TurnStarted, capability TurnStartCapability) (bool, error) {
+	publish := func(ev event.Event) { publishContext(ctx, ev) }
+	publishTurnStarted := func(publishCtx context.Context, ev event.TurnStarted, capability TurnStartCapability) (bool, error) {
 		if capability == nil {
-			err := cfg.events.PublishEventChecked(ctx, ev)
+			err := cfg.events.PublishEventChecked(publishCtx, ev)
 			return err == nil, err
 		}
-		return capability.PublishTurnStarted(ctx, ev)
+		return capability.PublishTurnStarted(publishCtx, ev)
 	}
-	commitStampedBoundary := func(stamped event.Event) error {
+	commitStampedBoundary := func(commitCtx context.Context, stamped event.Event) error {
 		if boundary, ok := cfg.events.(executionBoundary); ok {
-			return boundary.CommitBoundary(ctx, stamped)
+			return boundary.CommitBoundary(commitCtx, stamped)
 		}
-		return cfg.events.PublishEventChecked(ctx, stamped)
+		return cfg.events.PublishEventChecked(commitCtx, stamped)
 	}
-	commitStampedContextBoundary := func(stamped event.Event) (bool, error) {
+	commitStampedContextBoundary := func(commitCtx context.Context, stamped event.Event) (bool, error) {
 		if boundary, ok := cfg.events.(contextExecutionBoundary); ok {
-			return boundary.CommitContextBoundary(ctx, stamped)
+			return boundary.CommitContextBoundary(commitCtx, stamped)
 		}
 		if boundary, ok := cfg.events.(executionBoundary); ok {
-			err := boundary.CommitBoundary(ctx, stamped)
+			err := boundary.CommitBoundary(commitCtx, stamped)
 			return err == nil, err
 		}
-		err := cfg.events.PublishEventChecked(ctx, stamped)
+		err := cfg.events.PublishEventChecked(commitCtx, stamped)
 		return err == nil, err
 	}
-	commitBoundary := func(ev event.Event) (event.Event, error) {
+	commitBoundary := func(commitCtx context.Context, ev event.Event) (event.Event, error) {
 		stamped, err := stamp(ev)
 		if err != nil {
 			return nil, err
 		}
-		return stamped, commitStampedBoundary(stamped)
+		return stamped, commitStampedBoundary(commitCtx, stamped)
 	}
 
 	// publishAcceptance is the narrow transactional publication path for managed
@@ -786,9 +910,16 @@ func runLoop(cfg loopConfig, state loopState) {
 		return nil
 	}
 
-	dispatchCompactionBoundary := func(boundary compactionBoundaryKind, candidate *compactionExecutionCandidate) bool {
+	dispatchCompactionBoundary := func(
+		operationCtx context.Context,
+		boundary compactionBoundaryKind,
+		candidate *compactionExecutionCandidate,
+	) bool {
 		if config.compactionSink == nil {
 			return false
+		}
+		if operationCtx == nil {
+			operationCtx = ctx
 		}
 		pending := compactions.pendingAttempt()
 		if idleCompaction != nil && pending != nil && pending.AttemptID == idleCompaction.attemptID &&
@@ -825,6 +956,7 @@ func runLoop(cfg loopConfig, state loopState) {
 				reportCompactionFailure(waiters, err)
 				return false
 			}
+			resumeQueuedAfterCompaction()
 			return true
 		}
 		attempt := disposition.Attempt
@@ -837,9 +969,65 @@ func runLoop(cfg loopConfig, state loopState) {
 			return false
 		}
 		disposition.Attempt = attempt
+		hookCtx := operationCtx
+		if candidate != nil && config.Hooks.Handles(hook.OperationCompaction) {
+			maxSummaryTokens := content.TokenCount(0)
+			if config.Compaction != nil {
+				maxSummaryTokens = config.Compaction.MaxSummaryTokens
+			}
+			input := &loop.CompactionInput{
+				Basis: attempt.Basis, Model: candidate.Measurement.Model,
+				RequestFingerprint: candidate.Measurement.RequestFingerprint,
+				Transcript:         cloneMessages(candidate.Transcript), MaxSummaryTokens: maxSummaryTokens,
+			}
+			call := hook.Call{
+				Operation: hook.OperationCompaction, StartedAt: hookNow(config.now),
+				Coordinates: identity.Coordinates{
+					SessionID: state.sessionID, LoopID: state.id, TurnID: state.turnID,
+				},
+				AgentName: config.AgentName, Cause: attempt.Cause,
+				Compaction: &hook.CompactionData{AttemptID: attempt.AttemptID, Input: input},
+			}
+			var finish hook.FinishFunc
+			var hookErr error
+			hookCtx, finish, hookErr = config.Hooks.Start(operationCtx, call)
+			scope := &compactionHookScope{ctx: hookCtx, call: call, finish: finish}
+			disposition.hookScope = scope
+			disposition.input = input
+			if hookErr != nil {
+				reason := event.CompactRejectInternal
+				outcome := hook.OutcomeFailed
+				var guardErr *hook.GuardError
+				if !errors.As(hookErr, &guardErr) {
+					if _, denied := hook.AsDenial(hookErr); denied {
+						reason = event.CompactRejectUnavailable
+						outcome = hook.OutcomeDenied
+					}
+				}
+				scope.setTerminal(outcome, hookErr, nil)
+				rejected := rejectedCompactionResult(reason)
+				rejected.Proposal.hookScope = scope
+				disposition.preRejected = &rejected
+				if candidateSink, ok := config.compactionSink.(compactionCandidateSink); ok {
+					if err := candidateSink.CoordinateCompactionCandidate(hookCtx, disposition, *candidate); err == nil {
+						return true
+					}
+				}
+				_, finalizationErr := compactionFinalizations.Finalize(
+					hookCtx, *attempt, compactionFinalizationProposal{RejectReason: reason, hookScope: scope},
+				)
+				if finalizationErr != nil {
+					reportCompactionFailure(attempt.WaiterCommandIDs, finalizationErr)
+					return false
+				}
+				compactions.complete(attempt.AttemptID)
+				resumeQueuedAfterCompaction()
+				return true
+			}
+		}
 		invoked := false
 		coordinateErr := publishCompactionStartedBeforeInference(
-			ctx, cfg.events, cfg.eventFactory, state.sessionID, state.id,
+			hookCtx, cfg.events, cfg.eventFactory, state.sessionID, state.id,
 			event.CompactionStarted{AttemptID: attempt.AttemptID, Reason: attempt.Reason, Basis: attempt.Basis},
 			func(inferCtx context.Context) error {
 				invoked = true
@@ -856,6 +1044,7 @@ func runLoop(cfg loopConfig, state loopState) {
 		}
 		if !invoked && isFatalPublication(coordinateErr) {
 			compactions.abort(attempt.AttemptID)
+			disposition.hookScope.finishInfrastructure(coordinateErr)
 			reportCompactionFailure(attempt.WaiterCommandIDs, &CompactionCoordinationError{
 				Kind: CompactionCoordinationOutcome, Cause: coordinateErr,
 			})
@@ -865,12 +1054,17 @@ func runLoop(cfg loopConfig, state loopState) {
 		if invoked {
 			rejectReason = event.CompactRejectExecutionFailed
 		}
-		_, finalizationErr := compactionFinalizations.Finalize(ctx, *attempt, compactionFinalizationProposal{RejectReason: rejectReason})
+		disposition.hookScope.setTerminal(hook.OutcomeFailed, &compactionOperationError{Reason: rejectReason}, nil)
+		_, finalizationErr := compactionFinalizations.Finalize(
+			hookCtx, *attempt,
+			compactionFinalizationProposal{RejectReason: rejectReason, hookScope: disposition.hookScope},
+		)
 		if finalizationErr != nil {
 			reportCompactionFailure(attempt.WaiterCommandIDs, finalizationErr)
 			return false
 		}
 		compactions.complete(attempt.AttemptID)
+		resumeQueuedAfterCompaction()
 		return false
 	}
 
@@ -948,6 +1142,7 @@ func runLoop(cfg loopConfig, state loopState) {
 		if rejected, ok := terminal.(event.CompactionRejected); ok && rejected.Reason == event.CompactionReasonAutomatic {
 			state.contextTracker.exhaustAutomatic(rejected.Basis, rejected.Reason, true)
 		}
+		resumeQueuedAfterCompaction()
 	}
 
 	awaitIdleCompaction := func(attemptID event.CompactAttemptID) {
@@ -965,6 +1160,9 @@ func runLoop(cfg loopConfig, state loopState) {
 			select {
 			case contextOutcomes <- contextCompactionOutcomeRequest{attemptID: attemptID, result: outcome, reply: reply}:
 			case <-ctx.Done():
+				outcome.Proposal.hookScope.finishInfrastructure(&CompactionCoordinationError{
+					Kind: CompactionCoordinationOutcome, Cause: ctx.Err(),
+				})
 				return
 			}
 			select {
@@ -1049,21 +1247,25 @@ func runLoop(cfg loopConfig, state loopState) {
 	// lifetime is bounded by the loop's, not by any caller's API-call ctx). It then
 	// commits the initial UserMessage into loopState.msgs. TurnStarted's Cause.LoopID carries
 	// qi.triggeredBy: set for a SubagentResult, zero for a UserInput). It returns the
-	// derived turn ctx and the defensive base clone the per-turn goroutine reads.
+	// derived turn ctx, the defensive base clone the per-turn goroutine reads, and
+	// the leading-derived-message count (state.msgsDerivedPrefix) that describes
+	// base — captured at the SAME point as the clone, before qi.msg is appended,
+	// so cfg.baseDerivedPrefix always describes exactly the base it travels with.
 	// This is the live-commit half of starting a turn (distinct from
 	// assembling the per-turn turnConfig).
-	installActiveTurn := func(turnID uuid.UUID, qi queuedInput) (context.Context, content.AgenticMessages) {
+	installActiveTurn := func(parentCtx context.Context, turnID uuid.UUID, qi queuedInput) (context.Context, content.AgenticMessages, int) {
 		state.turnIndex++
 		state.turnID = turnID
 		state.causationID = qi.inputID
 		state.status = loopRunning
-		turnCtx, cancel := context.WithCancel(ctx)
+		turnCtx, cancel := context.WithCancel(parentCtx)
 		state.cancelTurn = cancel
 
 		// base is a defensive deep clone of pre-turn history, taken BEFORE the
 		// initial UserMessage is committed (runTurn reads it
 		// concurrently while the actor keeps appending committed step groups).
 		base := cloneMessages(state.msgs)
+		baseDerivedPrefix := state.msgsDerivedPrefix
 
 		// Loop-owned incremental commit: commit the initial UserMessage and emit
 		// TurnStarted (Message + Cause.CommandID = inputID + InputID = inputID) was
@@ -1071,7 +1273,7 @@ func runLoop(cfg loopConfig, state loopState) {
 		state.msgs = append(state.msgs, qi.msg)
 		state.context = event.ContextMeasurement{}
 		state.hasContext = false
-		return turnCtx, base
+		return turnCtx, base, baseDerivedPrefix
 	}
 
 	// buildTurnConfig assembles the per-turn turnConfig: the static deps (base/model/
@@ -1090,7 +1292,7 @@ func runLoop(cfg loopConfig, state loopState) {
 	//   - emit: the turn goroutine's event emit, publish-only (every loop event reaches
 	//     consumers through the session fan-in). publish never blocks the actor, so the
 	//     turn goroutine cannot be pinned by a slow consumer.
-	buildTurnConfig := func(base content.AgenticMessages, firstAdmission func()) turnConfig {
+	buildTurnConfig := func(base content.AgenticMessages, baseDerivedPrefix int, firstAdmission func()) turnConfig {
 		admit := func(context.Context) (func(), error) { return func() {}, nil }
 		if admission, ok := cfg.events.(executionAdmission); ok {
 			admit = func(ctx context.Context) (func(), error) {
@@ -1099,7 +1301,7 @@ func runLoop(cfg loopConfig, state loopState) {
 		}
 		commit := func(cctx context.Context, tc turnCommit) error {
 			ack := make(chan error, 1)
-			req := commitRequest{commit: tc, ack: ack}
+			req := commitRequest{ctx: cctx, commit: tc, ack: ack}
 			select {
 			case commits <- req:
 			case <-cctx.Done():
@@ -1159,7 +1361,11 @@ func runLoop(cfg loopConfig, state loopState) {
 					select {
 					case cfg.contextOutcomes <- outcomeRequest:
 					case <-ctx.Done():
-						return &CompactionCoordinationError{Kind: CompactionCoordinationOutcome, Cause: ctx.Err()}
+						handoffErr := &CompactionCoordinationError{
+							Kind: CompactionCoordinationOutcome, Cause: ctx.Err(),
+						}
+						outcome.Proposal.hookScope.finishInfrastructure(handoffErr)
+						return handoffErr
 					}
 					var disposition contextCompactionOutcomeReply
 					select {
@@ -1213,11 +1419,16 @@ func runLoop(cfg loopConfig, state loopState) {
 		// remaining fields are immutable loop wiring, so they ride the frozen config.
 		return turnConfig{
 			base:                    base,
+			baseDerivedPrefix:       baseDerivedPrefix,
 			runtimeContext:          config.RuntimeContext,
 			model:                   state.effective.model,
 			system:                  state.effective.system,
 			tools:                   state.effective.tools,
+			output:                  cloneOutputSchema(config.Output),
 			client:                  config.Client,
+			hooks:                   config.Hooks,
+			agentName:               config.AgentName,
+			now:                     config.now,
 			gateReg:                 gateReg,
 			idGen:                   config.idGen,
 			admit:                   admit,
@@ -1226,8 +1437,10 @@ func runLoop(cfg loopConfig, state loopState) {
 			commit:                  commit,
 			drainPending:            drainPending,
 			emit:                    publish,
+			emitContext:             publishContext,
 			afterDrain:              config.afterDrain,
 			afterContextReplacement: config.afterContextReplacement,
+			reviewContext:           config.reviewContext,
 		}
 	}
 
@@ -1264,17 +1477,41 @@ func runLoop(cfg loopConfig, state loopState) {
 			TurnIndex: state.turnIndex + 1,
 			Message:   cloneUserMessage(qi.msg),
 		}
+		turnCall := hook.Call{
+			Operation:   hook.OperationTurn,
+			StartedAt:   hookNow(config.now),
+			Coordinates: started.Coordinates,
+			AgentName:   config.AgentName,
+			Cause:       started.Cause,
+			Turn: &hook.TurnData{
+				Index: started.TurnIndex,
+				Input: started.Message,
+			},
+		}
+		turnHookCtx, turnHookFinish, hookErr := config.Hooks.Start(ctx, turnCall)
+		if hookErr != nil {
+			safeErr := safeHookError(hook.OperationTurn, hookErr)
+			return uuid.UUID{}, &turnStartHookFailure{
+				err: safeErr,
+				complete: func() {
+					finishHook(turnHookFinish, turnCall, hookOutcome(ctx, hookErr), hookErr)
+				},
+			}
+		}
 		stamped, err := stamp(started)
 		if err != nil {
+			finishHook(turnHookFinish, turnCall, hook.OutcomeFailed, err)
 			return uuid.UUID{}, err
 		}
 		started = stamped.(event.TurnStarted)
 		mutation, err := preflightContextMutation(state.contextTracker, state.contextGeneration, started.EventID, contextMutationHistory)
 		if err != nil {
+			finishHook(turnHookFinish, turnCall, hook.OutcomeFailed, err)
 			return uuid.UUID{}, err
 		}
-		committed, publishErr := publishTurnStarted(started, capability)
+		committed, publishErr := publishTurnStarted(turnHookCtx, started, capability)
 		if !committed {
+			finishHook(turnHookFinish, turnCall, hookOutcome(turnHookCtx, publishErr), publishErr)
 			return uuid.UUID{}, publishErr
 		}
 		mutation.commit(&state.contextTracker, &state.contextGeneration)
@@ -1284,7 +1521,10 @@ func runLoop(cfg loopConfig, state loopState) {
 			idleCompaction = nil
 			finalizeIdleCompactionRejection(preparation, event.CompactRejectStaleBasis)
 		}
-		turnCtx, base := installActiveTurn(turnID, qi)
+		turnCtx, base, baseDerivedPrefix := installActiveTurn(turnHookCtx, turnID, qi)
+		state.turnHookCall = turnCall
+		state.turnHookFinish = turnHookFinish
+		state.turnHookCtx = turnHookCtx
 		idx := state.turnIndex
 		cancel := state.cancelTurn
 		if publishErr != nil {
@@ -1297,7 +1537,8 @@ func runLoop(cfg loopConfig, state loopState) {
 			return turnID, nil
 		}
 		ts := newTurnState(state.sessionID, state.id, turnID, idx, state.causationID, qi.msg)
-		turnCfg := buildTurnConfig(base, firstAdmission)
+		turnCfg := buildTurnConfig(base, baseDerivedPrefix, firstAdmission)
+		turnCfg.cause = started.Cause
 
 		go func() {
 			defer cancel()
@@ -1382,8 +1623,6 @@ func runLoop(cfg loopConfig, state loopState) {
 		})
 	}
 
-	var requestStartAdmission func() bool
-
 	// decideSubmit resolves a UserInput/SubagentResult against the actor's OWN live
 	// state (race-free), PUBLISHING the typed outcome event rather than replying a
 	// command.Disposition. Every submit may queue behind a running turn: a busy loop
@@ -1414,7 +1653,7 @@ func runLoop(cfg loopConfig, state loopState) {
 			rejectSubmit(qi, event.RejectShuttingDown)
 		case len(state.inbox) >= loop.ManagedInputQueueCapacity && !bypassReject:
 			rejectSubmit(qi, event.RejectQueueFull)
-		case state.status == loopRunning || state.status == loopWaitingAdmission || (state.status == loopShuttingDown && bypassReject):
+		case state.status == loopRunning || state.status == loopWaitingAdmission || compactions.blocksInput() || (state.status == loopShuttingDown && bypassReject):
 			// Busy (or a never-rejected SubagentResult while shutting down): accept into
 			// the inbox (ordered) and publish InputQueued (Ephemeral). The submit resolves
 			// on the fan-in. A SubagentResult queued during shutdown is later returned via
@@ -1459,7 +1698,7 @@ func runLoop(cfg loopConfig, state loopState) {
 			reject(event.RejectShuttingDown, nil)
 		case len(state.inbox) >= loop.ManagedInputQueueCapacity:
 			reject(event.RejectQueueFull, nil)
-		case state.status == loopRunning || state.status == loopWaitingAdmission:
+		case state.status == loopRunning || state.status == loopWaitingAdmission || compactions.blocksInput():
 			if err := publishAcceptance(c.CommandID); err != nil {
 				c.Accepted <- err
 				return
@@ -1546,7 +1785,7 @@ func runLoop(cfg loopConfig, state loopState) {
 	}
 
 	requestStartAdmission = func() bool {
-		if len(state.inbox) == 0 || state.status == loopShuttingDown || state.status == loopWaitingAdmission {
+		if len(state.inbox) == 0 || state.status == loopShuttingDown || state.status == loopWaitingAdmission || compactions.blocksInput() {
 			return false
 		}
 		admission, ok := cfg.events.(executionAdmission)
@@ -1558,6 +1797,7 @@ func runLoop(cfg loopConfig, state loopState) {
 				} else {
 					returnEntry(next, event.CancelTurnFailed, uuid.UUID{})
 				}
+				completeTurnStartHook(err)
 				return false
 			}
 			return true
@@ -1594,6 +1834,9 @@ func runLoop(cfg loopConfig, state loopState) {
 	// TurnFoldedInto resolves it) or via returnQueuedInbox (an abnormal terminal), so the
 	// inbox-exit invariant — every removed entry is resolved exactly once — still holds.
 	drainInbox := func() []queuedInput {
+		if compactions.blocksInput() {
+			return nil
+		}
 		// Fold only the LEADING run of foldable entries; stop at the first non-folding
 		// entry (a delegate follow-up). A noFold entry — and everything queued behind it
 		// — must start its OWN distinct turn rather than fold into the running turn, so it
@@ -1711,6 +1954,21 @@ func runLoop(cfg loopConfig, state loopState) {
 		}
 		return startNextQueued(endedTurnID)
 	}
+	finishActiveTurnHook := func(terminal event.Event, boundaryErr error) {
+		turnErr := terminalHookError(terminal)
+		if boundaryErr != nil {
+			turnErr = boundaryErr
+		}
+		finishHook(
+			state.turnHookFinish,
+			state.turnHookCall,
+			hookOutcome(state.turnHookCtx, turnErr),
+			turnErr,
+		)
+		state.turnHookCall = hook.Call{}
+		state.turnHookFinish = nil
+		state.turnHookCtx = nil
+	}
 
 	// handleTurnResult is the actor's response to a turn goroutine's terminal
 	// hand-back (the `case result := <-internal` select arm, extracted so the select
@@ -1733,10 +1991,15 @@ func runLoop(cfg loopConfig, state loopState) {
 		endedTurnID := state.turnID
 		// The terminal publish must still carry this turn's correlation IDs (stamped by
 		// publish from state.turnID), so clear them only afterward.
-		_, boundaryErr := commitBoundary(result.terminal)
+		commitCtx := state.turnHookCtx
+		if commitCtx == nil {
+			commitCtx = ctx
+		}
+		_, boundaryErr := commitBoundary(commitCtx, result.terminal)
 		if boundaryErr != nil {
 			slog.Error("turn boundary commit failed", "error", boundaryErr)
 		}
+		finishActiveTurnHook(result.terminal, boundaryErr)
 		state.turnID = uuid.UUID{}
 		state.causationID = uuid.UUID{}
 		// A finished turn must not leave stale gates: the parked runners have already
@@ -2036,7 +2299,7 @@ func runLoop(cfg loopConfig, state loopState) {
 				if admission.Kind == compactionAdmissionOpened && startIdleCompactionPreparation(admission.AttemptID) {
 					return false
 				}
-				dispatchCompactionBoundary(compactionBoundaryTurn, nil)
+				dispatchCompactionBoundary(ctx, compactionBoundaryTurn, nil)
 			}
 
 		case command.Interrupt:
@@ -2071,7 +2334,7 @@ func runLoop(cfg loopConfig, state loopState) {
 				c.Ack <- false
 			}
 			if state.status == loopIdle {
-				dispatchCompactionBoundary(compactionBoundaryTurn, nil)
+				dispatchCompactionBoundary(ctx, compactionBoundaryTurn, nil)
 			}
 
 		case command.Shutdown:
@@ -2098,7 +2361,7 @@ func runLoop(cfg loopConfig, state loopState) {
 				state.cancelAdmission()
 				state.cancelAdmission = nil
 				returnQueuedInbox(event.CancelTurnInterrupted, uuid.UUID{})
-				dispatchCompactionBoundary(compactionBoundaryTurn, nil)
+				dispatchCompactionBoundary(ctx, compactionBoundaryTurn, nil)
 				ackShutdowns(nil)
 				return true
 			}
@@ -2107,7 +2370,7 @@ func runLoop(cfg loopConfig, state loopState) {
 				// (it will never start) before stopping; in practice the inbox is
 				// empty when idle, but this guarantees nothing is silently dropped.
 				returnQueuedInbox(event.CancelTurnInterrupted, uuid.UUID{})
-				dispatchCompactionBoundary(compactionBoundaryTurn, nil)
+				dispatchCompactionBoundary(ctx, compactionBoundaryTurn, nil)
 				ackShutdowns(nil)
 				return true
 			}
@@ -2150,21 +2413,55 @@ func runLoop(cfg loopConfig, state loopState) {
 				return
 			}
 		case reg := <-gateReg:
+			if !reg.abandonID.IsZero() {
+				if _, open := state.pendingGates[reg.abandonID]; open {
+					closeErr := cfg.gates.CloseGate(reg.ctx, reg.abandonID, gatedomain.CloseAbandoned)
+					if closeErr == nil {
+						delete(state.pendingGates, reg.abandonID)
+					}
+					reg.ack <- gateInstallAck{gateID: reg.abandonID, err: closeErr}
+				} else {
+					reg.ack <- gateInstallAck{gateID: reg.abandonID}
+				}
+				break
+			}
 			callID := reg.toolExecutionID()
-			gateID, err := cfg.gates.PrepareGateOpen(ctx, state.id, reg.gate, reg.payload)
+			gateCtx := reg.ctx
+			if gateCtx == nil {
+				gateCtx = ctx
+			}
+			gateID, err := cfg.gates.PrepareGateOpen(gateCtx, state.id, reg.gate, reg.payload)
 			if err != nil {
 				reg.ack <- gateInstallAck{err: err}
 				break
 			}
 			state.pendingGates[gateID] = pendingGate{reply: reg.reply, kind: reg.kind}
 			route := gatedomain.Route{GateID: gateID, LoopID: state.id, ToolExecutionID: callID}
-			if err := cfg.gates.ActivateGate(ctx, gateID, route); err != nil {
+			if err := cfg.gates.ActivateGate(gateCtx, gateID, route); err != nil {
 				delete(state.pendingGates, gateID)
-				_ = cfg.gates.CloseGate(ctx, gateID, gatedomain.CloseAbandoned)
+				_ = cfg.gates.CloseGate(gateCtx, gateID, gatedomain.CloseAbandoned)
 				reg.ack <- gateInstallAck{gateID: gateID, err: err}
 				break
 			}
 			reg.ack <- gateInstallAck{gateID: gateID}
+
+			// Automatic review begins only after GateOpened has committed and the
+			// runner has been acked (design §14.2/§14.3): the human can answer
+			// immediately, there is no invisible review-only wait, and activation
+			// failure (handled above, before the ack) can never start a review.
+			// StartPermissionReview must return promptly — the actor calls it
+			// inline and moves on to the next select iteration without waiting on
+			// classifier inference.
+			if reg.kind == gatePermission && cfg.reviewStarter != nil {
+				if req, ok := permissionRequestFromPayload(reg.payload); ok {
+					cfg.reviewStarter.StartPermissionReview(ctx, PermissionReviewRequest{
+						GateID:          gateID,
+						ToolExecutionID: callID,
+						Request:         req,
+						ReviewContext:   reg.reviewContext,
+					})
+				}
+			}
 
 		case req := <-snapshots:
 			// Committed-state query: the actor is the SOLE owner of loopState.msgs +
@@ -2214,7 +2511,7 @@ func runLoop(cfg loopConfig, state loopState) {
 				continue
 			}
 			if reason := compactions.cancellationRejectReason(); reason != event.CompactRejectUnspecified {
-				dispatchCompactionBoundary(compactionBoundaryTurn, nil)
+				dispatchCompactionBoundary(ctx, compactionBoundaryTurn, nil)
 				continue
 			}
 			currentBasis := state.contextTracker.currentBasis()
@@ -2242,11 +2539,13 @@ func runLoop(cfg loopConfig, state loopState) {
 				if stampErr != nil {
 					reportCompactionFailure(pending.WaiterCommandIDs, stampErr)
 					compactions.abort(pending.AttemptID)
+					resumeQueuedAfterCompaction()
 					continue
 				}
 				if validateErr := event.ValidateEvent(measured); validateErr != nil {
 					reportCompactionFailure(pending.WaiterCommandIDs, validateErr)
 					compactions.abort(pending.AttemptID)
+					resumeQueuedAfterCompaction()
 					continue
 				}
 				if publishErr := cfg.events.PublishEventChecked(ctx, measured); publishErr != nil {
@@ -2268,7 +2567,7 @@ func runLoop(cfg loopConfig, state loopState) {
 				reportCompactionFailure(pending.WaiterCommandIDs, err)
 				continue
 			}
-			if dispatchCompactionBoundary(compactionBoundaryTurn, &result.candidate) {
+			if dispatchCompactionBoundary(ctx, compactionBoundaryTurn, &result.candidate) {
 				awaitIdleCompaction(pending.AttemptID)
 			}
 
@@ -2341,7 +2640,14 @@ func runLoop(cfg loopConfig, state loopState) {
 					}
 				}
 				coordinated := false
-				dispatch := func() { coordinated = dispatchCompactionBoundary(compactionBoundaryStep, &executionCandidate) }
+				// Measurement happens after Step has durably finished, so the request
+				// context carries the still-live Turn scope (not a closed Step scope).
+				// Preserve it across the actor seam into Compaction.
+				dispatch := func() {
+					coordinated = dispatchCompactionBoundary(
+						result.request.ctx, compactionBoundaryStep, &executionCandidate,
+					)
+				}
 				if config.beforeCompactionBoundary != nil {
 					config.beforeCompactionBoundary(compactionBoundaryStep)
 				}
@@ -2416,7 +2722,13 @@ func runLoop(cfg loopConfig, state loopState) {
 				continue
 			}
 			coordinated := false
-			dispatch := func() { coordinated = dispatchCompactionBoundary(compactionBoundaryStep, &executionCandidate) }
+			// Automatic compaction is a child of the still-live Turn after Step
+			// completion; use the originating measurement context, not actor ctx.
+			dispatch := func() {
+				coordinated = dispatchCompactionBoundary(
+					result.request.ctx, compactionBoundaryStep, &executionCandidate,
+				)
+			}
 			if config.beforeCompactionBoundary != nil {
 				config.beforeCompactionBoundary(compactionBoundaryStep)
 			}
@@ -2436,17 +2748,25 @@ func runLoop(cfg loopConfig, state loopState) {
 		case outcome := <-contextOutcomes:
 			attempt := compactions.pendingAttempt()
 			if attempt == nil || attempt.AttemptID != outcome.attemptID {
-				outcome.reply <- contextCompactionOutcomeReply{err: &contextCompactionOutcomeError{AttemptID: outcome.attemptID}}
+				identityErr := &contextCompactionOutcomeError{AttemptID: outcome.attemptID}
+				outcome.result.Proposal.hookScope.finishInfrastructure(identityErr)
+				outcome.reply <- contextCompactionOutcomeReply{err: identityErr}
 				continue
 			}
 			if reason := compactions.cancellationRejectReason(); reason != event.CompactRejectUnspecified {
+				scope := outcome.result.Proposal.hookScope
 				outcome.result = rejectedCompactionResult(reason)
+				outcome.result.Proposal.hookScope = scope
+				scope.setTerminal(hook.OutcomeCanceled, context.Canceled, nil)
 			}
 			settings, configured := contextSettings(config)
 			proposal := outcome.result.Proposal
 			disposition := outcome.result.Disposition
 			if validationErr := validateContextCompactionProposal(attempt, outcome.result); validationErr != nil {
-				proposal = compactionFinalizationProposal{RejectReason: event.CompactRejectInternal}
+				proposal = compactionFinalizationProposal{
+					RejectReason: event.CompactRejectInternal, hookScope: proposal.hookScope,
+				}
+				proposal.hookScope.setTerminal(hook.OutcomeFailed, validationErr, nil)
 				disposition = contextCompactionAwaitRejected
 			}
 			var replacementPlan *actorContextReplacement
@@ -2458,13 +2778,20 @@ func runLoop(cfg loopConfig, state loopState) {
 					if errors.As(replacementErr, &stale) {
 						rejectReason = event.CompactRejectStaleBasis
 					}
-					proposal = compactionFinalizationProposal{RejectReason: rejectReason}
+					proposal = compactionFinalizationProposal{
+						RejectReason: rejectReason, hookScope: proposal.hookScope,
+					}
+					proposal.hookScope.setTerminal(hook.OutcomeFailed, replacementErr, nil)
 					disposition = contextCompactionAwaitRejected
 				} else {
 					replacementPlan = &plan
 				}
 			}
-			terminal, finalizationErr := compactionFinalizations.Finalize(ctx, *attempt, proposal)
+			finalizeCtx := ctx
+			if proposal.hookScope != nil && proposal.hookScope.ctx != nil {
+				finalizeCtx = proposal.hookScope.ctx
+			}
+			terminal, finalizationErr := compactionFinalizations.Finalize(finalizeCtx, *attempt, proposal)
 			if finalizationErr != nil {
 				reportCompactionFailure(attempt.WaiterCommandIDs, finalizationErr)
 				outcome.reply <- contextCompactionOutcomeReply{err: finalizationErr}
@@ -2489,6 +2816,7 @@ func runLoop(cfg loopConfig, state loopState) {
 				disposition: disposition, replacement: turnReplacement,
 				continuationError: outcome.result.ContinuationError, rejectReason: rejection.RejectReason, retry: retry,
 			}
+			resumeQueuedAfterCompaction()
 
 		case result := <-admissions:
 			state.cancelAdmission = nil
@@ -2543,6 +2871,7 @@ func runLoop(cfg loopConfig, state loopState) {
 				} else {
 					returnEntry(next, event.CancelTurnFailed, uuid.UUID{})
 				}
+				completeTurnStartHook(err)
 				returnQueuedInbox(event.CancelTurnFailed, uuid.UUID{})
 				emitLoopIdle()
 			}
@@ -2555,7 +2884,7 @@ func runLoop(cfg loopConfig, state loopState) {
 			// drained entries are now in draining and are resolved either by their
 			// TurnFoldedInto commit (below) or by returnQueuedInbox on an abnormal
 			// terminal — never silently lost.
-			dispatch := func() { dispatchCompactionBoundary(compactionBoundaryStep, nil) }
+			dispatch := func() { dispatchCompactionBoundary(ctx, compactionBoundaryStep, nil) }
 			if compactions.pendingAtBoundary() {
 				if config.beforeCompactionBoundary != nil {
 					config.beforeCompactionBoundary(compactionBoundaryStep)
@@ -2584,7 +2913,11 @@ func runLoop(cfg loopConfig, state loopState) {
 			}
 			committed := false
 			if boundaryErr == nil {
-				committed, boundaryErr = commitStampedContextBoundary(stampedBoundary)
+				commitCtx := req.ctx
+				if commitCtx == nil {
+					commitCtx = ctx
+				}
+				committed, boundaryErr = commitStampedContextBoundary(commitCtx, stampedBoundary)
 			}
 			if committed {
 				state.msgs = append(state.msgs, req.commit.Messages...)
@@ -2601,7 +2934,7 @@ func runLoop(cfg loopConfig, state loopState) {
 			req.ack <- boundaryErr
 
 		case result := <-internal:
-			dispatch := func() { dispatchCompactionBoundary(compactionBoundaryTurn, nil) }
+			dispatch := func() { dispatchCompactionBoundary(ctx, compactionBoundaryTurn, nil) }
 			if compactions.pendingAtBoundary() {
 				if config.beforeCompactionBoundary != nil {
 					config.beforeCompactionBoundary(compactionBoundaryTurn)
@@ -2633,12 +2966,19 @@ func runLoop(cfg loopConfig, state loopState) {
 				// wedged there and would never have produced a terminal anyway.
 				select {
 				case result := <-internal:
-					if _, err := commitBoundary(result.terminal); err != nil {
-						slog.Error("turn boundary commit failed during loop cancellation", "error", err)
+					commitCtx := state.turnHookCtx
+					if commitCtx == nil {
+						commitCtx = ctx
 					}
+					_, boundaryErr := commitBoundary(commitCtx, result.terminal)
+					if boundaryErr != nil {
+						slog.Error("turn boundary commit failed during loop cancellation", "error", boundaryErr)
+					}
+					finishActiveTurnHook(result.terminal, boundaryErr)
 				case <-time.After(config.DrainTimeout):
 					slog.Error("turn goroutine did not drain after ctx cancel; detaching",
 						"timeout", config.DrainTimeout)
+					finishActiveTurnHook(nil, ctx.Err())
 				}
 			}
 			// Defensive: the loop is exiting, but drop any gates so no detached path

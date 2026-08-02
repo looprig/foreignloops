@@ -1,6 +1,10 @@
 package event
 
 import (
+	"strings"
+	"unicode"
+	"unicode/utf8"
+
 	"github.com/looprig/core/content"
 	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/gate"
@@ -34,45 +38,62 @@ const (
 
 // Identity / body field names, named so an InvalidEventError reads precisely.
 const (
-	FieldEventID          FieldName = "EventID"
-	FieldSessionID        FieldName = "SessionID"
-	FieldLoopID           FieldName = "LoopID"
-	FieldTurnID           FieldName = "TurnID"
-	FieldStepID           FieldName = "StepID"
-	FieldToolExecutionID  FieldName = "ToolExecutionID"
-	FieldConsistency      FieldName = "Consistency"
-	FieldTrigger          FieldName = "Trigger"
-	FieldCause            FieldName = "Cause"
-	FieldCommandID        FieldName = "CommandID"
-	FieldActiveLoopID     FieldName = "ActiveLoopID"
-	FieldModel            FieldName = "Model"
-	FieldModelKey         FieldName = "ModelKey"
-	FieldContextLimits    FieldName = "ContextLimits"
-	FieldEffort           FieldName = "Effort"
-	FieldUsage            FieldName = "Usage"
-	FieldMessages         FieldName = "Messages"
-	FieldVisibility       FieldName = "Visibility"
-	FieldDefinition       FieldName = "Definition"
-	FieldRunID            FieldName = "RunID"
-	FieldRuntime          FieldName = "Runtime"
-	FieldDuration         FieldName = "Duration"
-	FieldStage            FieldName = "Stage"
-	FieldReasonCode       FieldName = "ReasonCode"
-	FieldAttemptID        FieldName = "AttemptID"
-	FieldReason           FieldName = "Reason"
-	FieldRejectReason     FieldName = "RejectReason"
-	FieldWaiterCommandIDs FieldName = "WaiterCommandIDs"
-	FieldSummary          FieldName = "Summary"
-	FieldPostContext      FieldName = "PostContext"
-	FieldCommittedEventID FieldName = "CommittedEventID"
-	FieldSource           FieldName = "Source"
-	FieldGeneration       FieldName = "Generation"
-	FieldTools            FieldName = "Tools"
+	FieldEventID            FieldName = "EventID"
+	FieldSessionID          FieldName = "SessionID"
+	FieldLoopID             FieldName = "LoopID"
+	FieldTurnID             FieldName = "TurnID"
+	FieldStepID             FieldName = "StepID"
+	FieldToolExecutionID    FieldName = "ToolExecutionID"
+	FieldConsistency        FieldName = "Consistency"
+	FieldTrigger            FieldName = "Trigger"
+	FieldCause              FieldName = "Cause"
+	FieldCommandID          FieldName = "CommandID"
+	FieldActiveLoopID       FieldName = "ActiveLoopID"
+	FieldCategory           FieldName = "Category"
+	FieldModel              FieldName = "Model"
+	FieldModelKey           FieldName = "ModelKey"
+	FieldContextLimits      FieldName = "ContextLimits"
+	FieldEffort             FieldName = "Effort"
+	FieldUsage              FieldName = "Usage"
+	FieldMessages           FieldName = "Messages"
+	FieldVisibility         FieldName = "Visibility"
+	FieldDefinition         FieldName = "Definition"
+	FieldRunID              FieldName = "RunID"
+	FieldRuntime            FieldName = "Runtime"
+	FieldAgentRuntime       FieldName = "AgentRuntime"
+	FieldACPSessionID       FieldName = "ACPSessionID"
+	FieldDuration           FieldName = "Duration"
+	FieldStage              FieldName = "Stage"
+	FieldReasonCode         FieldName = "ReasonCode"
+	FieldAttemptID          FieldName = "AttemptID"
+	FieldReason             FieldName = "Reason"
+	FieldRejectReason       FieldName = "RejectReason"
+	FieldWaiterCommandIDs   FieldName = "WaiterCommandIDs"
+	FieldSummary            FieldName = "Summary"
+	FieldPostContext        FieldName = "PostContext"
+	FieldCommittedEventID   FieldName = "CommittedEventID"
+	FieldSource             FieldName = "Source"
+	FieldActor              FieldName = "Actor"
+	FieldGeneration         FieldName = "Generation"
+	FieldTools              FieldName = "Tools"
+	FieldGateID             FieldName = "GateID"
+	FieldClassifier         FieldName = "Classifier"
+	FieldClassifierRevision FieldName = "ClassifierRevision"
+	FieldStatus             FieldName = "Status"
+	FieldRisk               FieldName = "Risk"
+	FieldAuthorization      FieldName = "Authorization"
+	FieldCategories         FieldName = "Categories"
+	FieldAutoApproved       FieldName = "AutoApproved"
 	// FieldIntegrationName names IntegrationStatus.Name. It is not spelled
 	// "FieldName": that identifier is this file's FieldName TYPE.
-	FieldIntegrationName FieldName = "Name"
-	FieldState           FieldName = "State"
-	FieldDetail          FieldName = "Detail"
+	FieldIntegrationName    FieldName = "Name"
+	FieldState              FieldName = "State"
+	FieldDetail             FieldName = "Detail"
+	FieldEpoch              FieldName = "Epoch"
+	FieldAdoptedFingerprint FieldName = "AdoptedFingerprint"
+	FieldManifest           FieldName = "Manifest"
+	FieldDrift              FieldName = "Drift"
+	FieldMessage            FieldName = "Message"
 	// FieldType names the whole event (not one coordinate) on the fail-secure
 	// unknown-type path, paired with RuleUnknownType.
 	FieldType FieldName = "Type"
@@ -94,12 +115,13 @@ func (e *InvalidEventError) Error() string {
 
 // idProfile is one event type's STATIC identity contract from the fill matrix:
 // which Coordinates fields must be set, which must be zero, whether a
-// ToolExecutionID is required (the five tool-interaction events), and whether TurnID is
-// OPTIONAL (only InputCancelled, whose TurnID is the returned turn for an abnormal
-// return but zero for a pure client retract). A field that is neither required nor
-// forbidden is unconstrained. It holds no per-instance value, so every event type's
-// profile is a plain constant; ValidateEvent reads the runtime ToolExecutionID off
-// the concrete event body when requireTool is set.
+// ToolExecutionID is required (the tool-interaction and permission-review
+// events), and whether TurnID is OPTIONAL (only InputCancelled, whose TurnID is
+// the returned turn for an abnormal return but zero for a pure client retract).
+// A field that is neither required nor forbidden is unconstrained. It holds no
+// per-instance value, so every event type's profile is a plain constant;
+// ValidateEvent reads the runtime ToolExecutionID off the concrete event body
+// when requireTool is set.
 type idProfile struct {
 	requireSession bool
 	requireLoop    bool
@@ -116,7 +138,8 @@ type idProfile struct {
 // ValidateEvent checks ev against the ID fill matrix and returns a typed
 // *InvalidEventError on the first violation, nil when ev satisfies every invariant.
 // EventID is required on every event; the per-type profile then pins the required
-// and must-be-zero coordinates (and ToolExecutionID for the five tool-interaction events).
+// and must-be-zero coordinates (and ToolExecutionID for tool-interaction and
+// permission-review events).
 // Fail-secure: an event whose concrete type is not in the sealed union is invalid
 // with FieldType/RuleUnknownType — the caller learns the type is unknown, not that
 // some coordinate is missing.
@@ -145,6 +168,10 @@ func validateEventIdentity(ev Event) error {
 
 func validateEventBody(ev Event) error {
 	switch e := ev.(type) {
+	case SessionStarted:
+		if !validConfigManifestSchema(e.Manifest, true) {
+			return &InvalidEventError{Event: "SessionStarted", Field: FieldManifest, Rule: RuleInvalid}
+		}
 	case WorkspaceCheckpointed:
 		if e.Consistency != SnapshotQuiescent && e.Consistency != SnapshotFuzzy {
 			return &InvalidEventError{Event: "WorkspaceCheckpointed", Field: FieldConsistency, Rule: RuleInvalid}
@@ -159,6 +186,10 @@ func validateEventBody(ev Event) error {
 		if e.ActiveLoopID.IsZero() {
 			return &InvalidEventError{Event: "ActiveLoopChanged", Field: FieldActiveLoopID, Rule: RuleRequired}
 		}
+	case LoopRestoreTombstoned:
+		if !ValidLoopRestoreTombstoneCategory(e.Category) {
+			return &InvalidEventError{Event: "LoopRestoreTombstoned", Field: FieldCategory, Rule: RuleInvalid}
+		}
 	case DelegateRequestAccepted:
 		if e.Cause.CommandID.IsZero() {
 			return &InvalidEventError{Event: "DelegateRequestAccepted", Field: FieldCommandID, Rule: RuleRequired}
@@ -172,7 +203,19 @@ func validateEventBody(ev Event) error {
 	case IntegrationStatus:
 		return validateIntegrationStatus(e)
 	case LoopStarted:
-		return validateModelRuntime("LoopStarted", e.Runtime)
+		if e.Runtime == (ModelRuntime{}) && e.AgentRuntime == nil {
+			return nil
+		}
+		if err := validateModelRuntime("LoopStarted", e.Runtime); err != nil {
+			return err
+		}
+		if e.AgentRuntime != nil {
+			return validateAgentRuntime(*e.AgentRuntime)
+		}
+	case LoopAgentSessionBound:
+		if !validAgentRuntimeIdentifier(e.ACPSessionID, false) || e.ACPSessionID == "" {
+			return &InvalidEventError{Event: "LoopAgentSessionBound", Field: FieldACPSessionID, Rule: RuleInvalid}
+		}
 	case ContextMeasured:
 		if e.Visibility() != Public {
 			return &InvalidEventError{Event: "ContextMeasured", Field: FieldVisibility, Rule: RuleInvalid}
@@ -221,14 +264,302 @@ func validateEventBody(ev Event) error {
 		}
 	case HustleFailed:
 		return validateHustleFailed(e)
+	case PermissionReviewStarted:
+		return validatePermissionReviewStarted(e)
+	case PermissionReviewCompleted:
+		return validatePermissionReviewCompleted(e)
 	case StepDone:
 		return validateStepDoneMessages(e.Messages)
 	case TurnDone:
 		if err := e.Usage.Validate(); err != nil {
 			return &InvalidEventError{Event: "TurnDone", Field: FieldUsage, Rule: RuleInvalid}
 		}
+	case ConfigurationAdopted:
+		return validateConfigurationAdopted(e)
 	}
 	return nil
+}
+
+func validatePermissionReviewStarted(e PermissionReviewStarted) error {
+	return validatePermissionReviewMetadata(
+		"PermissionReviewStarted",
+		e.Visibility(),
+		e.GateID,
+		e.Classifier,
+		e.ClassifierRevision,
+	)
+}
+
+func validatePermissionReviewCompleted(e PermissionReviewCompleted) error {
+	const name EventName = "PermissionReviewCompleted"
+	if err := validatePermissionReviewMetadata(
+		name,
+		e.Visibility(),
+		e.GateID,
+		e.Classifier,
+		e.ClassifierRevision,
+	); err != nil {
+		return err
+	}
+	if _, ok := gate.ParseReviewStatus(string(e.Status)); !ok {
+		return invalidPermissionReview(name, FieldStatus)
+	}
+
+	switch e.Status {
+	case gate.ReviewStatusAllowed, gate.ReviewStatusNeedsHuman:
+		if _, ok := gate.ParseReviewRisk(string(e.Risk)); !ok {
+			return invalidPermissionReview(name, FieldRisk)
+		}
+		if e.Status == gate.ReviewStatusAllowed && e.Risk == gate.ReviewRiskCritical {
+			return invalidPermissionReview(name, FieldRisk)
+		}
+		if _, ok := gate.ParseReviewAuthorization(string(e.Authorization)); !ok {
+			return invalidPermissionReview(name, FieldAuthorization)
+		}
+		if err := gate.ValidateReviewCategories(e.Categories); err != nil {
+			return invalidPermissionReview(name, FieldCategories)
+		}
+		if e.AutoApproved != (e.Status == gate.ReviewStatusAllowed) {
+			return invalidPermissionReview(name, FieldAutoApproved)
+		}
+	case gate.ReviewStatusNotApplicable,
+		gate.ReviewStatusTimedOut,
+		gate.ReviewStatusFailed,
+		gate.ReviewStatusCancelled,
+		gate.ReviewStatusStale:
+		if e.Risk != "" {
+			return invalidPermissionReview(name, FieldRisk)
+		}
+		if e.Authorization != "" {
+			return invalidPermissionReview(name, FieldAuthorization)
+		}
+		if len(e.Categories) != 0 {
+			return invalidPermissionReview(name, FieldCategories)
+		}
+		if e.AutoApproved {
+			return invalidPermissionReview(name, FieldAutoApproved)
+		}
+	}
+	return nil
+}
+
+func validatePermissionReviewMetadata(
+	name EventName,
+	visibility EventVisibility,
+	gateID gate.ID,
+	classifier hustle.Name,
+	revision string,
+) error {
+	if visibility != Internal {
+		return invalidPermissionReview(name, FieldVisibility)
+	}
+	if gateID.IsZero() {
+		return &InvalidEventError{Event: name, Field: FieldGateID, Rule: RuleRequired}
+	}
+	if gate.ValidatePermissionClassifierName(classifier) != nil {
+		return invalidPermissionReview(name, FieldClassifier)
+	}
+	if !utf8.ValidString(revision) ||
+		strings.TrimSpace(revision) == "" ||
+		len(revision) > gate.MaxPermissionClassifierRevisionBytes {
+		return invalidPermissionReview(name, FieldClassifierRevision)
+	}
+	return nil
+}
+
+func invalidPermissionReview(name EventName, field FieldName) error {
+	return &InvalidEventError{Event: name, Field: field, Rule: RuleInvalid}
+}
+
+// Bounds for ConfigurationAdopted's durable, partly user-authored payload: a
+// hostile or buggy decision must not be able to append an unbounded record to
+// the journal, and a legacy (SchemaVersion 0) manifest projection is never
+// persisted.
+const (
+	maxAgentRuntimeIdentityBytes = 128
+	// maxRuntimeManifestIdentifierBytes bounds the current-schema runtime
+	// identity fields. They are opaque identifiers at this boundary: the
+	// producer owns their meaning, while the journal only accepts the bounded,
+	// secret-free alphabet used by runtime profiles and revisions.
+	maxRuntimeManifestIdentifierBytes = 128
+
+	// The manifest is decoded from untrusted journal input, so its collections
+	// are capped defense-in-depth. The caps are generous: they never trip a
+	// legitimate configuration, only an abusive one.
+	maxConfigManifestTools     = 4096
+	maxConfigManifestAppFields = 1024
+	// maxConfigDriftChanges must never reject a drift summary a VALID manifest
+	// comparison can legitimately produce, or a large-but-legitimate change would
+	// brick every restore. A schema-2 assessment can emit one removal and one
+	// addition per bounded collection member when baseline and candidate are
+	// disjoint, plus thirteen manifest scalar-field categories including hook
+	// policy. Restore may append one root-agent-name change after AssessDrift,
+	// so that slot is explicit too. It still bounds a decoded hostile event.
+	// Runtime identity contributes three additional bounded scalar changes, and
+	// a configured permission-review policy can contribute one more, each of
+	// which is fail-closed.
+	maxConfigDriftScalarChanges  = 17
+	maxConfigDriftAgentNameSlots = 1
+	maxConfigDriftChanges        = 2*maxConfigManifestTools + 2*maxConfigManifestAppFields + maxConfigDriftScalarChanges + maxConfigDriftAgentNameSlots
+	// MaxConfigMessageLen and MaxConfigActorLen bound the durable, partly
+	// user-authored audit fields. They are exported so the restore constructor can
+	// TRUNCATE a decider's over-long Message/Actor before building the adoption (a
+	// long audit note must never brick a restore); the validator here still rejects
+	// an over-long field on a hand-crafted, decoded journal record.
+	MaxConfigMessageLen = 4096
+	MaxConfigActorLen   = 1024
+)
+
+func validateAgentRuntime(v AgentRuntime) error {
+	if v.Harness == "" || v.Profile == "" || v.CredentialMode == "" || v.ModelAlias == "" {
+		return &InvalidEventError{Event: "LoopStarted", Field: FieldAgentRuntime, Rule: RuleRequired}
+	}
+	if v.CredentialMode != "native-auth" && v.CredentialMode != "gateway-backed" {
+		return &InvalidEventError{Event: "LoopStarted", Field: FieldAgentRuntime, Rule: RuleInvalid}
+	}
+	for _, candidate := range []struct {
+		value      string
+		allowSlash bool
+	}{
+		{v.Harness, false},
+		{v.Profile, true},
+		{v.CredentialMode, false},
+		{v.ModelAlias, false},
+		{v.SmallModelAlias, false},
+		{v.ACPSessionID, false},
+	} {
+		if candidate.value != "" && !validAgentRuntimeIdentifier(candidate.value, candidate.allowSlash) {
+			return &InvalidEventError{Event: "LoopStarted", Field: FieldAgentRuntime, Rule: RuleInvalid}
+		}
+	}
+	return nil
+}
+
+func validAgentRuntimeIdentifier(value string, allowSlash bool) bool {
+	if value == "" {
+		return true
+	}
+	if len(value) > maxAgentRuntimeIdentityBytes || !utf8.ValidString(value) || strings.TrimSpace(value) != value {
+		return false
+	}
+	if strings.Contains(value, "://") || strings.HasPrefix(value, "/") || strings.HasPrefix(value, "~/") || strings.HasPrefix(value, "./") || strings.HasPrefix(value, "../") {
+		return false
+	}
+	if !allowSlash && strings.Contains(value, "/") {
+		return false
+	}
+	if allowSlash && strings.Contains(value, "\\") {
+		return false
+	}
+	for _, segment := range strings.Split(value, "/") {
+		if segment == "" || segment == "." || segment == ".." {
+			return false
+		}
+		for _, r := range segment {
+			if r == '\\' || r == ':' || r == 0 || unicode.IsControl(r) || unicode.IsSpace(r) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// validateConfigurationAdopted enforces the config-epoch invariants: epoch 1
+// belongs to SessionStarted so an adoption is always >= 2, the adopted
+// fingerprint is required, the source is one of the four closed DecisionSource
+// values, the drift summary, message, and actor are length-capped, and a legacy
+// (SchemaVersion 0) manifest projection is refused.
+func validateConfigurationAdopted(e ConfigurationAdopted) error {
+	const name EventName = "ConfigurationAdopted"
+	if e.Epoch < 2 {
+		return &InvalidEventError{Event: name, Field: FieldEpoch, Rule: RuleInvalid}
+	}
+	if e.AdoptedFingerprint == "" {
+		return &InvalidEventError{Event: name, Field: FieldAdoptedFingerprint, Rule: RuleRequired}
+	}
+	if !e.Source.Valid() {
+		return &InvalidEventError{Event: name, Field: FieldSource, Rule: RuleInvalid}
+	}
+	if len(e.Drift) > maxConfigDriftChanges {
+		return &InvalidEventError{Event: name, Field: FieldDrift, Rule: RuleInvalid}
+	}
+	if len(e.Message) > MaxConfigMessageLen {
+		return &InvalidEventError{Event: name, Field: FieldMessage, Rule: RuleInvalid}
+	}
+	if len(e.Actor) > MaxConfigActorLen {
+		return &InvalidEventError{Event: name, Field: FieldActor, Rule: RuleInvalid}
+	}
+	if !validConfigManifestSchema(e.Manifest, false) {
+		return &InvalidEventError{Event: name, Field: FieldManifest, Rule: RuleInvalid}
+	}
+	// A persisted manifest's recorded fingerprint must match the manifest itself,
+	// so a durable baseline can never carry a fingerprint that disagrees with the
+	// configuration it describes.
+	if e.Manifest.Fingerprint() != e.AdoptedFingerprint {
+		return &InvalidEventError{Event: name, Field: FieldAdoptedFingerprint, Rule: RuleInvalid}
+	}
+	if len(e.Manifest.Tools) > maxConfigManifestTools {
+		return &InvalidEventError{Event: name, Field: FieldManifest, Rule: RuleInvalid}
+	}
+	if len(e.Manifest.AppFields) > maxConfigManifestAppFields {
+		return &InvalidEventError{Event: name, Field: FieldManifest, Rule: RuleInvalid}
+	}
+	return nil
+}
+
+func validConfigManifestSchema(manifest ConfigManifest, allowLegacy bool) bool {
+	switch manifest.SchemaVersion {
+	case 0:
+		return allowLegacy && manifest.HookPolicyRev == ""
+	case 1:
+		// HookPolicyRev did not exist in schema v1 and is deliberately excluded
+		// from its historical canonical layout. Reject it rather than accepting
+		// policy state that the fingerprint cannot authenticate.
+		return manifest.HookPolicyRev == "" && zeroRuntimeManifest(manifest)
+	case 2:
+		// Schema v2 has no runtime identity fields. Reject populated fields rather
+		// than accepting data the v2 fingerprint does not authenticate.
+		return zeroRuntimeManifest(manifest)
+	case ManifestSchemaVersion:
+		return validRuntimeManifestIdentifier(manifest.RuntimeProfile) &&
+			validRuntimeManifestIdentifier(manifest.RuntimeCatalogRev) &&
+			validRuntimeManifestIdentifier(manifest.RuntimeIdentityRev)
+	default:
+		return false
+	}
+}
+
+// validRuntimeManifestIdentifier validates one current-schema runtime identity
+// field. Empty is valid because native and legacy sessions have no runtime
+// override. Non-empty values are deliberately treated as opaque: this helper
+// does not interpret profiles, catalog revisions, or digests. It only bounds
+// them and permits the identifier alphabet emitted by the runtime producers.
+func validRuntimeManifestIdentifier(value string) bool {
+	if value == "" {
+		return true
+	}
+	if len(value) > maxRuntimeManifestIdentifierBytes || !utf8.ValidString(value) {
+		return false
+	}
+	if strings.TrimSpace(value) != value {
+		return false
+	}
+	for _, segment := range strings.Split(value, "/") {
+		if segment == "" || segment == "." || segment == ".." {
+			return false
+		}
+		for _, r := range segment {
+			if r == '\\' || r == ':' || r == 0 || unicode.IsControl(r) || unicode.IsSpace(r) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func zeroRuntimeManifest(manifest ConfigManifest) bool {
+	return manifest.RuntimeProfile == "" && manifest.RuntimeCatalogRev == "" &&
+		manifest.RuntimeIdentityRev == ""
 }
 
 func invalidHustle(name EventName, field FieldName) *InvalidEventError {
@@ -480,7 +811,8 @@ func checkProfile(name EventName, c identity.Coordinates, toolID uuid.UUID, p id
 	return nil
 }
 
-// toolExecutionID returns the body ToolExecutionID for the five tool-interaction events
+// toolExecutionID returns the body ToolExecutionID for the seven tool-interaction
+// and permission-review events
 // (the only events whose profile sets requireTool) and the zero UUID for every
 // other type — checkProfile ignores it unless requireTool is set.
 func toolExecutionID(ev Event) uuid.UUID {
@@ -494,6 +826,10 @@ func toolExecutionID(ev Event) uuid.UUID {
 	case ToolCallStarted:
 		return e.ToolExecutionID
 	case ToolCallCompleted:
+		return e.ToolExecutionID
+	case PermissionReviewStarted:
+		return e.ToolExecutionID
+	case PermissionReviewCompleted:
 		return e.ToolExecutionID
 	default:
 		return uuid.UUID{}
@@ -522,6 +858,10 @@ func classify(ev Event) (name string, profile idProfile, ok bool) {
 		return "RestoreDone", sessionProfile(), true
 	case RestoreErrored:
 		return "RestoreErrored", sessionProfile(), true
+	case ConfigurationAdopted:
+		// Session-scoped, same shape as SessionStarted: only SessionID set. The
+		// SessionID rides in the Header; the event carries no standalone field.
+		return "ConfigurationAdopted", sessionProfile(), true
 	case WorkspaceCheckpointed:
 		// Session-scoped: a session-global workspace snapshot appended at quiescence
 		// (same shape as RestoreDone/SessionIdle) — only SessionID set. Ref is an
@@ -531,21 +871,22 @@ func classify(ev Event) (name string, profile idProfile, ok bool) {
 		return "WorkspaceRestored", sessionProfile(), true
 	case ActiveLoopChanged:
 		return "ActiveLoopChanged", sessionProfile(), true
+	case LoopRestoreTombstoned:
+		return "LoopRestoreTombstoned", loopProfile(), true
 	case IntegrationStatus:
 		// Session-scoped: an integration is a session-global resource, not a
-		// loop's. Same shape as SecurityLimitChanged — only SessionID set.
+		// loop's. Same shape as WorkspaceCheckpointed — only SessionID set.
 		return "IntegrationStatus", sessionProfile(), true
-	case SecurityLimitChanged:
-		// Session-scoped: a session-global ceiling clamp appended when the operator
-		// changes it (same shape as WorkspaceCheckpointed) — only SessionID set. Level is
-		// an opaque ordinal the validator never constrains.
-		return "SecurityLimitChanged", sessionProfile(), true
 	case HustleStarted:
 		return "HustleStarted", sessionProfile(), true
 	case HustleCompleted:
 		return "HustleCompleted", sessionProfile(), true
 	case HustleFailed:
 		return "HustleFailed", sessionProfile(), true
+	case PermissionReviewStarted:
+		return "PermissionReviewStarted", toolProfile(), true
+	case PermissionReviewCompleted:
+		return "PermissionReviewCompleted", toolProfile(), true
 	case LoopIdle:
 		return "LoopIdle", loopProfile(), true
 	case LoopStarted:
@@ -577,6 +918,8 @@ func classify(ev Event) (name string, profile idProfile, ok bool) {
 		return "CompactWaiterRejected", loopProfile(), true
 	case ForeignSessionBound:
 		return "ForeignSessionBound", loopProfile(), true
+	case LoopAgentSessionBound:
+		return "LoopAgentSessionBound", loopProfile(), true
 	case TokenDelta:
 		return "TokenDelta", stepProfile(), true
 	case TurnStarted:
@@ -682,7 +1025,8 @@ func hostGateProfile() idProfile {
 	return idProfile{requireSession: true}
 }
 
-// toolProfile: the five tool-interaction events — full quartet set plus a required
+// toolProfile: the seven tool-interaction and permission-review events — full
+// quartet set plus a required
 // ToolExecutionID (read from the event body by ValidateEvent, not stored here).
 func toolProfile() idProfile {
 	return idProfile{
