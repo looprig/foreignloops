@@ -85,9 +85,6 @@ func (c Config) validate() error {
 	} else if c.Binding != (launch.ProxyBinding{}) {
 		return &ConfigError{Field: "Binding", Reason: "must be empty for native authentication"}
 	}
-	if c.ModelAlias == "" {
-		return &ConfigError{Field: "ModelAlias", Reason: "is required"}
-	}
 	if !c.Posture.Valid() {
 		return &ConfigError{Field: "Posture", Reason: "must be a supported posture"}
 	}
@@ -97,12 +94,30 @@ func (c Config) validate() error {
 
 	switch c.Harness {
 	case HarnessClaudeCode:
+		if c.gatewayBacked() {
+			if c.ModelAlias == "" {
+				return &ConfigError{Field: "ModelAlias", Reason: "is required"}
+			}
+			if c.SmallModelAlias == "" {
+				return &ConfigError{Field: "SmallModelAlias", Reason: "is required for Claude Code"}
+			}
+			break
+		}
+		if c.ModelAlias == "" && c.SmallModelAlias == "" {
+			break
+		}
+		if c.ModelAlias == "" {
+			return &ConfigError{Field: "ModelAlias", Reason: "must be provided with SmallModelAlias for Claude Code"}
+		}
 		if c.SmallModelAlias == "" {
-			return &ConfigError{Field: "SmallModelAlias", Reason: "is required for Claude Code"}
+			return &ConfigError{Field: "SmallModelAlias", Reason: "must be provided with ModelAlias for Claude Code"}
 		}
 	case HarnessCodex:
 		if c.SmallModelAlias != "" {
 			return &ConfigError{Field: "SmallModelAlias", Reason: "is not supported by Codex"}
+		}
+		if c.gatewayBacked() && c.ModelAlias == "" {
+			return &ConfigError{Field: "ModelAlias", Reason: "is required"}
 		}
 	}
 	return nil

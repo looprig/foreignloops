@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"reflect"
-	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -175,6 +174,13 @@ func installDial(t *testing.T, fn dialFunc) {
 	previous := dial
 	dial = fn
 	t.Cleanup(func() { dial = previous })
+}
+
+func installNativeDial(t *testing.T, fn nativeDialFunc) {
+	t.Helper()
+	previous := nativeDial
+	nativeDial = fn
+	t.Cleanup(func() { nativeDial = previous })
 }
 
 func installClaudeConnectorFactory(t *testing.T, fn claudeConnectorFactory) {
@@ -428,15 +434,15 @@ func TestNewNativeAuthOmitsProxyAndGatewayOverrides(t *testing.T) {
 			sess := newFakeSession("native-auth-session")
 			conn := &fakeClient{newSession: sess}
 			owned := &fakeDialedClient{acpClient: conn}
-			var launchCfg launch.Config
+			var nativeCfg launch.NativeConfig
 			if harnessName == HarnessClaudeCode {
 				installClaudeConnectorFactory(t, func(models launch.ClaudeModels) claudeConnector {
 					return &fakeClaudeConnector{models: models}
 				})
 			}
 
-			installDial(t, func(_ context.Context, got launch.Config) (dialedClient, error) {
-				launchCfg = got
+			installNativeDial(t, func(_ context.Context, got launch.NativeConfig) (dialedClient, error) {
+				nativeCfg = got
 				return owned, nil
 			})
 
@@ -446,30 +452,121 @@ func TestNewNativeAuthOmitsProxyAndGatewayOverrides(t *testing.T) {
 			}
 			defer func() { _ = d.Close() }()
 
-			if launchCfg.SharedProxy != nil {
-				t.Fatal("native launch config SharedProxy != nil, want nil")
-			}
-			if !launchCfg.NoProxy {
-				t.Fatal("native launch config NoProxy = false, want true")
-			}
-			if !reflect.DeepEqual(launchCfg.Command.Env, originalEnv) {
-				t.Fatalf("native launch env = %#v, want caller env %#v without gateway additions", launchCfg.Command.Env, originalEnv)
+			if !reflect.DeepEqual(nativeCfg.Command.Env, originalEnv) {
+				t.Fatalf("native launch env = %#v, want caller env %#v before public native connector configuration", nativeCfg.Command.Env, originalEnv)
 			}
 
-			for _, entry := range launchCfg.Command.Env {
-				if strings.HasPrefix(entry, "ANTHROPIC_BASE_URL=") ||
-					strings.HasPrefix(entry, "ANTHROPIC_AUTH_TOKEN=") ||
-					strings.HasPrefix(entry, "LOOPRIG_PROXY_TOKEN=") {
-					t.Errorf("native configured env contains gateway entry %q", entry)
+			switch harnessName {
+			case HarnessClaudeCode:
+				native, ok := nativeCfg.Harness.(launch.NativeHarnessAdapter)
+				if !ok {
+					t.Fatalf("native launch Harness = %T, want launch.NativeHarnessAdapter", nativeCfg.Harness)
+				}
+				harness, ok := native.(*launch.ClaudeConnector)
+				if !ok {
+					t.Fatalf("native launch Harness = %T, want *launch.ClaudeConnector", native)
+				}
+				wantModels := launch.ClaudeModels{Default: cfg.ModelAlias, Small: cfg.SmallModelAlias}
+				if harness.Models != wantModels {
+					t.Fatalf("native Claude models = %+v, want %+v", harness.Models, wantModels)
+				}
+			case HarnessCodex:
+				native, ok := nativeCfg.Harness.(launch.NativeHarnessAdapter)
+				if !ok {
+					t.Fatalf("native launch Harness = %T, want launch.NativeHarnessAdapter", nativeCfg.Harness)
+				}
+				harness, ok := native.(*launch.CodexConnector)
+				if !ok {
+					t.Fatalf("native launch Harness = %T, want *launch.CodexConnector", native)
+				}
+				if harness.Model != cfg.ModelAlias {
+					t.Fatalf("native Codex model = %q, want %q", harness.Model, cfg.ModelAlias)
+				}
+				wantPosture := codexPosture(cfg.Posture, false)
+				if harness.Posture != wantPosture {
+					t.Fatalf("native Codex posture = %+v, want %+v", harness.Posture, wantPosture)
 				}
 			}
-			if harnessName == HarnessCodex {
-				harness, ok := launchCfg.Harness.(*launch.CodexConnector)
-				if !ok {
-					t.Fatalf("native launch Harness = %T, want *launch.CodexConnector", launchCfg.Harness)
+			if harnessName == HarnessClaudeCode {
+				wantOperations := []string{
+					"set_config:model=" + cfg.ModelAlias,
+					"set_config:model=" + cfg.SmallModelAlias,
+					"set_mode:acceptEdits",
 				}
-				if harness.Posture.SandboxNetworkAccess {
-					t.Fatal("native Codex posture SandboxNetworkAccess = true, want false")
+				if !reflect.DeepEqual(sess.operations, wantOperations) {
+					t.Fatalf("native Claude session operations = %v, want %v", sess.operations, wantOperations)
+				}
+			}
+		})
+	}
+}
+
+func TestNewNativeHarnessManagedDoesNotSelectOrInjectModel(t *testing.T) {
+	for _, harnessName := range []Harness{HarnessClaudeCode, HarnessCodex} {
+		t.Run(string(harnessName), func(t *testing.T) {
+			cfg := validConfig(harnessName)
+			cfg.Credential = loop.CredentialNativeAuth
+			cfg.Binding = launch.ProxyBinding{}
+			cfg.ModelAlias = ""
+			if harnessName == HarnessClaudeCode {
+				cfg.SmallModelAlias = ""
+			}
+			cfg.AgentSessionID = ""
+
+			sess := newFakeSession("native-managed-session")
+			conn := &fakeClient{newSession: sess}
+			owned := &fakeDialedClient{acpClient: conn}
+			var nativeCfg launch.NativeConfig
+			if harnessName == HarnessClaudeCode {
+				installClaudeConnectorFactory(t, func(models launch.ClaudeModels) claudeConnector {
+					if models != (launch.ClaudeModels{}) {
+						t.Fatalf("managed Claude models = %+v, want empty", models)
+					}
+					return &fakeClaudeConnector{models: models}
+				})
+			}
+			installNativeDial(t, func(_ context.Context, got launch.NativeConfig) (dialedClient, error) {
+				nativeCfg = got
+				return owned, nil
+			})
+
+			d, err := New(context.Background(), cfg)
+			if err != nil {
+				t.Fatalf("New() error = %v", err)
+			}
+			defer func() { _ = d.Close() }()
+
+			var wantOperations []string
+			if harnessName == HarnessClaudeCode {
+				wantOperations = []string{"set_mode:acceptEdits"}
+			}
+			if got := sess.operations; !reflect.DeepEqual(got, wantOperations) {
+				t.Fatalf("managed session operations = %v, want %v", got, wantOperations)
+			}
+			switch harnessName {
+			case HarnessClaudeCode:
+				native, ok := nativeCfg.Harness.(launch.NativeHarnessAdapter)
+				if !ok {
+					t.Fatalf("managed native Harness = %T, want launch.NativeHarnessAdapter", nativeCfg.Harness)
+				}
+				harness, ok := native.(*launch.ClaudeConnector)
+				if !ok {
+					t.Fatalf("managed native Harness = %T, want *launch.ClaudeConnector", native)
+				}
+				if harness.Models != (launch.ClaudeModels{}) {
+					t.Fatalf("managed native Claude models = %+v, want empty", harness.Models)
+				}
+			case HarnessCodex:
+				native, ok := nativeCfg.Harness.(launch.NativeHarnessAdapter)
+				if !ok {
+					t.Fatalf("managed native Harness = %T, want launch.NativeHarnessAdapter", nativeCfg.Harness)
+				}
+				harness, ok := native.(*launch.CodexConnector)
+				if !ok {
+					t.Fatalf("managed native Harness = %T, want *launch.CodexConnector", native)
+				}
+				if harness.Model != "" {
+					t.Fatalf("managed native Codex model = %q, want empty", harness.Model)
 				}
 			}
 		})

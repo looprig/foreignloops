@@ -48,6 +48,10 @@ type dialFunc func(context.Context, launch.Config) (dialedClient, error)
 
 var dial dialFunc = dialLaunch
 
+type nativeDialFunc func(context.Context, launch.NativeConfig) (dialedClient, error)
+
+var nativeDial nativeDialFunc = dialNativeLaunch
+
 // claudeConnector is the session-level portion of launch.ClaudeConnector.
 // launch's public methods accept *client.Session, so production uses the
 // adapter below while construction tests can use a narrow in-process fake.
@@ -106,24 +110,33 @@ func New(ctx context.Context, cfg Config) (*Driver, error) {
 		return nil, err
 	}
 
-	launchCfg := launch.Config{
-		Harness: harness,
-		Client: client.Options{
-			Permissions: newPermissionHandler(cfg.Posture, cfg.WorkspaceRoot),
-		},
-		Command: stdio.Command{
-			Path: cfg.Executable,
-			Env:  append([]string(nil), cfg.Env...),
-			Dir:  cfg.WorkspaceRoot,
-		},
+	command := stdio.Command{
+		Path: cfg.Executable,
+		Env:  append([]string(nil), cfg.Env...),
+		Dir:  cfg.WorkspaceRoot,
 	}
+	clientOptions := client.Options{
+		Permissions: newPermissionHandler(cfg.Posture, cfg.WorkspaceRoot),
+	}
+	var owned dialedClient
 	if cfg.gatewayBacked() {
-		launchCfg.SharedProxy = &cfg.Binding
+		owned, err = dial(driverCtx, launch.Config{
+			Harness:     harness,
+			SharedProxy: &cfg.Binding,
+			Command:     command,
+			Client:      clientOptions,
+		})
 	} else {
-		launchCfg.NoProxy = true
+		native, ok := harness.(launch.NativeHarnessAdapter)
+		if !ok {
+			return nil, errors.New("acp: native harness does not implement launch.NativeHarnessAdapter")
+		}
+		owned, err = nativeDial(driverCtx, launch.NativeConfig{
+			Harness: native,
+			Command: command,
+			Client:  clientOptions,
+		})
 	}
-
-	owned, err := dial(driverCtx, launchCfg)
 	if err != nil {
 		return nil, fmt.Errorf("acp: dial: %w", err)
 	}
@@ -154,13 +167,17 @@ func New(ctx context.Context, cfg Config) (*Driver, error) {
 
 	// A loaded Claude session owns its existing configuration. ACP does not
 	// populate mutable config/mode capabilities for session/load, so only a
-	// fresh session receives the requested model and permission setup.
+	// fresh session receives the requested model and permission setup. When
+	// both aliases are empty, native Claude is harness-managed: leave model
+	// selection entirely to the adapter and apply only the posture.
 	if claude != nil && cfg.AgentSessionID == "" {
-		if err := claude.SelectDefaultModel(driverCtx, sess); err != nil {
-			return nil, closeAfterConstructionFailure(d, fmt.Errorf("acp: select default model: %w", err))
-		}
-		if err := claude.SelectSmallModel(driverCtx, sess); err != nil {
-			return nil, closeAfterConstructionFailure(d, fmt.Errorf("acp: select small model: %w", err))
+		if cfg.ModelAlias != "" {
+			if err := claude.SelectDefaultModel(driverCtx, sess); err != nil {
+				return nil, closeAfterConstructionFailure(d, fmt.Errorf("acp: select default model: %w", err))
+			}
+			if err := claude.SelectSmallModel(driverCtx, sess); err != nil {
+				return nil, closeAfterConstructionFailure(d, fmt.Errorf("acp: select small model: %w", err))
+			}
 		}
 		if err := claude.ApplyPermissionMode(driverCtx, sess, claudePermissionMode(cfg.Posture)); err != nil {
 			return nil, closeAfterConstructionFailure(d, fmt.Errorf("acp: apply permission mode: %w", err))
@@ -180,7 +197,12 @@ func connectorFor(cfg Config) (launch.HarnessAdapter, claudeConnector, error) {
 		}
 		return launch.ClaudeCode(models), newClaudeConnector(models), nil
 	case HarnessCodex:
-		codex := launch.Codex("").WithModel(cfg.ModelAlias)
+		var codex *launch.CodexConnector
+		if cfg.gatewayBacked() {
+			codex = launch.Codex("").WithModel(cfg.ModelAlias)
+		} else {
+			codex = launch.Codex(cfg.ModelAlias)
+		}
 		codex.Posture = codexPosture(cfg.Posture, cfg.gatewayBacked())
 		return codex, nil, nil
 	default:
@@ -308,6 +330,17 @@ func dialLaunch(ctx context.Context, cfg launch.Config) (dialedClient, error) {
 	}, nil
 }
 
+func dialNativeLaunch(ctx context.Context, cfg launch.NativeConfig) (dialedClient, error) {
+	managed, err := launch.DialNative(ctx, cfg)
+	if err != nil {
+		return nil, err
+	}
+	return &launchedClient{
+		managed: managed,
+		acp:     &realClient{client: managed.Client()},
+	}, nil
+}
+
 type realClient struct {
 	client *client.Client
 }
@@ -357,6 +390,7 @@ func concreteSession(sess session) (*client.Session, error) {
 }
 
 var _ dialFunc = dialLaunch
+var _ nativeDialFunc = dialNativeLaunch
 var _ claudeConnectorFactory = func(launch.ClaudeModels) claudeConnector {
 	return &realClaudeConnector{}
 }

@@ -186,6 +186,94 @@ func TestConfigValidateAcceptsNativeAuthWithoutBinding(t *testing.T) {
 	}
 }
 
+func TestConfigValidateAcceptsNativeHarnessManagedWithoutModels(t *testing.T) {
+	for _, harness := range []Harness{HarnessClaudeCode, HarnessCodex} {
+		t.Run(string(harness), func(t *testing.T) {
+			cfg := validConfig(harness)
+			cfg.Credential = loop.CredentialNativeAuth
+			cfg.Binding = launch.ProxyBinding{}
+			cfg.ModelAlias = ""
+			if harness == HarnessClaudeCode {
+				cfg.SmallModelAlias = ""
+			}
+
+			if err := cfg.validate(); err != nil {
+				t.Fatalf("validate() error = %v, want nil for harness-managed native mode", err)
+			}
+		})
+	}
+}
+
+func TestConfigValidateRejectsPartialNativeClaudeModelSelection(t *testing.T) {
+	tests := []struct {
+		name  string
+		main  string
+		small string
+		field string
+	}{
+		{name: "small without main", main: "", small: "small", field: "ModelAlias"},
+		{name: "main without small", main: "primary", small: "", field: "SmallModelAlias"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := validConfig(HarnessClaudeCode)
+			cfg.Credential = loop.CredentialNativeAuth
+			cfg.Binding = launch.ProxyBinding{}
+			cfg.ModelAlias = tt.main
+			cfg.SmallModelAlias = tt.small
+
+			err := cfg.validate()
+			if err == nil {
+				t.Fatal("validate() error = nil, want partial native Claude selection rejected")
+			}
+			var cfgErr *ConfigError
+			if !errors.As(err, &cfgErr) {
+				t.Fatalf("validate() error = %T, want *ConfigError", err)
+			}
+			if cfgErr.Field != tt.field {
+				t.Fatalf("ConfigError.Field = %q, want %q", cfgErr.Field, tt.field)
+			}
+		})
+	}
+}
+
+func TestConfigValidateKeepsGatewayModelsConcrete(t *testing.T) {
+	tests := []struct {
+		name    string
+		harness Harness
+		main    string
+		small   string
+		field   string
+	}{
+		{name: "codex model", harness: HarnessCodex, main: "", field: "ModelAlias"},
+		{name: "claude main model", harness: HarnessClaudeCode, main: "", small: "small", field: "ModelAlias"},
+		{name: "claude small model", harness: HarnessClaudeCode, main: "primary", small: "", field: "SmallModelAlias"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := validConfig(tt.harness)
+			cfg.ModelAlias = tt.main
+			if tt.harness == HarnessClaudeCode {
+				cfg.SmallModelAlias = tt.small
+			}
+
+			err := cfg.validate()
+			if err == nil {
+				t.Fatal("validate() error = nil, want gateway model requirement")
+			}
+			var cfgErr *ConfigError
+			if !errors.As(err, &cfgErr) {
+				t.Fatalf("validate() error = %T, want *ConfigError", err)
+			}
+			if cfgErr.Field != tt.field {
+				t.Fatalf("ConfigError.Field = %q, want %q", cfgErr.Field, tt.field)
+			}
+		})
+	}
+}
+
 func TestConfigValidatePreservesCallerOwnedValues(t *testing.T) {
 	cfg := validConfig(HarnessClaudeCode)
 	env := append([]string(nil), cfg.Env...)
