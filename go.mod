@@ -9,7 +9,7 @@ tool (
 )
 
 require (
-	github.com/looprig/acp v0.1.0
+	github.com/looprig/acp v0.1.1
 	github.com/looprig/core v0.5.0
 	github.com/looprig/harness v0.19.0
 	github.com/looprig/inference v0.6.0
