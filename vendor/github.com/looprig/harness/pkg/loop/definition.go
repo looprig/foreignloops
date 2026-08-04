@@ -252,6 +252,15 @@ func (d Definition) Name() identity.AgentName {
 	return d.state.name
 }
 
+// Description returns the immutable user-facing guidance attached to this
+// definition. It is used when compiling parent-scoped agent capabilities.
+func (d Definition) Description() string {
+	if d.state == nil {
+		return ""
+	}
+	return d.state.description
+}
+
 // Delegates returns a defensive copy of the definition's allowed delegate names.
 func (d Definition) Delegates() []identity.AgentName {
 	if d.state == nil {
@@ -561,7 +570,7 @@ func (d Definition) Bind(ctx context.Context, bindings tool.Bindings) (BoundDefi
 		return selected, nil
 	}
 
-	// withExtra appends the caller-injected ExtraTools (the derived delegation Subagent
+	// withExtra appends the caller-injected ExtraTools (the derived delegation agent-tools
 	// tool) to a mode's tool set, so a delegate-bearing loop exposes it in EVERY mode
 	// without the definition hand-listing it. The same immutable ExtraTools definitions
 	// are appended to base + every mode, so build's by-name cache builds each once and
@@ -617,6 +626,8 @@ type BoundDefinition interface {
 	Description() string
 	Engine() Engine
 	RuntimeProfile() RuntimeProfileName
+	RuntimeSource() RuntimeSourceName
+	RuntimeSelectionKind() RuntimeSelectionKind
 	RuntimeCatalogDigest() string
 	RuntimeIdentity() RuntimeIdentity
 	Client() inference.Client
@@ -648,7 +659,7 @@ type BoundDefinition interface {
 
 // boundDefinitionState is the sealed bound view. accessOverride, when non-nil,
 // is a binding-time per-loop gate override installed by OverrideBoundAccess;
-// otherwise Access() resolves the loop's OWN definition gate — a subagent
+// otherwise Access() resolves the loop's OWN definition gate — a child agent
 // binding without an explicit override always inherits its own definition's
 // gate, never another loop's.
 type boundDefinitionState struct {
@@ -656,6 +667,8 @@ type boundDefinitionState struct {
 	modes                 []BoundMode
 	accessOverride        AccessGate
 	runtimeProfile        RuntimeProfileName
+	runtimeSource         RuntimeSourceName
+	runtimeSelectionKind  RuntimeSelectionKind
 	runtimeCatalogDigest  string
 	runtimeModelAlias     ModelAlias
 	runtimeTargetProvider model.ProviderName
@@ -669,11 +682,17 @@ func (b *boundDefinitionState) DisplayName() string                { return b.de
 func (b *boundDefinitionState) Description() string                { return b.definition.description }
 func (b *boundDefinitionState) Engine() Engine                     { return b.definition.engine }
 func (b *boundDefinitionState) RuntimeProfile() RuntimeProfileName { return b.runtimeProfile }
-func (b *boundDefinitionState) RuntimeCatalogDigest() string       { return b.runtimeCatalogDigest }
+func (b *boundDefinitionState) RuntimeSource() RuntimeSourceName   { return b.runtimeSource }
+func (b *boundDefinitionState) RuntimeSelectionKind() RuntimeSelectionKind {
+	return b.runtimeSelectionKind
+}
+func (b *boundDefinitionState) RuntimeCatalogDigest() string { return b.runtimeCatalogDigest }
 func (b *boundDefinitionState) RuntimeIdentity() RuntimeIdentity {
 	return RuntimeIdentity{
 		Profile:        b.runtimeProfile,
 		CatalogDigest:  b.runtimeCatalogDigest,
+		Source:         b.runtimeSource,
+		SelectionKind:  b.runtimeSelectionKind,
 		ModelAlias:     b.runtimeModelAlias,
 		TargetProvider: b.runtimeTargetProvider,
 		TargetModel:    b.runtimeTargetModel,
@@ -885,8 +904,10 @@ func WithDisplayName(name string) Option {
 	}
 }
 
-// WithDescription sets the loop's user-facing description. Purely presentational;
-// excluded from PolicyRevision for the same restore-compat reason as WithDisplayName.
+// WithDescription sets the loop's user-facing description. It remains excluded
+// from PolicyRevision because it is not execution policy, but topology
+// compatibility fingerprints include it so injected agent guidance stays bound
+// to the definition that produced it.
 func WithDescription(desc string) Option {
 	return func(o *definitionOptions) error {
 		if err := o.singleton("description"); err != nil {

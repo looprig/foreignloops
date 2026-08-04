@@ -5,13 +5,14 @@ package tool
 // these stable aliases at the preparation boundary; pkg/tool deliberately does
 // not import pkg/loop.
 type DelegateRuntime struct {
-	Harness    string
-	Profile    string
-	Model      string
-	SmallModel string
-	Effort     string
-	Explicit   DelegateRuntimeExplicit
-	Advertised DelegateRuntimeAdvertised
+	Harness       string
+	Profile       string
+	Source        string
+	SelectionKind string
+	Model         string
+	SmallModel    string
+	Effort        string
+	Explicit      DelegateRuntimeExplicit
 }
 
 // DelegateRuntimeExplicit records which selectors were supplied by the caller.
@@ -19,25 +20,14 @@ type DelegateRuntime struct {
 // distinguishable for downstream pinning and audit decisions.
 type DelegateRuntimeExplicit struct {
 	Harness bool
+	Source  bool
 	Model   bool
 	Effort  bool
 }
 
-// DelegateRuntimeAdvertised records which resolved selectors were visible in
-// the parent-scoped Subagent schema. It is presentation metadata only; the
-// controller ignores it and revalidates the concrete runtime tuple itself.
-type DelegateRuntimeAdvertised struct {
-	Harness bool
-	Model   bool
-	Effort  bool
-}
-
-func (a DelegateRuntimeAdvertised) Any() bool {
-	return a.Harness || a.Model || a.Effort
-}
-
-// DelegateArtifact is the prepared, fully validated Subagent call. It is
-// created once in PrepareCall and consumed once in execution.
+// DelegateArtifact is a prepared, fully validated agent-tool call. It is
+// created once in PrepareCall and consumed once in execution by StartAgent,
+// MessageAgent, ListAgents, or StopAgent.
 type DelegateArtifact struct {
 	Request DelegateRequest
 	Runtime *DelegateRuntime
