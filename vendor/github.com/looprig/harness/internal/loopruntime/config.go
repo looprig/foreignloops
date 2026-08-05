@@ -166,6 +166,14 @@ type runtimeConfig struct {
 	// test seam so a test can inject a deterministic (or failing) factory.
 	eventFactory *event.Factory
 
+	// The four fields below (afterDrain, afterContextReplacement,
+	// beforeCompactionBoundary, afterEffectiveConfigChange) are this package's
+	// test-only observation/synchronization seams: unexported, nil in
+	// production (never assigned by New/newLoopWithSeed outside tests), always
+	// nil-checked at their call sites. Check here before adding a fifth —
+	// the right execution point (turn goroutine vs. actor goroutine, before
+	// vs. after a durable commit) may already exist.
+
 	// afterDrain is a test-only synchronization seam invoked by foldPending in the
 	// turn goroutine AFTER cfg.drainPending has moved the inbox into the actor's
 	// draining buffer but BEFORE the first TurnFoldedInto commit. It is unexported,
@@ -184,6 +192,32 @@ type runtimeConfig struct {
 	// actor after selecting a safe boundary but before priority arbitration. It lets
 	// tests make both bounded command lanes ready without timing sleeps.
 	beforeCompactionBoundary func(compactionBoundaryKind)
+
+	// afterEffectiveConfigChange is a test-only synchronization seam invoked by
+	// applySetMode/applyChangeInference on the actor goroutine immediately after
+	// committing a new state.effective (after the durable LoopModeChanged/
+	// LoopInferenceChanged event has been appended, in the same place the actor
+	// already assigns state.effective/state.runtime). It is unexported, so the
+	// composition root cannot set it; New never assigns it, so it is nil in
+	// production. effectiveConfig carries no other external observation seam (the
+	// only production query, Snapshot, exposes committed msgs/turnIndex, not the
+	// live effective config) and the actor goroutine owns loopState exclusively, so
+	// this exists so a test can race-freely observe a field of effectiveConfig
+	// synchronously, without driving a full turn. The callback runs strictly
+	// BEFORE the command's Ack send (same goroutine, sequential statements), so
+	// a test that captures the passed value before calling the change and blocks
+	// on the Ack reply observes it race-free per Go's channel happens-before
+	// guarantee.
+	//
+	// inferenceCapability gained a real production reader in task 2.3
+	// (loop.go's two measureRequestContext call sites) and 2.4
+	// (compactionExecutionCandidate.InferenceCapability) — reassessed and kept:
+	// TestSetModeReResolvesCapabilityAcrossTransport,
+	// TestChangeInferenceReResolvesCapabilityAcrossTransport, and
+	// TestChangeInferenceUndeclaredTransportRefusedAndCapabilityUnchanged still
+	// want to observe the commit synchronously without driving a full turn
+	// through to measurement, which this seam is the only way to do.
+	afterEffectiveConfigChange func(effectiveConfig)
 
 	// reviewContext, when non-nil, turns on live-only permission-review
 	// context capture (internal/loopruntime/review_context.go) for every turn

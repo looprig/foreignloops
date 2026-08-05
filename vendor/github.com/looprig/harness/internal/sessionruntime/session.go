@@ -616,8 +616,23 @@ type loopHandle struct {
 	selectedHarness loop.AgentHarnessName
 }
 
+// runtimeForModel is the SOLE builder of the durable event.LoopStarted.Runtime — the
+// session-level counterpart to loopruntime's modelRuntime (loop.go), which builds the
+// same shape for LoopModeChanged/LoopInferenceChanged. Dropping a field here silently
+// breaks restore in production: a field missing from the durable LoopStarted record can
+// never be folded back on restore no matter how correct the restore-fold read side is —
+// exactly the bug fixed by e7da984a (APIFormat/BaseURL were grafted at the restore-fold
+// sites before this builder ever populated them on write). See the sibling restore-fold
+// sites this function's output ultimately feeds: internal/loopruntime/restored.go's
+// NewRestoredWithRuntime and loop_change.go's applyModelRuntime.
 func runtimeForModel(model model.Model) event.ModelRuntime {
-	return event.ModelRuntime{Key: model.Key(), Limits: model.Limits, Effort: model.Sampling.Effort}
+	return event.ModelRuntime{
+		Key:       model.Key(),
+		Limits:    model.Limits,
+		Effort:    model.Sampling.Effort,
+		APIFormat: model.APIFormat,
+		BaseURL:   model.BaseURL,
+	}
 }
 
 func (h *loopHandle) ID() uuid.UUID { return h.id }

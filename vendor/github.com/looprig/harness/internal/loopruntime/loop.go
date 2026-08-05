@@ -17,6 +17,7 @@ import (
 	"github.com/looprig/harness/pkg/loop"
 	"github.com/looprig/harness/pkg/tool"
 	"github.com/looprig/inference"
+	contextcount "github.com/looprig/inference/contextcount"
 	model "github.com/looprig/inference/model"
 )
 
@@ -230,16 +231,48 @@ type admissionFaultProbe interface {
 // takes effect only at the next turn boundary. SetLoopMode replaces all five fields;
 // ChangeLoopInference replaces only model+effort. The effort is also baked into
 // model.Sampling.Effort so the request the turn builds carries it.
+//
+// inferenceCapability is seeded from the resolved runtimeConfig (cfg.InferenceCapability)
+// at construction, and re-resolved by applySetMode/applyChangeInference (via
+// BoundDefinition.ContextTransportCapability) whenever a mode or inference change moves
+// the effective model onto a different declared ContextTransport. It always reflects the
+// CURRENTLY selected mode/model's transport capability. Both request-measurement call
+// sites (measureRequestContext, in the contextRequests case and the idle-compaction
+// preparation goroutine) read a per-actor-turn snapshot of this field — captured
+// synchronously on the actor goroutine before any off-actor goroutine spawns — rather
+// than the frozen runtimeConfig.InferenceCapability, which never re-resolves across a
+// transport-crossing change. compaction_executor.go no longer freezes its own copy either:
+// compactionExecutionCandidate.InferenceCapability is threaded per-call from this same
+// per-turn snapshot (see compactionExecutionCandidate construction in loop.go), so a
+// compaction triggered after a transport switch measures against the current transport too.
 type effectiveConfig struct {
-	mode   loop.ModeName
-	model  model.Model
-	effort model.Effort
-	system string
-	tools  ToolSet
+	mode                loop.ModeName
+	model               model.Model
+	effort              model.Effort
+	system              string
+	tools               ToolSet
+	inferenceCapability contextcount.InferenceCapability
 }
 
+// modelRuntime is the SOLE builder of the durable event.ModelRuntime this loop emits: the
+// actor's own state.runtime mirror (construction and every SetLoopMode/ChangeLoopInference
+// commit) and the Runtime field on the LoopModeChanged/LoopInferenceChanged events those
+// commits publish. Dropping a field here silently breaks restore in production — a field
+// missing from the durable record can never be folded back on restore no matter how
+// correct the restore-fold read side is, exactly the bug fixed by e7da984a (APIFormat/
+// BaseURL were grafted at the restore-fold sites before this builder ever populated them
+// on write). See the sibling restore-fold sites this function's output ultimately feeds:
+// restored.go's NewRestoredWithRuntime and sessionruntime/loop_change.go's
+// applyModelRuntime. sessionruntime/session.go's runtimeForModel is the analogous sole
+// builder for the session-level LoopStarted.Runtime.
 func modelRuntime(model model.Model, effort model.Effort) event.ModelRuntime {
-	return event.ModelRuntime{Key: model.Key(), Limits: model.Limits, Effort: effort}
+	return event.ModelRuntime{
+		Key:       model.Key(),
+		Limits:    model.Limits,
+		Effort:    effort,
+		APIFormat: model.APIFormat,
+		BaseURL:   model.BaseURL,
+	}
 }
 
 const defaultDrainTimeout = 5 * time.Second
@@ -444,12 +477,18 @@ func newLoopWithSeed(loopCtx context.Context, sessionID, loopID uuid.UUID, paren
 	// passes the definition's initial mode; NewRestored passes the restore-folded mode (and
 	// cfg already carries any restore-folded inference override). A change command later
 	// replaces these fields, and the next turn captures whatever is current here.
+	//
+	// applySetMode builds its OWN separate effectiveConfig literal (see the "next :="
+	// literal below) rather than sharing this one — a keyed struct literal doesn't
+	// force the two to stay in sync, so a future field added to effectiveConfig must
+	// be set at BOTH sites or it silently zero-values on a mode change.
 	state.effective = effectiveConfig{
-		mode:   initialMode,
-		model:  cfg.Model,
-		effort: cfg.Model.Sampling.Effort,
-		system: cfg.System,
-		tools:  cfg.Tools,
+		mode:                initialMode,
+		model:               cfg.Model,
+		effort:              cfg.Model.Sampling.Effort,
+		system:              cfg.System,
+		tools:               cfg.Tools,
+		inferenceCapability: cfg.InferenceCapability,
 	}
 	state.runtime = modelRuntime(cfg.Model, cfg.Model.Sampling.Effort)
 	if seed != nil {
@@ -1092,6 +1131,7 @@ func runLoop(cfg loopConfig, state loopState) {
 				Messages: cloneMessages(transcript),
 			},
 			tools: tools, transcript: transcript,
+			inferenceCapability: state.effective.inferenceCapability,
 		}
 		idleCompaction = &preparation
 		go func(preparationCtx context.Context, prepared idleCompactionPreparation, admission contextAdmissionSettings) {
@@ -1099,14 +1139,14 @@ func runLoop(cfg loopConfig, state loopState) {
 			request.Tools = toolDefs(preparationCtx, prepared.tools.Registry)
 			runtimeRevision := revisionDigest(nil)
 			measurement, err := measureRequestContext(
-				preparationCtx, config.ContextCounter, config.CounterCapability, config.InferenceCapability,
+				preparationCtx, config.ContextCounter, config.CounterCapability, prepared.inferenceCapability,
 				admission, prepared.basis, request, runtimeRevision,
 			)
 			result := idleCompactionCountResult{
 				preparation: prepared,
 				candidate: compactionExecutionCandidate{
 					Measurement: measurement, Request: request, RuntimeRevision: runtimeRevision,
-					Transcript: cloneMessages(prepared.transcript),
+					Transcript: cloneMessages(prepared.transcript), InferenceCapability: prepared.inferenceCapability,
 				},
 				err: err,
 			}
@@ -2105,13 +2145,35 @@ func runLoop(cfg loopConfig, state loopState) {
 		// resolved.Tools carries only the definition's declared registry.
 		nextTools := resolveToolSetCaps(resolved.Tools)
 		nextTools.Registry = composeRegistry(resolved.Tools.Registry, state.external)
-		next := effectiveConfig{mode: modeName, model: resolved.Model, effort: resolved.Model.Sampling.Effort, system: resolved.System, tools: nextTools}
+		// Re-resolve the effective capability for the NEW mode's model transport.
+		// resolved.InferenceCapability (from configForMode/resolveMode) is deliberately
+		// NOT used here: resolveMode only ever reads the definition's BASE transport
+		// capability (bound.InferenceCapability()), which is wrong for a mode whose
+		// model sits on a different declared ContextTransport. ContextTransportCapability
+		// looks up the capability declared for resolved.Model's OWN transport identity.
+		// cfg.bound is nil only on the raw-config test path, which never predeclares
+		// modes (configForMode already refused above in that case), so this guard is
+		// defensive; a missing/undeclared transport leaves the capability unchanged
+		// rather than silently zeroing it.
+		nextCapability := state.effective.inferenceCapability
+		if cfg.bound != nil {
+			if capability, ok := cfg.bound.ContextTransportCapability(resolved.Model); ok {
+				nextCapability = capability
+			}
+		}
+		// This is a SEPARATE effectiveConfig literal from newLoopWithSeed's — see the
+		// cross-reference comment there. Adding a field to effectiveConfig means setting
+		// it here too, or a mode change silently resets it to zero.
+		next := effectiveConfig{mode: modeName, model: resolved.Model, effort: resolved.Model.Sampling.Effort, system: resolved.System, tools: nextTools, inferenceCapability: nextCapability}
 		if err := commitContextConfigurationChange(event.LoopModeChanged{Header: changeHeader(), PreviousMode: string(state.effective.mode), Mode: string(modeName), Runtime: modelRuntime(next.model, next.effort)}); err != nil {
 			c.Ack <- command.LoopChangeResult{Err: &loop.ChangeError{Kind: loop.ChangeDurableAppendFailed, Cause: err}}
 			return
 		}
 		state.effective = next
 		state.runtime = modelRuntime(next.model, next.effort)
+		if config.afterEffectiveConfigChange != nil {
+			config.afterEffectiveConfigChange(state.effective)
+		}
 		c.Ack <- command.LoopChangeResult{Mode: string(next.mode), Model: next.model, Effort: next.effort}
 	}
 
@@ -2200,6 +2262,17 @@ func runLoop(cfg loopConfig, state loopState) {
 				}
 			}
 		}
+		// Re-resolve the effective capability for the NEW model's transport (see the
+		// matching comment in applySetMode for why ContextTransportCapability, not
+		// resolved.InferenceCapability, is the correct lookup). An effort-only change
+		// (c.SetModel false) leaves the current capability untouched — the model, and
+		// therefore its transport, has not changed.
+		nextCapability := state.effective.inferenceCapability
+		if c.SetModel && cfg.bound != nil {
+			if capability, ok := cfg.bound.ContextTransportCapability(model); ok {
+				nextCapability = capability
+			}
+		}
 		if c.SetEffort {
 			effort = c.Effort
 			if !effort.Valid() {
@@ -2215,7 +2288,11 @@ func runLoop(cfg loopConfig, state loopState) {
 		}
 		state.effective.model = model
 		state.effective.effort = effort
+		state.effective.inferenceCapability = nextCapability
 		state.runtime = modelRuntime(model, effort)
+		if config.afterEffectiveConfigChange != nil {
+			config.afterEffectiveConfigChange(state.effective)
+		}
 		c.Ack <- command.LoopChangeResult{Mode: string(state.effective.mode), Model: model, Effort: effort}
 	}
 
@@ -2501,12 +2578,13 @@ func runLoop(cfg loopConfig, state loopState) {
 			}
 			basis := state.contextTracker.currentBasis()
 			generation := state.contextGeneration
-			go func(request contextMeasureRequest, admission contextAdmissionSettings, measuredBasis event.ContextBasis, measuredGeneration uint64) {
+			capability := state.effective.inferenceCapability
+			go func(request contextMeasureRequest, admission contextAdmissionSettings, measuredBasis event.ContextBasis, measuredGeneration uint64, measuredCapability contextcount.InferenceCapability) {
 				measurement, err := measureRequestContext(
 					request.ctx,
 					config.ContextCounter,
 					config.CounterCapability,
-					config.InferenceCapability,
+					measuredCapability,
 					admission,
 					measuredBasis,
 					request.request,
@@ -2518,7 +2596,7 @@ func runLoop(cfg loopConfig, state loopState) {
 				case <-request.ctx.Done():
 				case <-ctx.Done():
 				}
-			}(req, settings, basis, generation)
+			}(req, settings, basis, generation, capability)
 
 		case result := <-idleCompactionResults:
 			preparing := idleCompaction
@@ -2647,7 +2725,7 @@ func runLoop(cfg loopConfig, state loopState) {
 			executionCandidate := compactionExecutionCandidate{
 				Measurement: result.measurement, Request: result.request.request,
 				RuntimeTail: result.request.runtimeTail, RuntimeRevision: result.request.runtimeContextRevision,
-				Transcript: cloneMessages(state.msgs),
+				Transcript: cloneMessages(state.msgs), InferenceCapability: state.effective.inferenceCapability,
 			}
 			if compactions.pendingAtBoundary() {
 				pending := compactions.pendingAttempt()
