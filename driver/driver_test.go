@@ -41,7 +41,17 @@ var (
 	_ Stream = (*fakeStream)(nil)
 
 	_ = Turn{"system", "sid", true, []content.Block(nil), "/workspace", PostureDefault}
-	_ = Event{KindInit, "sid", "text", "tool-id", "tool", true, "preview", (*content.AIMessage)(nil), "error"}
+	_ = Event{
+		Kind:          KindInit,
+		SessionID:     "sid",
+		Text:          "text",
+		ToolUseID:     "tool-id",
+		ToolName:      "tool",
+		IsError:       true,
+		ResultPreview: "preview",
+		Message:       (*content.AIMessage)(nil),
+		ErrText:       "error",
+	}
 	_ = History{true, []content.AgenticMessages(nil)}
 )
 
