@@ -308,7 +308,7 @@ func (l *Loop) drainStream(stream driver.Stream, cur event.TurnIndex, sidBound b
 			if input.Message != nil {
 				output.assistant = append(output.assistant, input.Message)
 			}
-		case driver.KindTerminalError:
+		case driver.KindTerminalError, driver.KindModelFacingError:
 			output.terminal = true
 			output.termErr = resultError(input)
 		default:

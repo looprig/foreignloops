@@ -197,6 +197,6 @@ func TestMapperModelFacingFailureUsesDedicatedError(t *testing.T) {
 }
 
 func markModelFacing(input driver.Event) driver.Event {
-	input.ModelFacing = true
+	input.Kind = driver.KindModelFacingError
 	return input
 }

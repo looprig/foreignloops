@@ -24,7 +24,7 @@ func TestBackendAndDriverPublicTopLevelSymbols(t *testing.T) {
 			dir:  filepath.Join(root, "driver"),
 			want: []string{
 				"Agent", "Closer", "DecodeError", "Event", "ExitError", "History", "HistoryError",
-				"Kind", "KindInit", "KindStepComplete", "KindTerminalError", "KindTerminalOK",
+				"Kind", "KindInit", "KindModelFacingError", "KindStepComplete", "KindTerminalError", "KindTerminalOK",
 				"KindTextDelta", "KindThinkingDelta", "KindToolResult", "KindToolUse",
 				"PermissionPosture", "Posture", "PostureAcceptEdits", "PostureDefault", "PostureReadOnly",
 				"PostureWorkspaceWrite", "SpawnError", "Stream", "Turn",

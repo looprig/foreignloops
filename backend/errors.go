@@ -59,18 +59,17 @@ func (e *modelFacingResultError) Error() string {
 func (e *modelFacingResultError) ModelFacingError() string { return e.Detail }
 
 func resultError(input driver.Event) error {
-	if input.ModelFacing {
+	if input.Kind == driver.KindModelFacingError {
 		return &modelFacingResultError{Detail: input.ErrText}
 	}
 	return &ForeignResultError{Detail: input.ErrText}
 }
 
 func joinTurnErrors(terminal, closeErr error) error {
-	var modelFacing *modelFacingResultError
-	if errors.As(terminal, &modelFacing) && modelFacing != nil {
+	if _, ok := terminal.(*modelFacingResultError); ok {
 		// A model-facing projection is the only detail allowed to cross this
 		// boundary. Do not join it with an arbitrary stream-close diagnostic.
-		return modelFacing
+		return terminal
 	}
 	return errors.Join(terminal, closeErr)
 }

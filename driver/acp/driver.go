@@ -182,7 +182,7 @@ func New(ctx context.Context, cfg Config) (*Driver, error) {
 				return nil, closeAfterConstructionFailure(d, fmt.Errorf("acp: select small model: %w", err))
 			}
 		}
-		if cfg.Effort != "" {
+		if nativeEffort(cfg.Effort) != "" {
 			if err := claude.SelectEffort(driverCtx, sess); err != nil {
 				return nil, closeAfterConstructionFailure(d, fmt.Errorf("acp: select effort: %w", err))
 			}
@@ -203,21 +203,35 @@ func connectorFor(cfg Config) (launch.HarnessAdapter, claudeConnector, error) {
 			Default: cfg.ModelAlias,
 			Small:   cfg.SmallModelAlias,
 		}
+		effort := nativeEffort(cfg.Effort)
 		claude := launch.ClaudeCode(models)
-		claude.Effort = cfg.Effort
-		return claude, newClaudeConnector(models, cfg.Effort), nil
+		claude.Effort = effort
+		return claude, newClaudeConnector(models, effort), nil
 	case HarnessCodex:
 		var codex *launch.CodexConnector
 		if cfg.gatewayBacked() {
 			codex = launch.Codex("").WithModel(cfg.ModelAlias)
+		} else if nativeEffort(cfg.Effort) == "" {
+			if cfg.ModelAlias == "" {
+				codex = launch.Codex("")
+			} else {
+				codex = launch.Codex("").WithModel(cfg.ModelAlias)
+			}
 		} else {
-			codex = launch.Codex("").WithModelEffort(cfg.ModelAlias, cfg.Effort)
+			codex = launch.Codex("").WithModelEffort(cfg.ModelAlias, nativeEffort(cfg.Effort))
 		}
 		codex.Posture = codexPosture(cfg.Posture, cfg.gatewayBacked())
 		return codex, nil, nil
 	default:
 		return nil, nil, &ConfigError{Field: "Harness", Reason: "must be a supported harness"}
 	}
+}
+
+func nativeEffort(effort string) string {
+	if effort == "" || effort == "none" {
+		return ""
+	}
+	return effort
 }
 
 func createSession(ctx context.Context, c acpClient, cfg Config) (session, error) {

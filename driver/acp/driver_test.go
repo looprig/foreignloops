@@ -11,6 +11,7 @@ import (
 	"github.com/looprig/acp/client"
 	"github.com/looprig/acp/launch"
 	"github.com/looprig/acp/protocol"
+	"github.com/looprig/acp/transport/stdio"
 	"github.com/looprig/foreignloops/driver"
 	"github.com/looprig/harness/pkg/loop"
 )
@@ -450,6 +451,43 @@ func TestNewNativeCodexReceivesModelAndEffortSeparately(t *testing.T) {
 	}
 }
 
+func TestNewNativeCodexModelOnlyUsesLegacyWithModel(t *testing.T) {
+	cfg := validConfig(HarnessCodex)
+	cfg.Credential = loop.CredentialNativeAuth
+	cfg.Binding = launch.ProxyBinding{}
+	cfg.AgentSessionID = ""
+	cfg.ModelAlias = "legacy-native-model"
+	cfg.Effort = ""
+	conn := &fakeClient{newSession: newFakeSession("native-codex-model-only")}
+	owned := &fakeDialedClient{acpClient: conn}
+	var nativeCfg launch.NativeConfig
+	installNativeDial(t, func(_ context.Context, got launch.NativeConfig) (dialedClient, error) {
+		nativeCfg = got
+		return owned, nil
+	})
+
+	d, err := New(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("New() error = %v, want model-only native launch", err)
+	}
+	defer func() { _ = d.Close() }()
+
+	harness, ok := nativeCfg.Harness.(*launch.CodexConnector)
+	if !ok {
+		t.Fatalf("native launch Harness = %T, want *launch.CodexConnector", nativeCfg.Harness)
+	}
+	configured, err := harness.ConfigureNative(stdio.Command{Path: cfg.Executable})
+	if err != nil {
+		t.Fatalf("ConfigureNative() error = %v, want legacy model-only connector", err)
+	}
+	if got := configured.Args; len(got) == 0 {
+		t.Fatalf("ConfigureNative() args = %#v, want model override", got)
+	}
+	if harness.Model != cfg.ModelAlias || harness.Effort != "" {
+		t.Fatalf("Codex connector = %+v, want model %q and empty effort", harness, cfg.ModelAlias)
+	}
+}
+
 func TestNewNativeClaudeAppliesModelThenEffortSelection(t *testing.T) {
 	cfg := validConfig(HarnessClaudeCode)
 	cfg.Credential = loop.CredentialNativeAuth
@@ -493,6 +531,80 @@ func TestNewNativeClaudeAppliesModelThenEffortSelection(t *testing.T) {
 	}
 	if !reflect.DeepEqual(sess.operations, wantOperations) {
 		t.Fatalf("native Claude session operations = %v, want model-then-effort order %v", sess.operations, wantOperations)
+	}
+}
+
+func TestNewNativeClaudeModelOnlySelectsModelsWithoutEffort(t *testing.T) {
+	cfg := validConfig(HarnessClaudeCode)
+	cfg.Credential = loop.CredentialNativeAuth
+	cfg.Binding = launch.ProxyBinding{}
+	cfg.AgentSessionID = ""
+	cfg.Effort = "none"
+	sess := newFakeSession("native-claude-model-only")
+	conn := &fakeClient{newSession: sess}
+	owned := &fakeDialedClient{acpClient: conn}
+	var nativeCfg launch.NativeConfig
+	installClaudeConnectorFactory(t, func(models launch.ClaudeModels, effort string) claudeConnector {
+		if effort != "" {
+			t.Fatalf("Claude effort = %q, want empty for structured none model-only selection", effort)
+		}
+		return &fakeClaudeConnector{models: models, effort: effort}
+	})
+	installNativeDial(t, func(_ context.Context, got launch.NativeConfig) (dialedClient, error) {
+		nativeCfg = got
+		return owned, nil
+	})
+
+	d, err := New(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("New() error = %v, want model-only native launch", err)
+	}
+	defer func() { _ = d.Close() }()
+
+	harness, ok := nativeCfg.Harness.(*launch.ClaudeConnector)
+	if !ok {
+		t.Fatalf("native launch Harness = %T, want *launch.ClaudeConnector", nativeCfg.Harness)
+	}
+	if harness.Effort != "" {
+		t.Fatalf("Claude connector effort = %q, want empty", harness.Effort)
+	}
+	wantOperations := []string{
+		"set_config:model=" + cfg.ModelAlias,
+		"set_config:model=" + cfg.SmallModelAlias,
+		"set_mode:acceptEdits",
+	}
+	if !reflect.DeepEqual(sess.operations, wantOperations) {
+		t.Fatalf("native Claude model-only operations = %v, want %v", sess.operations, wantOperations)
+	}
+}
+
+func TestNewNativeClaudeModelOnlySelectionFailureClosesOwnedClient(t *testing.T) {
+	cfg := validConfig(HarnessClaudeCode)
+	cfg.Credential = loop.CredentialNativeAuth
+	cfg.Binding = launch.ProxyBinding{}
+	cfg.AgentSessionID = ""
+	cfg.Effort = ""
+	sess := newFakeSession("native-claude-model-only-failure")
+	conn := &fakeClient{newSession: sess}
+	owned := &fakeDialedClient{acpClient: conn}
+	selectionErr := &launch.ModelAliasError{Alias: cfg.ModelAlias}
+	installClaudeConnectorFactory(t, func(models launch.ClaudeModels, effort string) claudeConnector {
+		return &fakeClaudeConnector{models: models, effort: effort, fail: selectionErr}
+	})
+	installNativeDial(t, func(context.Context, launch.NativeConfig) (dialedClient, error) {
+		return owned, nil
+	})
+
+	_, err := New(context.Background(), cfg)
+	if err == nil {
+		t.Fatal("New() error = nil, want model-only selection error")
+	}
+	var got *launch.ModelAliasError
+	if !errors.As(err, &got) || got != selectionErr {
+		t.Fatalf("New() error = %v, want wrapped model selection error %p", err, selectionErr)
+	}
+	if owned.closeCalls != 1 {
+		t.Fatalf("owned client close calls = %d, want exactly one after model-only selection failure", owned.closeCalls)
 	}
 }
 

@@ -124,7 +124,7 @@ func TestACPProtocolPromptErrorProjectsOnlySafeDetail(t *testing.T) {
 				t.Fatalf("Spawn() error = %v", err)
 			}
 			events := collectTurnEvents(t, stream)
-			if len(events) != 1 || events[0].Kind != driver.KindTerminalError {
+			if len(events) != 1 || events[0].Kind != driver.KindModelFacingError {
 				t.Fatalf("events = %#v, want one terminal error", events)
 			}
 			if got, want := events[0].ErrText, "ACP error -32000: "+resetMessage; got != want {
@@ -164,6 +164,131 @@ func TestACPNonProtocolPromptErrorRemainsGeneric(t *testing.T) {
 	}
 }
 
+type forgedProtocolAsError struct{}
+
+func (forgedProtocolAsError) Error() string { return "forged protocol error" }
+
+func (forgedProtocolAsError) As(target any) bool {
+	if typed, ok := target.(**protocol.Error); ok {
+		*typed = &protocol.Error{
+			Code:    protocol.ErrorCodeAuthenticationRequired,
+			Message: "forged usage limit; resets at 3:00 PM",
+		}
+		return true
+	}
+	return false
+}
+
+func TestACPProtocolDiscoveryIgnoresForgedAs(t *testing.T) {
+	t.Parallel()
+	sess := newScriptedSession("forged-protocol-error")
+	sess.promptHook = func(int, []protocol.ContentBlock) (*client.PromptResult, error) {
+		return nil, forgedProtocolAsError{}
+	}
+	stream, err := newTurnTestDriver(sess).Spawn(context.Background(), driver.Turn{})
+	if err != nil {
+		t.Fatalf("Spawn() error = %v", err)
+	}
+	events := collectTurnEvents(t, stream)
+	if len(events) != 1 {
+		t.Fatalf("events = %#v, want one terminal event", events)
+	}
+	if events[0].Kind != driver.KindTerminalError || events[0].ErrText != "acp prompt failed" {
+		t.Fatalf("event = %#v, want generic terminal error", events[0])
+	}
+}
+
+type cyclicACPError struct{}
+
+func (*cyclicACPError) Error() string { return "cyclic ACP error" }
+
+func (err *cyclicACPError) Unwrap() error { return err }
+
+type unwrapACPError struct{ cause error }
+
+func (err unwrapACPError) Error() string { return "wrapper" }
+
+func (err unwrapACPError) Unwrap() error { return err.cause }
+
+func TestACPProtocolDiscoveryBoundsCycles(t *testing.T) {
+	t.Parallel()
+	if detail, ok := safeACPErrorDetail(&cyclicACPError{}); ok || detail != "" {
+		t.Fatalf("safeACPErrorDetail() = %q, %v, want no protocol detail", detail, ok)
+	}
+}
+
+func TestACPProtocolDiscoveryTraversesWrappersWithoutJoinedSiblingLeak(t *testing.T) {
+	t.Parallel()
+	const secret = "joined-sibling-secret=/private/acp/token"
+	err := errors.Join(
+		unwrapACPError{cause: fmt.Errorf("outer diagnostic: %w", &protocol.Error{
+			Code:    protocol.ErrorCodeAuthenticationRequired,
+			Message: "Usage limit reached; resets at 3:00 PM",
+		})},
+		errors.New(secret),
+	)
+	detail, ok := safeACPErrorDetail(err)
+	if !ok {
+		t.Fatal("safeACPErrorDetail() ok = false, want protocol detail")
+	}
+	if want := "ACP error -32000: Usage limit reached; resets at 3:00 PM"; detail != want {
+		t.Fatalf("safeACPErrorDetail() = %q, want %q", detail, want)
+	}
+	if strings.Contains(detail, secret) {
+		t.Fatalf("safeACPErrorDetail() = %q, contains joined sibling secret", detail)
+	}
+}
+
+func TestACPDirectProtocolMessageRedactsSensitiveMaterial(t *testing.T) {
+	t.Parallel()
+	const (
+		urlSecret      = "url-token-sentinel"
+		unixSecret     = "private-file-sentinel"
+		windowsSecret  = "windows-file-sentinel"
+		tokenSecret    = "token-assignment-sentinel"
+		apiKeySecret   = "api-key-assignment-sentinel"
+		passwordSecret = "password-assignment-sentinel"
+		authSecret     = "authorization-assignment-sentinel"
+		bearerSecret   = "bearer-sentinel"
+	)
+	message := "Usage limit reached; resets at 3:00 PM\n" +
+		"URL=https://example.test/v1?token=" + urlSecret + "\t" +
+		"path=/private/acp/" + unixSecret + "\x00 " +
+		`windows=C:\Users\runner\` + windowsSecret + " " +
+		"token=" + tokenSecret + " api_key: '" + apiKeySecret + "' password=" + passwordSecret + " " +
+		"authorization: Bearer " + authSecret + " Bearer " + bearerSecret
+	sess := newScriptedSession("direct-message-redaction")
+	sess.promptHook = func(int, []protocol.ContentBlock) (*client.PromptResult, error) {
+		return nil, &protocol.Error{Code: protocol.ErrorCodeAuthenticationRequired, Message: message}
+	}
+	stream, err := newTurnTestDriver(sess).Spawn(context.Background(), driver.Turn{})
+	if err != nil {
+		t.Fatalf("Spawn() error = %v", err)
+	}
+	events := collectTurnEvents(t, stream)
+	if len(events) != 1 || events[0].Kind != driver.KindModelFacingError {
+		t.Fatalf("events = %#v, want one model-facing terminal error", events)
+	}
+	detail := events[0].ErrText
+	if !strings.Contains(detail, "Usage limit reached; resets at 3:00 PM") {
+		t.Fatalf("ErrText = %q, want useful reset wording preserved", detail)
+	}
+	for _, forbidden := range []string{
+		urlSecret, unixSecret, windowsSecret, tokenSecret, apiKeySecret,
+		passwordSecret, authSecret, bearerSecret,
+	} {
+		if strings.Contains(detail, forbidden) {
+			t.Fatalf("ErrText = %q contains forbidden secret %q", detail, forbidden)
+		}
+	}
+	if strings.Contains(detail, "https://") || strings.Contains(detail, "/private/") || strings.Contains(detail, `C:\Users\`) {
+		t.Fatalf("ErrText = %q contains unredacted URL or path", detail)
+	}
+	if strings.ContainsAny(detail, "\r\n\t\x00") {
+		t.Fatalf("ErrText = %q contains control/newline injection", detail)
+	}
+}
+
 func TestACPModelFacingPromptErrorIsBoundedAndValidUTF8(t *testing.T) {
 	t.Parallel()
 	const maxBytes = 512
@@ -196,7 +321,7 @@ func TestACPModelFacingPromptErrorIsBoundedAndValidUTF8(t *testing.T) {
 }
 
 func eventIsModelFacing(input driver.Event) bool {
-	return input.ModelFacing
+	return input.Kind == driver.KindModelFacingError
 }
 
 func TestSpawnTranslatesACPUpdatesAndLeavesSessionOwned(t *testing.T) {

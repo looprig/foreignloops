@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"reflect"
+	"regexp"
 	"strings"
 	"sync"
 	"unicode"
@@ -293,30 +295,142 @@ func sendTurnEvent(ctx context.Context, events chan<- driver.Event, event driver
 // unbounded model-facing payload.
 const maxACPModelFacingErrorBytes = 512
 
+const (
+	maxACPErrorDepth    = 32
+	maxACPErrorNodes    = 128
+	maxACPErrorChildren = 64
+)
+
+const redactedACPPath = "[REDACTED_PATH]"
+
+var (
+	acpMessageURLPattern              = regexp.MustCompile(`(?i)\b[a-z][a-z0-9+.-]*://[^\s<>"']+`)
+	acpMessageAuthPattern             = regexp.MustCompile(`(?i)(\b(?:authorization|proxy-authorization)\b\s*["']?\s*[:=]\s*)[^\r\n,;&}\]]+`)
+	acpMessageSecretAssignmentPattern = regexp.MustCompile(`(?i)(\b(?:api[\s_-]*key|access[\s_-]*token|refresh[\s_-]*token|token|password|credential|secret)\b\s*["']?\s*[:=]\s*)(?:"[^"]*"|'[^']*'|[^\s,;&}\]]+)`)
+	acpMessageBearerPattern           = regexp.MustCompile(`(?i)\bBearer\s+[A-Za-z0-9][A-Za-z0-9._~+/=-]*`)
+	acpMessageUnixPathPattern         = regexp.MustCompile(`/[^\s,;)}\]>"']+`)
+	acpMessageWindowsPathPattern      = regexp.MustCompile(`(?i)[A-Za-z]:[\\/][^\s,;)}\]>"']*`)
+)
+
 func promptFailureEvent(err error) driver.Event {
 	if detail, ok := safeACPErrorDetail(err); ok {
 		return driver.Event{
-			Kind:        driver.KindTerminalError,
-			ErrText:     detail,
-			ModelFacing: true,
+			Kind:    driver.KindModelFacingError,
+			ErrText: detail,
 		}
 	}
 	return driver.Event{Kind: driver.KindTerminalError, ErrText: "acp prompt failed"}
 }
 
-// safeACPErrorDetail intentionally reads only Code and Message from a typed
-// ACP protocol failure. In particular, it does not inspect Data, Error(), or
-// any unwrapped cause, because those may contain provider-internal secrets.
+// safeACPErrorDetail intentionally reads only Code and Message from an actual
+// ACP protocol failure. It never calls errors.As: an arbitrary error can use
+// As(any) bool to fabricate a protocol value, and Error()/Data()/causes may
+// contain provider-internal secrets. Only direct protocol values and standard
+// Unwrap-shaped wrappers are traversed, with finite bounds for hostile chains.
 func safeACPErrorDetail(err error) (string, bool) {
-	var fault *protocol.Fault
-	if errors.As(err, &fault) && fault != nil {
-		return formatACPErrorDetail(fault.Code, fault.Message), true
+	type node struct {
+		err   error
+		depth int
 	}
-	var wireErr *protocol.Error
-	if errors.As(err, &wireErr) && wireErr != nil {
-		return formatACPErrorDetail(wireErr.Code, wireErr.Message), true
+	if isNilACPError(err) {
+		return "", false
+	}
+	pending := []node{{err: err}}
+	seen := make(map[error]struct{})
+	visited := 0
+	for len(pending) > 0 && visited < maxACPErrorNodes {
+		current := pending[len(pending)-1]
+		pending = pending[:len(pending)-1]
+		if isNilACPError(current.err) || markACPErrorSeen(seen, current.err) {
+			continue
+		}
+		visited++
+		if code, message, ok := directACPErrorFields(current.err); ok {
+			return formatACPErrorDetail(code, message), true
+		}
+		if current.depth >= maxACPErrorDepth {
+			continue
+		}
+
+		if wrapper, ok := current.err.(interface{ Unwrap() []error }); ok {
+			children := safeACPUnwrapMany(wrapper)
+			if len(children) > maxACPErrorChildren {
+				children = children[:maxACPErrorChildren]
+			}
+			for index := len(children) - 1; index >= 0; index-- {
+				pending = append(pending, node{err: children[index], depth: current.depth + 1})
+			}
+			continue
+		}
+		if wrapper, ok := current.err.(interface{ Unwrap() error }); ok {
+			pending = append(pending, node{err: safeACPUnwrapOne(wrapper), depth: current.depth + 1})
+		}
 	}
 	return "", false
+}
+
+func directACPErrorFields(err error) (protocol.ErrorCode, string, bool) {
+	switch typed := any(err).(type) {
+	case *protocol.Error:
+		if typed == nil {
+			return 0, "", false
+		}
+		return typed.Code, typed.Message, true
+	case protocol.Error:
+		return typed.Code, typed.Message, true
+	case *protocol.Fault:
+		if typed == nil {
+			return 0, "", false
+		}
+		return typed.Code, typed.Message, true
+	case protocol.Fault:
+		return typed.Code, typed.Message, true
+	default:
+		return 0, "", false
+	}
+}
+
+func isNilACPError(err error) bool {
+	if err == nil {
+		return true
+	}
+	value := reflect.ValueOf(err)
+	switch value.Kind() {
+	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Pointer, reflect.Slice:
+		return value.IsNil()
+	default:
+		return false
+	}
+}
+
+func markACPErrorSeen(seen map[error]struct{}, err error) bool {
+	typeOfError := reflect.TypeOf(err)
+	if typeOfError == nil || !typeOfError.Comparable() {
+		return false
+	}
+	if _, ok := seen[err]; ok {
+		return true
+	}
+	seen[err] = struct{}{}
+	return false
+}
+
+func safeACPUnwrapOne(wrapper interface{ Unwrap() error }) (next error) {
+	defer func() {
+		if recover() != nil {
+			next = nil
+		}
+	}()
+	return wrapper.Unwrap()
+}
+
+func safeACPUnwrapMany(wrapper interface{ Unwrap() []error }) (children []error) {
+	defer func() {
+		if recover() != nil {
+			children = nil
+		}
+	}()
+	return wrapper.Unwrap()
 }
 
 func formatACPErrorDetail(code protocol.ErrorCode, message string) string {
@@ -339,7 +453,18 @@ func normalizeACPErrorMessage(message string) string {
 		}
 		normalized.WriteRune(r)
 	}
-	return strings.Join(strings.Fields(normalized.String()), " ")
+	return redactACPErrorMessage(strings.Join(strings.Fields(normalized.String()), " "))
+}
+
+func redactACPErrorMessage(message string) string {
+	message = acpMessageURLPattern.ReplaceAllString(message, redactedURL)
+	message = acpMessageAuthPattern.ReplaceAllString(message, "$1"+redactedToolValue)
+	message = acpMessageSecretAssignmentPattern.ReplaceAllString(message, "$1"+redactedToolValue)
+	message = acpMessageBearerPattern.ReplaceAllString(message, redactedToolValue)
+	message = toolCredentialTokenPattern.ReplaceAllString(message, redactedToolValue)
+	message = acpMessageWindowsPathPattern.ReplaceAllString(message, redactedACPPath)
+	message = acpMessageUnixPathPattern.ReplaceAllString(message, redactedACPPath)
+	return message
 }
 
 func truncateValidUTF8(input string, maxBytes int) string {

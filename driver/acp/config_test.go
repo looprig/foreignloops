@@ -224,17 +224,37 @@ func TestConfigValidateAcceptsNativeHarnessManagedWithoutModelAndEffort(t *testi
 	}
 }
 
-func TestConfigValidateRejectsPartialNativeModelEffortSelection(t *testing.T) {
+func TestConfigValidateAcceptsNativeModelOnlySelection(t *testing.T) {
+	for _, harness := range []Harness{HarnessCodex, HarnessClaudeCode} {
+		t.Run(string(harness), func(t *testing.T) {
+			cfg := validConfig(harness)
+			cfg.Credential = loop.CredentialNativeAuth
+			cfg.Binding = launch.ProxyBinding{}
+			cfg.ModelAlias = "native-model"
+			cfg.Effort = ""
+			if harness == HarnessClaudeCode {
+				cfg.SmallModelAlias = "native-small-model"
+			}
+			if err := cfg.validate(); err != nil {
+				t.Fatalf("validate() error = %v, want model-only native selection accepted", err)
+			}
+
+			cfg.Effort = "none"
+			if err := cfg.validate(); err != nil {
+				t.Fatalf("validate() error = %v, want structured none model-only selection accepted", err)
+			}
+		})
+	}
+}
+
+func TestConfigValidateRejectsNativeEffortWithoutModel(t *testing.T) {
 	tests := []struct {
 		name        string
-		model       string
 		effort      string
 		wantField   string
 		harnessName Harness
 	}{
-		{name: "model without effort", model: "native-model", wantField: "Effort", harnessName: HarnessCodex},
 		{name: "effort without model", effort: "high", wantField: "ModelAlias", harnessName: HarnessCodex},
-		{name: "claude model without effort", model: "native-model", wantField: "Effort", harnessName: HarnessClaudeCode},
 		{name: "claude effort without model", effort: "high", wantField: "ModelAlias", harnessName: HarnessClaudeCode},
 	}
 
@@ -243,15 +263,16 @@ func TestConfigValidateRejectsPartialNativeModelEffortSelection(t *testing.T) {
 			cfg := validConfig(tt.harnessName)
 			cfg.Credential = loop.CredentialNativeAuth
 			cfg.Binding = launch.ProxyBinding{}
-			cfg.ModelAlias = tt.model
+			cfg.ModelAlias = ""
 			cfg.Effort = tt.effort
 			if tt.harnessName == HarnessClaudeCode {
-				cfg.SmallModelAlias = tt.model
+				cfg.ModelAlias = ""
+				cfg.SmallModelAlias = ""
 			}
 
 			err := cfg.validate()
 			if err == nil {
-				t.Fatal("validate() error = nil, want partial native model/effort selection rejected")
+				t.Fatal("validate() error = nil, want native effort without model rejected")
 			}
 			var cfgErr *ConfigError
 			if !errors.As(err, &cfgErr) {
@@ -259,6 +280,26 @@ func TestConfigValidateRejectsPartialNativeModelEffortSelection(t *testing.T) {
 			}
 			if cfgErr.Field != tt.wantField {
 				t.Fatalf("ConfigError.Field = %q, want %q", cfgErr.Field, tt.wantField)
+			}
+		})
+	}
+}
+
+func TestConfigValidateRejectsGatewayEffort(t *testing.T) {
+	for _, harness := range []Harness{HarnessCodex, HarnessClaudeCode} {
+		t.Run(string(harness), func(t *testing.T) {
+			cfg := validConfig(harness)
+			cfg.Effort = "high"
+			err := cfg.validate()
+			if err == nil {
+				t.Fatal("validate() error = nil, want gateway effort rejected")
+			}
+			var cfgErr *ConfigError
+			if !errors.As(err, &cfgErr) {
+				t.Fatalf("validate() error = %T, want *ConfigError", err)
+			}
+			if cfgErr.Field != "Effort" {
+				t.Fatalf("ConfigError.Field = %q, want Effort", cfgErr.Field)
 			}
 		})
 	}
