@@ -23,6 +23,8 @@ const (
 	DefinitionUnusedHustleLimits              DefinitionErrorKind = "unused_hustle_limits"
 	DefinitionInvalidHustleLimits             DefinitionErrorKind = "invalid_hustle_limits"
 	DefinitionInvalidHooks                    DefinitionErrorKind = "invalid_hooks"
+	DefinitionMissingResourceStorage          DefinitionErrorKind = "missing_resource_storage"
+	DefinitionInvalidResourceStorage          DefinitionErrorKind = "invalid_resource_storage"
 	DefinitionMissingCompactionHustle         DefinitionErrorKind = "missing_compaction_hustle"
 	DefinitionIncompatibleCompactionHustle    DefinitionErrorKind = "incompatible_compaction_hustle"
 	DefinitionInvalidPermissionClassifiers    DefinitionErrorKind = "invalid_permission_classifiers"
@@ -94,12 +96,13 @@ func (e *DefinitionError) Unwrap() error { return e.Cause }
 type LifecycleErrorKind string
 
 const (
-	LifecycleContextDone        LifecycleErrorKind = "context_done"
-	LifecycleIDGenerationFailed LifecycleErrorKind = "id_generation_failed"
-	LifecycleLeaseFailed        LifecycleErrorKind = "lease_failed"
-	LifecycleJournalFailed      LifecycleErrorKind = "journal_failed"
-	LifecycleAppenderFailed     LifecycleErrorKind = "appender_failed"
-	LifecycleSessionFailed      LifecycleErrorKind = "session_failed"
+	LifecycleContextDone                     LifecycleErrorKind = "context_done"
+	LifecycleIDGenerationFailed              LifecycleErrorKind = "id_generation_failed"
+	LifecycleLeaseFailed                     LifecycleErrorKind = "lease_failed"
+	LifecycleJournalFailed                   LifecycleErrorKind = "journal_failed"
+	LifecycleAppenderFailed                  LifecycleErrorKind = "appender_failed"
+	LifecycleSessionFailed                   LifecycleErrorKind = "session_failed"
+	LifecycleProcessNotificationsUnsupported LifecycleErrorKind = "process_notifications_unsupported"
 )
 
 type LifecycleError struct {

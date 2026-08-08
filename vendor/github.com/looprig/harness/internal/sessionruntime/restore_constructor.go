@@ -48,7 +48,7 @@ func RestoreTopology(ctx context.Context, topology Topology, sessionID uuid.UUID
 	return restoreTopologySession(ctx, topology, sessionID, store, uuid.New, time.Now, opts...)
 }
 
-func (s *Session) attachRestoredLoop(started event.LoopStarted, parent loop.Provenance, bound loop.BoundDefinition, bindings tool.Bindings, folded foldResult, ri restoredInference, foreignSID string) error {
+func (s *Session) attachRestoredLoop(started event.LoopStarted, parent loop.Provenance, bound loop.BoundDefinition, bindings tool.Bindings, folded foldResult, ri restoredInference, notifications []tool.ProcessCompletionNotification, foreignSID string) error {
 	loopCtx, cancel := context.WithCancel(s.sessionCtx)
 	var backend loop.Backend
 	var err error
@@ -64,7 +64,7 @@ func (s *Session) attachRestoredLoop(started event.LoopStarted, parent loop.Prov
 				parent,
 				s,
 				bound,
-				restoredStateFrom(folded, ri),
+				restoredStateFrom(folded, ri, notifications),
 				loopruntime.RuntimeDependencies{Compactor: compactor, Hooks: s.hooks, ReviewContext: s.loopReviewContext()},
 			)
 		}
@@ -126,6 +126,9 @@ func restoreTopologySession(
 	case <-ctx.Done():
 		return nil, &RestoreError{Kind: RestoreContextDone, Cause: ctx.Err()}
 	default:
+	}
+	if err := validateProcessServiceEngines(topology); err != nil {
+		return nil, &RestoreError{Kind: RestoreLoopFailed, Cause: err}
 	}
 	// Allocate the one restored-session lifetime up front. Until successful transfer
 	// into Session, every exit below owns cancellation (lease/replay/bind/check/append/
@@ -219,6 +222,7 @@ func restoreTopologySession(
 	// coordinator) once resolved below. recordErrored releases the root lease BEFORE the
 	// session lease (LIFO) so a failed restore never strands root-lease ownership.
 	var resolved *resolvedPlacement
+	var resources *sessionResources
 	recordErrored := func(restoreErr error) (*Session, error) {
 		runRestoreFailureCleanup(constructionAbortTimeout, func(appendCtx context.Context) {
 			_ = appendRestoreEvent(appendCtx, j, factory, event.RestoreErrored{
@@ -226,6 +230,9 @@ func restoreTopologySession(
 				Err:    restoreErr,
 			})
 		}, func() {
+			if resources != nil {
+				_ = resources.Shutdown(context.Background())
+			}
 			releaseResolvedRoot(context.Background(), resolved)
 			releaseLease(lease)
 		})
@@ -381,6 +388,23 @@ func restoreTopologySession(
 		resolved = r
 		withResolvedPlacement(resolved)(probe)
 	}
+	if topologyRequiresProcessServices(topology) {
+		workspaceRoot := ""
+		if resolved != nil {
+			workspaceRoot = resolved.root
+		}
+		resources, err = resolveSessionResources(
+			ctx,
+			sessionID,
+			probe.resourceStorageResolver,
+			workspaceRoot,
+			true,
+		)
+		if err != nil {
+			return recordErrored(&RestoreError{Kind: RestoreLoopFailed, Cause: err})
+		}
+		withSessionResources(resources)(probe)
+	}
 
 	var manager *delegationManager
 	if probe.runtimeCatalogProvider != nil {
@@ -408,7 +432,7 @@ func restoreTopologySession(
 	if newPath {
 		planAllowMismatch = true
 	}
-	plans, activePlan, err := planLoops(sessionCtx, sessionID, topology, activeDefinition, roots, starts, allRecords, planAllowMismatch, contextDisposition, manager, probe.newWorkspaceBinding)
+	plans, activePlan, err := planLoops(sessionCtx, sessionID, topology, activeDefinition, roots, starts, allRecords, planAllowMismatch, contextDisposition, manager, probe.newWorkspaceBinding, resources)
 	if err != nil {
 		return recordErrored(err)
 	}
@@ -540,11 +564,14 @@ func restoreTopologySession(
 		// below) so its Shutdown stops+joins it before SessionStopped and lease release.
 		leaseOpts = append(leaseOpts, withOffloadGCRunner(gcRunner))
 	}
+	if resources != nil {
+		leaseOpts = append(leaseOpts, withSessionResources(resources))
+	}
 	// Recover the foreign session id from the root loop's events. Prebound adapters
 	// stamped it on LoopStarted; late-bound adapters record it with ForeignSessionBound.
 	// buildRestoredSession fails closed on an empty sid for a foreign engine.
 	foreignSID := findForeignSID(rootEvents)
-	s, err := buildRestoredSession(sessionCtx, sessionCancel, bound, activePlan.bindings, sessionID, rootLoopID, foreignSID, spawnedCount, folded, activeInference, restoredGates.open, j, factory, newID, now, leaseOpts...)
+	s, err := buildRestoredSession(sessionCtx, sessionCancel, bound, activePlan.bindings, sessionID, rootLoopID, foreignSID, spawnedCount, folded, activeInference, activePlan.notifications, restoredGates.open, j, factory, newID, now, leaseOpts...)
 	if err != nil {
 		if constructionCleanupOwned(err) {
 			return nil, err
@@ -584,6 +611,32 @@ func restoreTopologySession(
 	backgroundPlan, err := manager.planRestoredBackgroundRequests(s, allRecords, all, crashClosures)
 	if err != nil {
 		return abortAccepted(s, &RestoreError{Kind: RestoreReplayFailed, Cause: err})
+	}
+	if resources != nil {
+		// Attach the checked process-service delegates BEFORE Activate: a process
+		// resource's own Activate may need to durably publish a lifecycle record
+		// (for example, Task 4's ProcessLifecycleLostOnRestore for a manifest it
+		// cannot otherwise confirm), and it must observe the checked path on its
+		// very first call, never the bridge's pre-attachment "services unavailable"
+		// stub. See activateProcessServiceBridge's doc for the full contract.
+		if err := s.activateProcessServiceBridge(); err != nil {
+			return abortAccepted(s, &RestoreError{Kind: RestoreLoopFailed, Cause: err})
+		}
+		if err := resources.Activate(ctx); err != nil {
+			return abortAccepted(s, &RestoreError{Kind: RestoreLoopFailed, Cause: err})
+		}
+		// Harness's OWN durable trail (never Tools' on-disk manifest, and never an OS
+		// process identifier — tool.ProcessLifecycleMetadata carries none) is the only
+		// record the session itself can consult for "was a process running when we
+		// crashed, with no way to confirm its actual fate". Any (LoopID, ProcessHandle)
+		// whose last known lifecycle record never reached a terminal (Completed/Lost)
+		// is marked lost here, through the SAME checked publication path Task 24B/24C
+		// built (the bridge just attached above) — never a separate, unchecked write —
+		// mirroring the crash-seam TurnInterrupted closure above, but for process
+		// lifecycles instead of turns.
+		if err := publishOrphanedProcessLifecycles(ctx, s, orphanedProcessLifecycles(all)); err != nil {
+			return abortAccepted(s, &RestoreError{Kind: RestoreAppendFailed, Cause: err})
+		}
 	}
 	// RestoreDone is the commit point: every loop is bound, crash-closed, built,
 	// attached, and the active selection has been validated before this append.
@@ -637,6 +690,10 @@ type loopPlan struct {
 	folded          foldResult
 	runtimeMismatch *RestoreRuntimeMismatchError
 	tombstoned      bool
+	// notifications are this loop's undelivered process completion
+	// notifications (Task 24C), computed by planLoops from allRecords and
+	// this plan's own events (see undeliveredProcessNotifications).
+	notifications []tool.ProcessCompletionNotification
 }
 
 // discoverRoots scans the full UNNARROWED replay for every LoopStarted, collecting the
@@ -695,7 +752,7 @@ func discoverRoots(all []event.Event, topology Topology, allowMismatch bool) (ma
 // unknown (children of a single-definition run). It is the single Bind of each loop,
 // performed inside the restore lease. It returns the ordered plans and the active plan, or a
 // typed error the caller records as a RestoreErrored.
-func planLoops(sessionCtx context.Context, sessionID uuid.UUID, topology Topology, activeDefinition loop.Definition, roots map[identity.AgentName]event.LoopStarted, starts []event.LoopStarted, allRecords []journal.JournalRecord, allowMismatch bool, contextDisposition func(loop.BoundDefinition) (bool, error), manager *delegationManager, wsBind func() *tool.WorkspaceBinding) ([]loopPlan, loopPlan, error) {
+func planLoops(sessionCtx context.Context, sessionID uuid.UUID, topology Topology, activeDefinition loop.Definition, roots map[identity.AgentName]event.LoopStarted, starts []event.LoopStarted, allRecords []journal.JournalRecord, allowMismatch bool, contextDisposition func(loop.BoundDefinition) (bool, error), manager *delegationManager, wsBind func() *tool.WorkspaceBinding, resources *sessionResources) ([]loopPlan, loopPlan, error) {
 	plans := make([]loopPlan, 0, len(starts))
 	activeIndex := -1
 	for _, started := range starts {
@@ -714,7 +771,11 @@ func planLoops(sessionCtx context.Context, sessionID uuid.UUID, topology Topolog
 			// invents a missing definition here).
 			return nil, loopPlan{}, &RestoreError{Kind: RestoreLoopFailed, Cause: &AgentNameMismatchError{Persisted: started.AgentName}}
 		}
-		bindings := tool.Bindings{SessionID: sessionID, LoopID: started.LoopID, Workspace: wsBind(), Delegate: manager.controllerFor(started.LoopID, definition), ExtraTools: delegateExtraTools(definition, manager)}
+		processBinding, processErr := processBindingFor(definition, resources)
+		if processErr != nil {
+			return nil, loopPlan{}, &RestoreError{Kind: RestoreLoopFailed, Cause: processErr}
+		}
+		bindings := tool.Bindings{SessionID: sessionID, LoopID: started.LoopID, Workspace: wsBind(), Delegate: manager.controllerFor(started.LoopID, definition), Process: processBinding, ExtraTools: delegateExtraTools(definition, manager)}
 		bound, bindErr := definition.Bind(sessionCtx, bindings)
 		if bindErr != nil {
 			return nil, loopPlan{}, &RestoreError{Kind: RestoreLoopFailed, Cause: bindErr}
@@ -761,6 +822,7 @@ func planLoops(sessionCtx context.Context, sessionID uuid.UUID, topology Topolog
 		if plans[i].tombstoned && i == activeIndex {
 			return nil, loopPlan{}, &RestoreError{Kind: RestoreLoopFailed, Cause: &SessionError{Kind: SessionLoopExited}}
 		}
+		plans[i].notifications = undeliveredProcessNotifications(allRecords, plans[i].started.LoopID, causedCommandIDs(plans[i].events))
 	}
 	return plans, plans[activeIndex], nil
 }
@@ -898,7 +960,7 @@ func attachAndActivate(s *Session, all []event.Event, plans []loopPlan, rootLoop
 			}
 			continue
 		}
-		if err := s.attachRestoredLoop(plan.started, parent, plan.bound, plan.bindings, plan.folded, foldLoopInference(plan.events), findForeignSID(plan.events)); err != nil {
+		if err := s.attachRestoredLoop(plan.started, parent, plan.bound, plan.bindings, plan.folded, foldLoopInference(plan.events), plan.notifications, findForeignSID(plan.events)); err != nil {
 			mismatch, runtimeFailure := classifyRestoredChildRuntimeFailure(plan.bound, err)
 			if !runtimeFailure {
 				return err
@@ -1030,6 +1092,7 @@ func buildRestoredSession(
 	spawnedCount int,
 	folded foldResult,
 	ri restoredInference,
+	notifications []tool.ProcessCompletionNotification,
 	restoredGates map[gate.ID]gateEntry,
 	j journal.SessionJournal,
 	factory *event.Factory,
@@ -1143,7 +1206,7 @@ func buildRestoredSession(
 				loop.Provenance{},
 				s,
 				cfg,
-				restoredStateFrom(folded, ri),
+				restoredStateFrom(folded, ri, notifications),
 				loopruntime.RuntimeDependencies{Compactor: compactor, Hooks: s.hooks, ReviewContext: s.loopReviewContext()},
 			)
 		}
@@ -1286,6 +1349,98 @@ func withRestoreHeader(ev event.Event, hdr event.Header) event.Event {
 	default:
 		panic("session: withRestoreHeader called on a non-restore event type")
 	}
+}
+
+// processLifecycleKey identifies one supervised process across its durable
+// lifecycle record sequence: the loop that owns it plus its opaque,
+// non-OS-identifying handle (tool.ProcessLifecycleMetadata never carries an OS
+// process identifier — see Task 4's DTO shape).
+type processLifecycleKey struct {
+	loopID uuid.UUID
+	handle string
+}
+
+// orphanedProcessLifecycles scans the full unnarrowed restore replay (every
+// loop's events) and returns the last-known tool.ProcessLifecycleMetadata for
+// every (LoopID, ProcessHandle) whose durable record sequence never reached a
+// terminal kind (ProcessLifecycleCompleted or ProcessLifecycleLost) — a
+// process that, per Harness's OWN durable trail, was still Started,
+// Backgrounded, or had only a StopRequested recorded when the session
+// crashed, with no way to confirm what actually happened to it afterward.
+// Order is first-seen (stream order), so a caller that publishes one
+// synthesized ProcessLost per orphan does so deterministically.
+//
+// This is a pure fold over already-durable Harness events; it never reads an
+// OS-level manifest and never touches an OS process identifier (there is none
+// on the DTO to misuse).
+func orphanedProcessLifecycles(events []event.Event) []tool.ProcessLifecycleMetadata {
+	last := make(map[processLifecycleKey]tool.ProcessLifecycleMetadata)
+	terminal := make(map[processLifecycleKey]bool)
+	order := make([]processLifecycleKey, 0)
+	for _, ev := range events {
+		var metadata tool.ProcessLifecycleMetadata
+		switch typed := ev.(type) {
+		case event.ProcessStarted:
+			metadata = typed.Process
+		case event.ProcessBackgrounded:
+			metadata = typed.Process
+		case event.ProcessStopRequested:
+			metadata = typed.Process
+		case event.ProcessCompleted:
+			metadata = typed.Process
+		case event.ProcessLost:
+			metadata = typed.Process
+		default:
+			continue
+		}
+		key := processLifecycleKey{loopID: metadata.LoopID, handle: metadata.ProcessHandle}
+		if _, seen := last[key]; !seen {
+			order = append(order, key)
+		}
+		last[key] = metadata
+		terminal[key] = metadata.Kind == tool.ProcessLifecycleCompleted || metadata.Kind == tool.ProcessLifecycleLost
+	}
+	orphans := make([]tool.ProcessLifecycleMetadata, 0, len(order))
+	for _, key := range order {
+		if !terminal[key] {
+			orphans = append(orphans, last[key])
+		}
+	}
+	return orphans
+}
+
+// publishOrphanedProcessLifecycles durably marks every orphan (see
+// orphanedProcessLifecycles) lost, through the session's already-attached
+// checked process-service bridge — the SAME idempotent publication path
+// Task 24B's live lifecycle events and Task 24C's completion notifications
+// use, never a separate direct journal write. Each record mints a FRESH
+// EventID (the orphan's original metadata already durably owns its own
+// Started/Backgrounded EventID) and sets Kind/State/Reason to Task 4's
+// ProcessLifecycleLost / ProcessLifecycleLostOnRestore / ProcessTerminalLostOnRestore
+// triple, carrying every other field (SessionID, LoopID, ProcessHandle,
+// OriginExecutionID, ProcessCreatedAt/StartedAt) forward unchanged from the
+// last-known record — it never signals or queries the OS, and never invents
+// an OS-identifying field the DTO does not have.
+func publishOrphanedProcessLifecycles(ctx context.Context, s *Session, orphans []tool.ProcessLifecycleMetadata) error {
+	for _, orphan := range orphans {
+		eventID, err := s.newID()
+		if err != nil {
+			return &RestoreError{Kind: RestoreIDGenerationFailed, Cause: err}
+		}
+		lost := orphan
+		lost.EventID = eventID
+		lost.Kind = tool.ProcessLifecycleLost
+		lost.State = tool.ProcessLifecycleLostOnRestore
+		lost.Reason = tool.ProcessTerminalLostOnRestore
+		lost.ProcessFinishedAt = s.now()
+		lost.HasExitCode = false
+		lost.ExitCode = 0
+		lost.Diagnostic = ""
+		if err := s.resources.processServiceBridge.PublishProcessLifecycle(ctx, lost); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // openTurnCoords returns the TurnID + TurnIndex of the last TurnStarted in one loop's

@@ -185,6 +185,11 @@ type Session struct {
 	// §22.4's "stale live cancellation handles do not survive restore".
 	review reviewLifecycle
 
+	// resources is the one session-private registry shared by every process-enabled
+	// loop binding in this live construction.
+	resources               *sessionResources
+	resourceStorageResolver SessionResourceStorageResolver
+
 	// limits are the in-session agent-spawn safety caps NewLoop enforces (depth +
 	// quota). Defaulted in newSession (withDefaults) so the live values are always
 	// positive caps, and overridable via WithLimits. Read under loopsMu inside NewLoop's
@@ -511,7 +516,7 @@ func (s *Session) abortConstructionAfter(cause error, appendTerminal func(contex
 			loopDrains = append(loopDrains, handle.backend.DoneChan())
 		}
 	}
-	needsOwner := appendTerminal != nil || s.wsRootRelease != nil || s.leaseRelease != nil
+	needsOwner := appendTerminal != nil || s.resources != nil || s.wsRootRelease != nil || s.leaseRelease != nil
 	if !needsOwner {
 		waitConstructionPhases(abortCtx, hubDrain, checkpointDrain, loopDrains)
 		return
@@ -531,6 +536,9 @@ func (s *Session) abortConstructionAfter(cause error, appendTerminal func(contex
 			<-checkpointDrain
 		}
 		waitConstructionDrains(context.Background(), loopDrains)
+		if s.resources != nil {
+			_ = s.resources.Shutdown(context.Background())
+		}
 		// Lease hooks are accepted by the Session before construction starts. Once
 		// accepted, this is their sole teardown owner: root then session, exactly once.
 		s.releaseRootLease(context.Background())
@@ -1348,7 +1356,12 @@ func (s *Session) newLoopWithAdmission(parent loop.Provenance, cfg loop.Definiti
 			release()
 			return uuid.UUID{}, &SessionError{Kind: SessionLoopIDGenerationFailed, Cause: err}
 		}
-		bindings = tool.Bindings{SessionID: s.sessionID, LoopID: loopID, Workspace: s.newWorkspaceBinding(), Delegate: s.delegation.controllerFor(loopID, cfg), ExtraTools: delegateExtraTools(cfg, s.delegation)}
+		processBinding, bindingErr := processBindingFor(cfg, s.resources)
+		if bindingErr != nil {
+			release()
+			return uuid.UUID{}, bindingErr
+		}
+		bindings = tool.Bindings{SessionID: s.sessionID, LoopID: loopID, Workspace: s.newWorkspaceBinding(), Delegate: s.delegation.controllerFor(loopID, cfg), Process: processBinding, ExtraTools: delegateExtraTools(cfg, s.delegation)}
 		bound, err = cfg.Bind(s.sessionCtx, bindings)
 		if err != nil {
 			release()
@@ -1894,6 +1907,14 @@ func newSessionTopology(ctx context.Context, topology Topology, newID idGenerato
 		hubOpts = append(hubOpts, hub.WithAppender(s.injectedEventAppender))
 	}
 	s.hub = hub.New(id, hubOpts...)
+	// Attach the checked process-service delegates now that the hub exists, so any
+	// process resource this session activates below (via the prepared loops' Bind,
+	// which may bind a ProcessBinding over s.resources) observes the checked publish
+	// path from its very first call — never the bridge's pre-attachment stub. See
+	// activateProcessServiceBridge's doc for the ordering contract this preserves.
+	if err := s.activateProcessServiceBridge(); err != nil {
+		return abort(err)
+	}
 	if err := s.bindSessionHustles(); err != nil {
 		return abort(err)
 	}
@@ -1939,7 +1960,11 @@ func newSessionTopology(ctx context.Context, topology Topology, newID idGenerato
 		if mintErr != nil {
 			return abort(&SessionError{Kind: SessionLoopIDGenerationFailed, Cause: mintErr})
 		}
-		bindings := tool.Bindings{SessionID: id, LoopID: loopID, Workspace: s.newWorkspaceBinding(), Delegate: s.delegation.controllerFor(loopID, definition), ExtraTools: delegateExtraTools(definition, s.delegation)}
+		processBinding, bindingErr := processBindingFor(definition, s.resources)
+		if bindingErr != nil {
+			return abort(bindingErr)
+		}
+		bindings := tool.Bindings{SessionID: id, LoopID: loopID, Workspace: s.newWorkspaceBinding(), Delegate: s.delegation.controllerFor(loopID, definition), Process: processBinding, ExtraTools: delegateExtraTools(definition, s.delegation)}
 		bound, bindErr := definition.Bind(sessionCtx, bindings)
 		if bindErr != nil {
 			return abort(bindErr)
@@ -2444,6 +2469,35 @@ func (s *Session) newWorkspaceBinding() *tool.WorkspaceBinding {
 	return &tool.WorkspaceBinding{Root: s.wsRoot, Coordinator: s.wsCoordinator, Observations: tool.NewWorkspaceObservations()}
 }
 
+// activateProcessServiceBridge attaches Task 24B's checked durable lifecycle
+// publisher and this Session's own Task 24C completion notifier
+// (NotifyProcessCompletion) behind the session's process-service bridge
+// (process_services.go). It is nil-safe: a session with no process-enabled
+// loop never resolved a resources registry, so this is then a no-op.
+//
+// It MUST be called after s.hub exists (the checked publisher publishes
+// through it) and BEFORE the resources registry's one-time Activate runs: a
+// process resource that decides during its own Activate to publish a
+// lifecycle record (for example marking a manifest it cannot otherwise
+// confirm as lost) must observe the checked path immediately, never the
+// bridge's pre-attachment "services unavailable" stub. The live construction
+// path (newSessionTopology) calls this right after building the hub; the
+// restore path (restoreTopologySession) calls it after buildRestoredSession
+// returns and before resources.Activate — both strictly before the session
+// (or restore) is reachable/committed.
+func (s *Session) activateProcessServiceBridge() error {
+	if s.resources == nil {
+		return nil
+	}
+	publisher, err := newCheckedProcessLifecyclePublisher(s.sessionID, s.hub, s.now)
+	if err != nil {
+		return err
+	}
+	s.resources.processServiceBridge.attachProcessLifecyclePublisher(publisher)
+	s.resources.processServiceBridge.attachProcessCompletionNotifier(s)
+	return nil
+}
+
 // shutdownTarget pairs a loop with the Ack channel of the command.Shutdown the
 // session sent it, so the ack-wait phase can drain each loop's reply in turn. It
 // is Shutdown-internal: the send phase records one per loop actually reached, and
@@ -2533,7 +2587,7 @@ func (s *Session) shutdown() error {
 	// runtime begins its own drain, so in-flight classifier calls observe
 	// cancellation as early as possible.
 	s.shutdownPermissionReviews()
-	failures := make([]error, 0, 6)
+	failures := make([]error, 0, 7)
 	failures = append(failures, s.closeHustles(shutdownRoot, timeouts.hustle))
 	targets, sendErr := s.sendLoopShutdowns(shutdownRoot, snapshot, timeouts.loopSend)
 	failures = append(failures, sendErr)
@@ -2544,6 +2598,13 @@ func (s *Session) shutdown() error {
 	// component therefore cannot suppress checkpoint, durable-stop, or lease cleanup.
 	s.stopOffloadGC()
 	failures = append(failures, s.stopCheckpoints(shutdownRoot, timeouts.checkpoint))
+	// Session resources (including the process registry) must fully terminate and
+	// confirm before the hub stops and the leases/session context release: their own
+	// Shutdown is where a live supervised process is actually stopped and its final
+	// lifecycle/completion record durably published, and that publication still needs
+	// a live hub to reach durably (see stopHub below, which only runs after this
+	// returns).
+	failures = append(failures, s.stopSessionResources(shutdownRoot, timeouts.sessionResources))
 	failures = append(failures, s.stopHub(shutdownRoot, timeouts.hub))
 	s.releaseRootLease(shutdownRoot)
 	s.releaseLease(shutdownRoot)

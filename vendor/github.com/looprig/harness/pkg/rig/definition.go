@@ -1,8 +1,10 @@
 package rig
 
 import (
+	"context"
 	"strings"
 
+	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/internal/sessionruntime"
 	"github.com/looprig/harness/pkg/gate"
 	"github.com/looprig/harness/pkg/hook"
@@ -10,24 +12,26 @@ import (
 	"github.com/looprig/harness/pkg/identity"
 	"github.com/looprig/harness/pkg/loop"
 	"github.com/looprig/harness/pkg/sessionstore"
+	"github.com/looprig/harness/pkg/tool"
 )
 
 type definitionState struct {
-	loops                  []loop.Definition
-	hustles                []hustle.Definition
-	hustleLimits           HustleLimits
-	primers                []string
-	activePrimer           string
-	store                  *sessionstore.Store
-	storeSet               bool
-	seen                   map[singletonKey]bool
-	lifecycleOptions       []sessionruntime.LifecycleOption
-	fingerprintFields      ConfigFingerprintFields
-	permissionClassifiers  gate.PermissionClassifierSet
-	permissionReviewPolicy gate.PermissionReviewPolicy
-	permissionReviewLimits PermissionReviewLimits
-	hooks                  hook.Set
-	compiledHooks          *hook.Runner
+	loops                   []loop.Definition
+	hustles                 []hustle.Definition
+	hustleLimits            HustleLimits
+	primers                 []string
+	activePrimer            string
+	store                   *sessionstore.Store
+	storeSet                bool
+	seen                    map[singletonKey]bool
+	lifecycleOptions        []sessionruntime.LifecycleOption
+	fingerprintFields       ConfigFingerprintFields
+	permissionClassifiers   gate.PermissionClassifierSet
+	permissionReviewPolicy  gate.PermissionReviewPolicy
+	permissionReviewLimits  PermissionReviewLimits
+	hooks                   hook.Set
+	compiledHooks           *hook.Runner
+	resourceStorageProvider SessionResourceStorageProvider
 	// placements accumulates every workspace placement option. Define enforces at most
 	// one; more than one is a typed rejection.
 	placements     []pendingPlacement
@@ -36,8 +40,9 @@ type definitionState struct {
 
 // Rig is an immutable design-time assembly that creates and restores sessions.
 type Rig struct {
-	lifecycle *sessionruntime.Lifecycle
-	hooks     *hook.Runner
+	lifecycle               *sessionruntime.Lifecycle
+	hooks                   *hook.Runner
+	resourceStorageProvider SessionResourceStorageProvider
 }
 
 func Define(options ...Option) (*Rig, error) {
@@ -134,6 +139,9 @@ func Define(options ...Option) (*Rig, error) {
 	if err := validatePermissionReviewObservations(state); err != nil {
 		return nil, err
 	}
+	if requiresProcessServices(state.loops) && state.resourceStorageProvider == nil {
+		return nil, &DefinitionError{Kind: DefinitionMissingResourceStorage}
+	}
 	if err := validateHustleRegistration(state); err != nil {
 		return nil, err
 	}
@@ -221,6 +229,15 @@ func Define(options ...Option) (*Rig, error) {
 	lifecycleOptions = append(lifecycleOptions, sessionruntime.WithLifecycleFingerprint(fingerprint))
 	lifecycleOptions = append(lifecycleOptions, sessionruntime.WithLifecycleManifest(manifest))
 	lifecycleOptions = append(lifecycleOptions, sessionruntime.WithLifecycleHooks(state.compiledHooks))
+	if state.resourceStorageProvider != nil {
+		provider := state.resourceStorageProvider
+		lifecycleOptions = append(lifecycleOptions, sessionruntime.WithLifecycleSessionResourceStorage(
+			func(ctx context.Context, id uuid.UUID) (string, string, error) {
+				storage, err := provider.StorageForSession(ctx, id)
+				return storage.Path, storage.Identity, err
+			},
+		))
+	}
 	primerNames := make([]identity.AgentName, len(state.primers))
 	for i, name := range state.primers {
 		primerNames[i] = identity.AgentName(name)
@@ -229,7 +246,20 @@ func Define(options ...Option) (*Rig, error) {
 	if err != nil {
 		return nil, &DefinitionError{Kind: DefinitionInvalidSessionStore, Cause: err}
 	}
-	return &Rig{lifecycle: lifecycle, hooks: state.compiledHooks}, nil
+	return &Rig{
+		lifecycle:               lifecycle,
+		hooks:                   state.compiledHooks,
+		resourceStorageProvider: state.resourceStorageProvider,
+	}, nil
+}
+
+func requiresProcessServices(definitions []loop.Definition) bool {
+	for _, definition := range definitions {
+		if definition.ToolRequirements()&tool.RequiresProcessServices != 0 {
+			return true
+		}
+	}
+	return false
 }
 
 func resolvePermissionReviewFingerprint(state *definitionState) (*permissionReviewFingerprint, error) {

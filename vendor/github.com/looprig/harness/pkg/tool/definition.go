@@ -30,7 +30,10 @@ const (
 	// RequiresWorkspaceRead marks definitions that only need the canonical
 	// workspace root for read-only evidence collection.
 	RequiresWorkspaceRead
-	knownRequirements = RequiresWorkspace | RequiresDelegateController | RequiresWorkspaceRead
+	// RequiresProcessServices marks definitions that build session-supervised
+	// process tools.
+	RequiresProcessServices
+	knownRequirements = RequiresWorkspace | RequiresDelegateController | RequiresWorkspaceRead | RequiresProcessServices
 )
 
 // WorkspaceOperation identifies the scope of a workspace mutation permit.
@@ -70,6 +73,15 @@ type WorkspacePermit interface {
 type WorkspaceCoordinator interface {
 	Acquire(ctx context.Context, operation WorkspaceOperation, canonicalPath string) (WorkspacePermit, error)
 	Healthy() error
+}
+
+// WorkspaceLifetimeCoordinator is the optional long-lived workspace
+// coordination capability implemented by a WorkspaceCoordinator that can
+// reserve a prepared process's authoritative access for its complete lifetime.
+// AcquireLifetime blocks until the access is compatible with every active
+// mutation and lifetime reservation, or ctx is done.
+type WorkspaceLifetimeCoordinator interface {
+	AcquireLifetime(ctx context.Context, access WorkspaceAccess) (WorkspacePermit, error)
 }
 
 // FileObservation is the private concurrency token standard file tools keep for one
@@ -232,6 +244,7 @@ type Bindings struct {
 	Workspace     *WorkspaceBinding
 	ReadWorkspace *ReadWorkspaceBinding
 	Delegate      DelegateController
+	Process       *ProcessBinding
 	// ExtraTools are additional tool definitions the LOOP appends to every mode's
 	// toolset at Bind, beyond the definition's own WithTools. The composition root uses
 	// it to inject the derived, definition-scoped atomic agent-tool bundle (StartAgent,
@@ -528,6 +541,10 @@ func attenuateBindings(requirements Requirements, bindings Bindings) Bindings {
 	if requirements&RequiresDelegateController != 0 {
 		attenuated.Delegate = bindings.Delegate
 	}
+	if requirements&RequiresProcessServices != 0 {
+		process := *bindings.Process
+		attenuated.Process = &process
+	}
 	return attenuated
 }
 
@@ -564,6 +581,14 @@ func validateBindings(requirements Requirements, bindings Bindings) error {
 	if requirements&RequiresDelegateController != 0 && nilDelegateController(bindings.Delegate) {
 		return &MissingBindingError{Requirement: RequiresDelegateController}
 	}
+	if requirements&RequiresProcessServices != 0 {
+		if bindings.Process == nil {
+			return &MissingBindingError{Requirement: RequiresProcessServices}
+		}
+		if nilSessionResourceRegistry(bindings.Process.Registry) {
+			return &InvalidBindingsError{Field: "process.registry"}
+		}
+	}
 	return nil
 }
 
@@ -576,6 +601,10 @@ func nilWorkspaceCoordinator(value WorkspaceCoordinator) bool {
 }
 
 func nilDelegateController(value DelegateController) bool {
+	return value == nil || nilReflectValue(reflect.ValueOf(value))
+}
+
+func nilSessionResourceRegistry(value SessionResourceRegistry) bool {
 	return value == nil || nilReflectValue(reflect.ValueOf(value))
 }
 
@@ -630,6 +659,8 @@ func (e *MissingBindingError) Error() string {
 		name = "delegate controller"
 	case RequiresWorkspaceRead:
 		name = "read workspace"
+	case RequiresProcessServices:
+		name = "process services"
 	default:
 		name = strconv.Itoa(int(e.Requirement))
 	}
