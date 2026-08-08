@@ -33,6 +33,11 @@ type Config struct {
 	Binding launch.ProxyBinding
 	// ModelAlias is the primary harness-facing model alias.
 	ModelAlias string
+	// Effort is the neutral native reasoning-effort selector. Native explicit
+	// selections must provide ModelAlias and Effort together; when both are
+	// empty, the harness owns model and effort selection. Gateway launches do
+	// not use this field.
+	Effort string
 	// SmallModelAlias is required by Claude Code and forbidden by Codex.
 	SmallModelAlias string
 	// Posture is the neutral access posture for the child.
@@ -119,6 +124,13 @@ func (c Config) validate() error {
 		if c.gatewayBacked() && c.ModelAlias == "" {
 			return &ConfigError{Field: "ModelAlias", Reason: "is required"}
 		}
+	}
+
+	if !c.gatewayBacked() && ((c.ModelAlias == "") != (c.Effort == "")) {
+		if c.ModelAlias == "" {
+			return &ConfigError{Field: "ModelAlias", Reason: "must be provided with Effort for native selection"}
+		}
+		return &ConfigError{Field: "Effort", Reason: "must be provided with ModelAlias for native selection"}
 	}
 	return nil
 }

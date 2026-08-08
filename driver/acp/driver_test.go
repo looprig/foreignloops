@@ -144,8 +144,10 @@ func (s *driverContextSession) Prompt(ctx context.Context, _ []protocol.ContentB
 func (s *driverContextSession) Cancel(ctx context.Context) error { return ctx.Err() }
 
 type fakeClaudeConnector struct {
-	models launch.ClaudeModels
-	fail   error
+	models     launch.ClaudeModels
+	effort     string
+	fail       error
+	failEffort error
 }
 
 func (c *fakeClaudeConnector) SelectDefaultModel(ctx context.Context, sess session) error {
@@ -160,6 +162,16 @@ func (c *fakeClaudeConnector) SelectSmallModel(ctx context.Context, sess session
 		return c.fail
 	}
 	return sess.SetConfigOption(ctx, "model", protocol.SessionConfigValueID(c.models.Small))
+}
+
+func (c *fakeClaudeConnector) SelectEffort(ctx context.Context, sess session) error {
+	if c.failEffort != nil {
+		return c.failEffort
+	}
+	if c.effort == "" {
+		return nil
+	}
+	return sess.SetConfigOption(ctx, "thought_level", protocol.SessionConfigValueID(c.effort))
 }
 
 func (c *fakeClaudeConnector) ApplyPermissionMode(ctx context.Context, sess session, modeID protocol.SessionModeID) error {
@@ -286,7 +298,7 @@ func TestNewClaudeCreatesOneSessionAppliesModelsAndPosture(t *testing.T) {
 	var launchCfg launch.Config
 	models := launch.ClaudeModels{Default: cfg.ModelAlias, Small: cfg.SmallModelAlias}
 
-	installClaudeConnectorFactory(t, func(got launch.ClaudeModels) claudeConnector {
+	installClaudeConnectorFactory(t, func(got launch.ClaudeModels, _ string) claudeConnector {
 		if got != models {
 			t.Fatalf("Claude models = %+v, want %+v", got, models)
 		}
@@ -392,6 +404,139 @@ func TestNewCodexCreatesOneSessionWithModelAndPosture(t *testing.T) {
 	}
 }
 
+func TestNewNativeCodexReceivesModelAndEffortSeparately(t *testing.T) {
+	cfg := validConfig(HarnessCodex)
+	cfg.Credential = loop.CredentialNativeAuth
+	cfg.Binding = launch.ProxyBinding{}
+	cfg.AgentSessionID = ""
+	cfg.ModelAlias = "adapter/model[effort]"
+	cfg.Effort = "high"
+	originalEnv := append([]string(nil), cfg.Env...)
+	conn := &fakeClient{newSession: newFakeSession("native-codex-selection")}
+	owned := &fakeDialedClient{acpClient: conn}
+	var nativeCfg launch.NativeConfig
+	installNativeDial(t, func(_ context.Context, got launch.NativeConfig) (dialedClient, error) {
+		nativeCfg = got
+		return owned, nil
+	})
+
+	d, err := New(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	defer func() { _ = d.Close() }()
+
+	native, ok := nativeCfg.Harness.(launch.NativeHarnessAdapter)
+	if !ok {
+		t.Fatalf("native launch Harness = %T, want launch.NativeHarnessAdapter", nativeCfg.Harness)
+	}
+	harness, ok := native.(*launch.CodexConnector)
+	if !ok {
+		t.Fatalf("native launch Harness = %T, want *launch.CodexConnector", native)
+	}
+	if harness.Model != cfg.ModelAlias {
+		t.Fatalf("Codex model = %q, want unparsed %q", harness.Model, cfg.ModelAlias)
+	}
+	if harness.Effort != cfg.Effort {
+		t.Fatalf("Codex effort = %q, want %q", harness.Effort, cfg.Effort)
+	}
+	if !reflect.DeepEqual(nativeCfg.Command.Env, originalEnv) {
+		t.Fatalf("native launch env = %#v, want original env %#v", nativeCfg.Command.Env, originalEnv)
+	}
+	for _, value := range nativeCfg.Command.Env {
+		if value == "EFFORT="+cfg.Effort || value == "MODEL_EFFORT="+cfg.Effort {
+			t.Fatalf("native launch env contains effort selector %q: %#v", value, nativeCfg.Command.Env)
+		}
+	}
+}
+
+func TestNewNativeClaudeAppliesModelThenEffortSelection(t *testing.T) {
+	cfg := validConfig(HarnessClaudeCode)
+	cfg.Credential = loop.CredentialNativeAuth
+	cfg.Binding = launch.ProxyBinding{}
+	cfg.AgentSessionID = ""
+	cfg.Effort = "high"
+	sess := newFakeSession("native-claude-selection")
+	conn := &fakeClient{newSession: sess}
+	owned := &fakeDialedClient{acpClient: conn}
+	var nativeCfg launch.NativeConfig
+
+	installClaudeConnectorFactory(t, func(models launch.ClaudeModels, effort string) claudeConnector {
+		if effort != cfg.Effort {
+			t.Fatalf("Claude effort = %q, want %q", effort, cfg.Effort)
+		}
+		return &fakeClaudeConnector{models: models, effort: effort}
+	})
+	installNativeDial(t, func(_ context.Context, got launch.NativeConfig) (dialedClient, error) {
+		nativeCfg = got
+		return owned, nil
+	})
+
+	d, err := New(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	defer func() { _ = d.Close() }()
+
+	harness, ok := nativeCfg.Harness.(*launch.ClaudeConnector)
+	if !ok {
+		t.Fatalf("native launch Harness = %T, want *launch.ClaudeConnector", nativeCfg.Harness)
+	}
+	if harness.Effort != cfg.Effort {
+		t.Fatalf("Claude connector effort = %q, want %q", harness.Effort, cfg.Effort)
+	}
+	wantOperations := []string{
+		"set_config:model=" + cfg.ModelAlias,
+		"set_config:model=" + cfg.SmallModelAlias,
+		"set_config:thought_level=" + cfg.Effort,
+		"set_mode:acceptEdits",
+	}
+	if !reflect.DeepEqual(sess.operations, wantOperations) {
+		t.Fatalf("native Claude session operations = %v, want model-then-effort order %v", sess.operations, wantOperations)
+	}
+}
+
+func TestNewClaudeEffortSelectionErrorClosesOwnedClientOnce(t *testing.T) {
+	cfg := validConfig(HarnessClaudeCode)
+	cfg.Credential = loop.CredentialNativeAuth
+	cfg.Binding = launch.ProxyBinding{}
+	cfg.AgentSessionID = ""
+	cfg.Effort = "unsupported"
+	sess := newFakeSession("native-claude-selection-error")
+	conn := &fakeClient{newSession: sess}
+	owned := &fakeDialedClient{acpClient: conn}
+	effortErr := &launch.EffortAliasError{Effort: cfg.Effort}
+
+	installClaudeConnectorFactory(t, func(models launch.ClaudeModels, effort string) claudeConnector {
+		return &fakeClaudeConnector{models: models, effort: effort, failEffort: effortErr}
+	})
+	installNativeDial(t, func(context.Context, launch.NativeConfig) (dialedClient, error) {
+		return owned, nil
+	})
+
+	_, err := New(context.Background(), cfg)
+	if err == nil {
+		t.Fatal("New() error = nil, want typed effort selection error")
+	}
+	var gotEffortErr *launch.EffortAliasError
+	if !errors.As(err, &gotEffortErr) {
+		t.Fatalf("New() error = %v (%T), want wrapped *launch.EffortAliasError", err, err)
+	}
+	if gotEffortErr != effortErr {
+		t.Fatalf("wrapped effort error = %p, want original %p", gotEffortErr, effortErr)
+	}
+	if owned.closeCalls != 1 {
+		t.Fatalf("owned client close calls = %d, want exactly one after selection failure", owned.closeCalls)
+	}
+	wantOperations := []string{
+		"set_config:model=" + cfg.ModelAlias,
+		"set_config:model=" + cfg.SmallModelAlias,
+	}
+	if !reflect.DeepEqual(sess.operations, wantOperations) {
+		t.Fatalf("session operations before effort failure = %v, want %v", sess.operations, wantOperations)
+	}
+}
+
 func TestNewCodexWorkspaceWritePreservesSandboxPosture(t *testing.T) {
 	cfg := validConfig(HarnessCodex)
 	cfg.AgentSessionID = ""
@@ -430,14 +575,15 @@ func TestNewNativeAuthOmitsProxyAndGatewayOverrides(t *testing.T) {
 			cfg.Credential = loop.CredentialNativeAuth
 			cfg.Binding = launch.ProxyBinding{}
 			cfg.AgentSessionID = ""
+			cfg.Effort = "medium"
 			originalEnv := append([]string(nil), cfg.Env...)
 			sess := newFakeSession("native-auth-session")
 			conn := &fakeClient{newSession: sess}
 			owned := &fakeDialedClient{acpClient: conn}
 			var nativeCfg launch.NativeConfig
 			if harnessName == HarnessClaudeCode {
-				installClaudeConnectorFactory(t, func(models launch.ClaudeModels) claudeConnector {
-					return &fakeClaudeConnector{models: models}
+				installClaudeConnectorFactory(t, func(models launch.ClaudeModels, effort string) claudeConnector {
+					return &fakeClaudeConnector{models: models, effort: effort}
 				})
 			}
 
@@ -470,6 +616,9 @@ func TestNewNativeAuthOmitsProxyAndGatewayOverrides(t *testing.T) {
 				if harness.Models != wantModels {
 					t.Fatalf("native Claude models = %+v, want %+v", harness.Models, wantModels)
 				}
+				if harness.Effort != cfg.Effort {
+					t.Fatalf("native Claude effort = %q, want %q", harness.Effort, cfg.Effort)
+				}
 			case HarnessCodex:
 				native, ok := nativeCfg.Harness.(launch.NativeHarnessAdapter)
 				if !ok {
@@ -482,6 +631,9 @@ func TestNewNativeAuthOmitsProxyAndGatewayOverrides(t *testing.T) {
 				if harness.Model != cfg.ModelAlias {
 					t.Fatalf("native Codex model = %q, want %q", harness.Model, cfg.ModelAlias)
 				}
+				if harness.Effort != cfg.Effort {
+					t.Fatalf("native Codex effort = %q, want %q", harness.Effort, cfg.Effort)
+				}
 				wantPosture := codexPosture(cfg.Posture, false)
 				if harness.Posture != wantPosture {
 					t.Fatalf("native Codex posture = %+v, want %+v", harness.Posture, wantPosture)
@@ -491,6 +643,7 @@ func TestNewNativeAuthOmitsProxyAndGatewayOverrides(t *testing.T) {
 				wantOperations := []string{
 					"set_config:model=" + cfg.ModelAlias,
 					"set_config:model=" + cfg.SmallModelAlias,
+					"set_config:thought_level=" + cfg.Effort,
 					"set_mode:acceptEdits",
 				}
 				if !reflect.DeepEqual(sess.operations, wantOperations) {
@@ -518,7 +671,7 @@ func TestNewNativeHarnessManagedDoesNotSelectOrInjectModel(t *testing.T) {
 			owned := &fakeDialedClient{acpClient: conn}
 			var nativeCfg launch.NativeConfig
 			if harnessName == HarnessClaudeCode {
-				installClaudeConnectorFactory(t, func(models launch.ClaudeModels) claudeConnector {
+				installClaudeConnectorFactory(t, func(models launch.ClaudeModels, _ string) claudeConnector {
 					if models != (launch.ClaudeModels{}) {
 						t.Fatalf("managed Claude models = %+v, want empty", models)
 					}
@@ -769,7 +922,7 @@ func TestNewWrapsClaudeModelAliasErrorAndClosesOwnedClient(t *testing.T) {
 	owned := &fakeDialedClient{acpClient: conn}
 	aliasErr := &launch.ModelAliasError{Alias: cfg.ModelAlias}
 
-	installClaudeConnectorFactory(t, func(launch.ClaudeModels) claudeConnector {
+	installClaudeConnectorFactory(t, func(launch.ClaudeModels, string) claudeConnector {
 		return &fakeClaudeConnector{fail: aliasErr}
 	})
 	installDial(t, func(context.Context, launch.Config) (dialedClient, error) {

@@ -58,13 +58,16 @@ var nativeDial nativeDialFunc = dialNativeLaunch
 type claudeConnector interface {
 	SelectDefaultModel(context.Context, session) error
 	SelectSmallModel(context.Context, session) error
+	SelectEffort(context.Context, session) error
 	ApplyPermissionMode(context.Context, session, protocol.SessionModeID) error
 }
 
-type claudeConnectorFactory func(launch.ClaudeModels) claudeConnector
+type claudeConnectorFactory func(launch.ClaudeModels, string) claudeConnector
 
-var newClaudeConnector claudeConnectorFactory = func(models launch.ClaudeModels) claudeConnector {
-	return &realClaudeConnector{connector: launch.ClaudeCode(models)}
+var newClaudeConnector claudeConnectorFactory = func(models launch.ClaudeModels, effort string) claudeConnector {
+	connector := launch.ClaudeCode(models)
+	connector.Effort = effort
+	return &realClaudeConnector{connector: connector}
 }
 
 // Driver owns one launch.Dial result and one ACP session for its entire
@@ -179,6 +182,11 @@ func New(ctx context.Context, cfg Config) (*Driver, error) {
 				return nil, closeAfterConstructionFailure(d, fmt.Errorf("acp: select small model: %w", err))
 			}
 		}
+		if cfg.Effort != "" {
+			if err := claude.SelectEffort(driverCtx, sess); err != nil {
+				return nil, closeAfterConstructionFailure(d, fmt.Errorf("acp: select effort: %w", err))
+			}
+		}
 		if err := claude.ApplyPermissionMode(driverCtx, sess, claudePermissionMode(cfg.Posture)); err != nil {
 			return nil, closeAfterConstructionFailure(d, fmt.Errorf("acp: apply permission mode: %w", err))
 		}
@@ -195,13 +203,15 @@ func connectorFor(cfg Config) (launch.HarnessAdapter, claudeConnector, error) {
 			Default: cfg.ModelAlias,
 			Small:   cfg.SmallModelAlias,
 		}
-		return launch.ClaudeCode(models), newClaudeConnector(models), nil
+		claude := launch.ClaudeCode(models)
+		claude.Effort = cfg.Effort
+		return claude, newClaudeConnector(models, cfg.Effort), nil
 	case HarnessCodex:
 		var codex *launch.CodexConnector
 		if cfg.gatewayBacked() {
 			codex = launch.Codex("").WithModel(cfg.ModelAlias)
 		} else {
-			codex = launch.Codex(cfg.ModelAlias)
+			codex = launch.Codex("").WithModelEffort(cfg.ModelAlias, cfg.Effort)
 		}
 		codex.Posture = codexPosture(cfg.Posture, cfg.gatewayBacked())
 		return codex, nil, nil
@@ -373,6 +383,14 @@ func (c *realClaudeConnector) SelectSmallModel(ctx context.Context, sess session
 	return c.connector.SelectSmallModel(ctx, concrete)
 }
 
+func (c *realClaudeConnector) SelectEffort(ctx context.Context, sess session) error {
+	concrete, err := concreteSession(sess)
+	if err != nil {
+		return err
+	}
+	return c.connector.SelectEffort(ctx, concrete)
+}
+
 func (c *realClaudeConnector) ApplyPermissionMode(ctx context.Context, sess session, modeID protocol.SessionModeID) error {
 	concrete, err := concreteSession(sess)
 	if err != nil {
@@ -391,6 +409,6 @@ func concreteSession(sess session) (*client.Session, error) {
 
 var _ dialFunc = dialLaunch
 var _ nativeDialFunc = dialNativeLaunch
-var _ claudeConnectorFactory = func(launch.ClaudeModels) claudeConnector {
+var _ claudeConnectorFactory = func(launch.ClaudeModels, string) claudeConnector {
 	return &realClaudeConnector{}
 }
