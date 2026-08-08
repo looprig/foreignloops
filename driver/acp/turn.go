@@ -3,9 +3,12 @@ package acp
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"strings"
 	"sync"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/looprig/acp/client"
 	"github.com/looprig/acp/protocol"
@@ -284,12 +287,82 @@ func sendTurnEvent(ctx context.Context, events chan<- driver.Event, event driver
 	}
 }
 
+// maxACPModelFacingErrorBytes bounds the complete model-facing projection,
+// including its fixed prefix. Keeping this at 512 bytes leaves enough room for
+// useful reset-time text while preventing an ACP message from becoming an
+// unbounded model-facing payload.
+const maxACPModelFacingErrorBytes = 512
+
+func promptFailureEvent(err error) driver.Event {
+	if detail, ok := safeACPErrorDetail(err); ok {
+		return driver.Event{
+			Kind:        driver.KindTerminalError,
+			ErrText:     detail,
+			ModelFacing: true,
+		}
+	}
+	return driver.Event{Kind: driver.KindTerminalError, ErrText: "acp prompt failed"}
+}
+
+// safeACPErrorDetail intentionally reads only Code and Message from a typed
+// ACP protocol failure. In particular, it does not inspect Data, Error(), or
+// any unwrapped cause, because those may contain provider-internal secrets.
+func safeACPErrorDetail(err error) (string, bool) {
+	var fault *protocol.Fault
+	if errors.As(err, &fault) && fault != nil {
+		return formatACPErrorDetail(fault.Code, fault.Message), true
+	}
+	var wireErr *protocol.Error
+	if errors.As(err, &wireErr) && wireErr != nil {
+		return formatACPErrorDetail(wireErr.Code, wireErr.Message), true
+	}
+	return "", false
+}
+
+func formatACPErrorDetail(code protocol.ErrorCode, message string) string {
+	message = normalizeACPErrorMessage(message)
+	detail := fmt.Sprintf("ACP error %d", code)
+	if message != "" {
+		detail += ": " + message
+	}
+	return truncateValidUTF8(detail, maxACPModelFacingErrorBytes)
+}
+
+func normalizeACPErrorMessage(message string) string {
+	message = strings.ToValidUTF8(message, "\uFFFD")
+	var normalized strings.Builder
+	normalized.Grow(len(message))
+	for _, r := range message {
+		if unicode.IsControl(r) || unicode.Is(unicode.Cf, r) || r == '\u2028' || r == '\u2029' {
+			normalized.WriteByte(' ')
+			continue
+		}
+		normalized.WriteRune(r)
+	}
+	return strings.Join(strings.Fields(normalized.String()), " ")
+}
+
+func truncateValidUTF8(input string, maxBytes int) string {
+	if maxBytes <= 0 {
+		return ""
+	}
+	if len(input) <= maxBytes {
+		return input
+	}
+	cut := 0
+	for cut < len(input) {
+		_, size := utf8.DecodeRuneInString(input[cut:])
+		if cut+size > maxBytes {
+			break
+		}
+		cut += size
+	}
+	return input[:cut]
+}
+
 func sendPromptTerminal(ctx context.Context, events chan<- driver.Event, state *translationState, outcome promptOutcome) {
 	if outcome.err != nil || outcome.result == nil {
-		sendTerminalEvent(ctx, events, driver.Event{
-			Kind:    driver.KindTerminalError,
-			ErrText: "acp prompt failed",
-		})
+		sendTerminalEvent(ctx, events, promptFailureEvent(outcome.err))
 		return
 	}
 	if message := state.message(); message != nil {

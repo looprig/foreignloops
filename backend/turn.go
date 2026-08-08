@@ -267,7 +267,7 @@ func (l *Loop) driveTurnWithLocks(turnCtx context.Context, cancel context.Cancel
 		return
 	}
 	committed := l.commitTurn(stream, drained.assistant, pub)
-	if turnErr := errors.Join(drained.termErr, closeErr); turnErr != nil {
+	if turnErr := joinTurnErrors(drained.termErr, closeErr); turnErr != nil {
 		pub(event.TurnFailed{TurnIndex: cur, Err: turnErr})
 		outcome = turnOutcome{committed: committed, spawned: spawned, boundSID: drained.boundSID}
 		return
@@ -310,7 +310,7 @@ func (l *Loop) drainStream(stream driver.Stream, cur event.TurnIndex, sidBound b
 			}
 		case driver.KindTerminalError:
 			output.terminal = true
-			output.termErr = &ForeignResultError{Detail: input.ErrText}
+			output.termErr = resultError(input)
 		default:
 			l.publishMapped(mapper, input, pub)
 		}

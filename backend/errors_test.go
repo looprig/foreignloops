@@ -54,3 +54,11 @@ func TestSnapshotErrorReasonValues(t *testing.T) {
 		t.Fatalf("SnapshotContextDone = %q, want context_done", backend.SnapshotContextDone)
 	}
 }
+
+func TestForeignResultErrorIsNotModelFacing(t *testing.T) {
+	t.Parallel()
+	type modelFacing interface{ ModelFacingError() string }
+	if _, ok := any(&backend.ForeignResultError{Detail: "provider output"}).(modelFacing); ok {
+		t.Fatal("ForeignResultError unexpectedly implements ModelFacingError")
+	}
+}

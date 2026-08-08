@@ -40,7 +40,7 @@ func (m *mapper) toEvents(input driver.Event) ([]event.Event, error) {
 	case driver.KindTerminalOK:
 		return one(event.TurnDone{TurnIndex: m.turnIndex, Message: input.Message}), nil
 	case driver.KindTerminalError:
-		return one(event.TurnFailed{TurnIndex: m.turnIndex, Err: &ForeignResultError{Detail: input.ErrText}}), nil
+		return one(event.TurnFailed{TurnIndex: m.turnIndex, Err: resultError(input)}), nil
 	case driver.KindInit:
 		return nil, nil
 	default:

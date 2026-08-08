@@ -3,12 +3,15 @@ package acp
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"reflect"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/looprig/acp/client"
 	"github.com/looprig/acp/protocol"
@@ -78,6 +81,122 @@ func cloneACPBlocks(blocks []protocol.ContentBlock) []protocol.ContentBlock {
 
 func newTurnTestDriver(sess *scriptedSession) *Driver {
 	return &Driver{session: sess, driverCtx: context.Background()}
+}
+
+func TestACPProtocolPromptErrorProjectsOnlySafeDetail(t *testing.T) {
+	t.Parallel()
+
+	const (
+		resetMessage  = "Usage limit reached; resets at 3:00 PM"
+		dataSentinel  = "data-secret-should-not-escape"
+		causeSentinel = "cause path=/private/acp token=token-secret"
+		outerSentinel = "outer path=/tmp/acp URL=https://example.test/?key=url-secret"
+	)
+	tests := []struct {
+		name string
+		err  error
+	}{
+		{
+			name: "wire error",
+			err: fmt.Errorf("%s: %w", outerSentinel, &protocol.Error{
+				Code:    protocol.ErrorCodeAuthenticationRequired,
+				Message: "Usage limit reached;\nresets at 3:00 PM\t\x00",
+				Data:    json.RawMessage(`{"secret":"` + dataSentinel + `"}`),
+			}),
+		},
+		{
+			name: "fault with cause and data",
+			err: fmt.Errorf("%s: %w", outerSentinel, protocol.AuthRequired(
+				"Usage limit reached;\rresets at 3:00 PM\x01",
+				errors.New(causeSentinel),
+			).WithData(map[string]string{"secret": dataSentinel})),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			sess := newScriptedSession("safe-error")
+			sess.promptHook = func(int, []protocol.ContentBlock) (*client.PromptResult, error) {
+				return nil, tt.err
+			}
+			stream, err := newTurnTestDriver(sess).Spawn(context.Background(), driver.Turn{})
+			if err != nil {
+				t.Fatalf("Spawn() error = %v", err)
+			}
+			events := collectTurnEvents(t, stream)
+			if len(events) != 1 || events[0].Kind != driver.KindTerminalError {
+				t.Fatalf("events = %#v, want one terminal error", events)
+			}
+			if got, want := events[0].ErrText, "ACP error -32000: "+resetMessage; got != want {
+				t.Fatalf("ErrText = %q, want %q", got, want)
+			}
+			if !eventIsModelFacing(events[0]) {
+				t.Fatalf("event = %#v, want explicit model-facing marker", events[0])
+			}
+			for _, forbidden := range []string{dataSentinel, causeSentinel, outerSentinel, "token-secret", "url-secret"} {
+				if strings.Contains(events[0].ErrText, forbidden) {
+					t.Fatalf("ErrText = %q contains forbidden sentinel %q", events[0].ErrText, forbidden)
+				}
+			}
+		})
+	}
+}
+
+func TestACPNonProtocolPromptErrorRemainsGeneric(t *testing.T) {
+	t.Parallel()
+	sess := newScriptedSession("generic-error")
+	sess.promptHook = func(int, []protocol.ContentBlock) (*client.PromptResult, error) {
+		return nil, fmt.Errorf("command=/private/bin/acp token=token-secret: %w", errors.New("stderr secret"))
+	}
+	stream, err := newTurnTestDriver(sess).Spawn(context.Background(), driver.Turn{})
+	if err != nil {
+		t.Fatalf("Spawn() error = %v", err)
+	}
+	events := collectTurnEvents(t, stream)
+	if len(events) != 1 || events[0].Kind != driver.KindTerminalError {
+		t.Fatalf("events = %#v, want one terminal error", events)
+	}
+	if events[0].ErrText != "acp prompt failed" {
+		t.Fatalf("ErrText = %q, want fixed generic category", events[0].ErrText)
+	}
+	if eventIsModelFacing(events[0]) {
+		t.Fatalf("event = %#v, generic ACP failure must not be model-facing", events[0])
+	}
+}
+
+func TestACPModelFacingPromptErrorIsBoundedAndValidUTF8(t *testing.T) {
+	t.Parallel()
+	const maxBytes = 512
+	message := strings.Repeat("é", maxBytes) + " resets at 3:00 PM"
+	sess := newScriptedSession("bounded-error")
+	sess.promptHook = func(int, []protocol.ContentBlock) (*client.PromptResult, error) {
+		invalid := string([]byte("prefix ")) + string([]byte{0xff, 0xfe}) + message
+		return nil, &protocol.Error{Code: protocol.ErrorCodeAuthenticationRequired, Message: invalid}
+	}
+	stream, err := newTurnTestDriver(sess).Spawn(context.Background(), driver.Turn{})
+	if err != nil {
+		t.Fatalf("Spawn() error = %v", err)
+	}
+	events := collectTurnEvents(t, stream)
+	if len(events) != 1 {
+		t.Fatalf("events = %#v, want one terminal event", events)
+	}
+	if !eventIsModelFacing(events[0]) {
+		t.Fatalf("event = %#v, want model-facing marker", events[0])
+	}
+	if len(events[0].ErrText) > maxBytes {
+		t.Fatalf("ErrText byte length = %d, want <= %d", len(events[0].ErrText), maxBytes)
+	}
+	if !utf8.ValidString(events[0].ErrText) {
+		t.Fatalf("ErrText = %q is not valid UTF-8", events[0].ErrText)
+	}
+	if strings.ContainsAny(events[0].ErrText, "\r\n\t\x00") {
+		t.Fatalf("ErrText = %q contains control/newline injection", events[0].ErrText)
+	}
+}
+
+func eventIsModelFacing(input driver.Event) bool {
+	return input.ModelFacing
 }
 
 func TestSpawnTranslatesACPUpdatesAndLeavesSessionOwned(t *testing.T) {

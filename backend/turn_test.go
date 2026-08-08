@@ -310,6 +310,36 @@ func TestTurnEventOrderingAndDriverErrorIdentity(t *testing.T) {
 	shutdown(t, state)
 }
 
+func TestModelFacingFailurePreservesOnlySafeDetail(t *testing.T) {
+	t.Parallel()
+	const safeDetail = "ACP error -32000: Usage limit reached; resets at 3:00 PM"
+	const closeSentinel = "close path=/private/acp token=close-secret"
+	agent := &fakeAgent{
+		closeErr: errors.New(closeSentinel),
+		events:   []driver.Event{markModelFacing(driver.Event{Kind: driver.KindTerminalError, ErrText: safeDetail})},
+	}
+	pub := &fakePublisher{}
+	state, _ := newTestLoop(t, Config{Agent: agent, SIDMode: SIDPrebound}, pub)
+	submit(t, state, "go")
+	waitFor(t, pub, func(input event.Event) bool { _, ok := input.(event.TurnFailed); return ok })
+	failed := pub.snapshot()[1].(event.TurnFailed)
+	var modelFacing interface{ ModelFacingError() string }
+	if !errors.As(failed.Err, &modelFacing) {
+		t.Fatalf("TurnFailed.Err = %T %v, want model-facing error", failed.Err, failed.Err)
+	}
+	if got := modelFacing.ModelFacingError(); got != safeDetail {
+		t.Fatalf("ModelFacingError() = %q, want %q", got, safeDetail)
+	}
+	if strings.Contains(failed.Err.Error(), closeSentinel) {
+		t.Fatalf("TurnFailed.Err = %q contains unsafe close detail", failed.Err)
+	}
+	var ordinary *ForeignResultError
+	if errors.As(failed.Err, &ordinary) {
+		t.Fatalf("TurnFailed.Err = %T, must not expose ordinary ForeignResultError", failed.Err)
+	}
+	shutdown(t, state)
+}
+
 func TestUserInputPublishesStartedBeforeSpawnAndHistoryBeforeDone(t *testing.T) {
 	t.Parallel()
 	agent := &fakeAgent{

@@ -166,3 +166,37 @@ func TestMapperCorrelation(t *testing.T) {
 		t.Fatalf("completed = %#v, want error result oops", completed)
 	}
 }
+
+func TestMapperModelFacingFailureUsesDedicatedError(t *testing.T) {
+	t.Parallel()
+	const safeDetail = "ACP error -32000: Usage limit reached; resets at 3:00 PM"
+	input := markModelFacing(driver.Event{Kind: driver.KindTerminalError, ErrText: safeDetail})
+	mapper := newMapper(wantTurn, seqIDGen())
+	mapped, err := mapper.toEvents(input)
+	if err != nil {
+		t.Fatalf("toEvents() error = %v", err)
+	}
+	if len(mapped) != 1 {
+		t.Fatalf("mapped events = %#v, want one event", mapped)
+	}
+	failed, ok := mapped[0].(event.TurnFailed)
+	if !ok {
+		t.Fatalf("mapped event = %T, want event.TurnFailed", mapped[0])
+	}
+	var modelFacing interface{ ModelFacingError() string }
+	if !errors.As(failed.Err, &modelFacing) {
+		t.Fatalf("TurnFailed.Err = %T %v, want dedicated model-facing error", failed.Err, failed.Err)
+	}
+	if got := modelFacing.ModelFacingError(); got != safeDetail {
+		t.Fatalf("ModelFacingError() = %q, want %q", got, safeDetail)
+	}
+	var ordinary *ForeignResultError
+	if errors.As(failed.Err, &ordinary) {
+		t.Fatalf("TurnFailed.Err = %T, must not also expose ordinary ForeignResultError", failed.Err)
+	}
+}
+
+func markModelFacing(input driver.Event) driver.Event {
+	input.ModelFacing = true
+	return input
+}

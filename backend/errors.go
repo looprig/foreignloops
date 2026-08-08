@@ -1,6 +1,11 @@
 package backend
 
-import "fmt"
+import (
+	"errors"
+	"fmt"
+
+	"github.com/looprig/foreignloops/driver"
+)
 
 // ConfigError reports invalid backend composition or runtime wiring.
 type ConfigError struct{ Field, Reason string }
@@ -38,6 +43,36 @@ type ForeignResultError struct{ Detail string }
 
 func (e *ForeignResultError) Error() string {
 	return "foreignloop: foreign result error: " + e.Detail
+}
+
+// modelFacingResultError is a result-level failure whose detail was already
+// projected and bounded by the driver for display to a model. Its dedicated
+// marker prevents ordinary provider output from becoming model-facing. The
+// concrete type stays private; callers classify it through ModelFacingError.
+type modelFacingResultError struct{ Detail string }
+
+func (e *modelFacingResultError) Error() string {
+	return "foreignloop: model-facing result error: " + e.Detail
+}
+
+// ModelFacingError returns the already-safe detail intended for model display.
+func (e *modelFacingResultError) ModelFacingError() string { return e.Detail }
+
+func resultError(input driver.Event) error {
+	if input.ModelFacing {
+		return &modelFacingResultError{Detail: input.ErrText}
+	}
+	return &ForeignResultError{Detail: input.ErrText}
+}
+
+func joinTurnErrors(terminal, closeErr error) error {
+	var modelFacing *modelFacingResultError
+	if errors.As(terminal, &modelFacing) && modelFacing != nil {
+		// A model-facing projection is the only detail allowed to cross this
+		// boundary. Do not join it with an arbitrary stream-close diagnostic.
+		return modelFacing
+	}
+	return errors.Join(terminal, closeErr)
 }
 
 // ForeignProtocolError reports a stream that ended without a result terminal.

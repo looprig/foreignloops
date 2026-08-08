@@ -69,6 +69,11 @@ type Event struct {
 	ResultPreview string
 	Message       *content.AIMessage
 	ErrText       string
+	// ModelFacing marks terminal error text that a driver has already reduced
+	// to a bounded, safe detail suitable for model display. Ordinary provider
+	// failures must leave this false so backend error handling keeps them
+	// non-model-facing.
+	ModelFacing bool
 }
 
 // PermissionPosture is the typed, non-interactive permission mode passed to an
