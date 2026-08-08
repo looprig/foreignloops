@@ -250,13 +250,17 @@ func TestACPDirectProtocolMessageRedactsSensitiveMaterial(t *testing.T) {
 		passwordSecret = "password-assignment-sentinel"
 		authSecret     = "authorization-assignment-sentinel"
 		bearerSecret   = "bearer-sentinel"
+		googleAPIKey   = "AIzaSyA-0123456789_AbCdEfGhIjKlMnOpQrStUv"
+		awsAccessKey   = "AKIAIOSFODNN7EXAMPLE"
+		jwtSecret      = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c"
 	)
 	message := "Usage limit reached; resets at 3:00 PM\n" +
 		"URL=https://example.test/v1?token=" + urlSecret + "\t" +
 		"path=/private/acp/" + unixSecret + "\x00 " +
 		`windows=C:\Users\runner\` + windowsSecret + " " +
 		"token=" + tokenSecret + " api_key: '" + apiKeySecret + "' password=" + passwordSecret + " " +
-		"authorization: Bearer " + authSecret + " Bearer " + bearerSecret
+		"authorization: Bearer " + authSecret + " Bearer " + bearerSecret + " " +
+		"google=" + googleAPIKey + " aws=" + awsAccessKey + " jwt=" + jwtSecret
 	sess := newScriptedSession("direct-message-redaction")
 	sess.promptHook = func(int, []protocol.ContentBlock) (*client.PromptResult, error) {
 		return nil, &protocol.Error{Code: protocol.ErrorCodeAuthenticationRequired, Message: message}
@@ -275,7 +279,7 @@ func TestACPDirectProtocolMessageRedactsSensitiveMaterial(t *testing.T) {
 	}
 	for _, forbidden := range []string{
 		urlSecret, unixSecret, windowsSecret, tokenSecret, apiKeySecret,
-		passwordSecret, authSecret, bearerSecret,
+		passwordSecret, authSecret, bearerSecret, googleAPIKey, awsAccessKey, jwtSecret,
 	} {
 		if strings.Contains(detail, forbidden) {
 			t.Fatalf("ErrText = %q contains forbidden secret %q", detail, forbidden)
@@ -286,6 +290,45 @@ func TestACPDirectProtocolMessageRedactsSensitiveMaterial(t *testing.T) {
 	}
 	if strings.ContainsAny(detail, "\r\n\t\x00") {
 		t.Fatalf("ErrText = %q contains control/newline injection", detail)
+	}
+}
+
+func TestACPDirectProtocolMessageRedactsBareCredentialForms(t *testing.T) {
+	t.Parallel()
+	const reset = "Usage limit reached; resets at 3:00 PM"
+	tests := []struct {
+		name   string
+		secret string
+	}{
+		{name: "bearer token", secret: "Bearer bearer-token_123"},
+		{name: "openai key", secret: "sk-live-0123456789abcdef"},
+		{name: "github token", secret: "ghp_0123456789abcdef"},
+		{name: "xox token", secret: "xoxb-0123456789abcdef"},
+		{name: "google api key", secret: "AIzaSyA-0123456789_AbCdEfGhIjKlMnOpQrStUv"},
+		{name: "aws access key", secret: "AKIAIOSFODNN7EXAMPLE"},
+		{name: "jwt", secret: "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			sess := newScriptedSession("bare-credential-" + tt.name)
+			sess.promptHook = func(int, []protocol.ContentBlock) (*client.PromptResult, error) {
+				return nil, &protocol.Error{Code: protocol.ErrorCodeAuthenticationRequired, Message: reset + "; credential " + tt.secret}
+			}
+			stream, err := newTurnTestDriver(sess).Spawn(context.Background(), driver.Turn{})
+			if err != nil {
+				t.Fatalf("Spawn() error = %v", err)
+			}
+			events := collectTurnEvents(t, stream)
+			if len(events) != 1 || events[0].Kind != driver.KindModelFacingError {
+				t.Fatal("prompt did not produce one model-facing error event")
+			}
+			if strings.Contains(events[0].ErrText, tt.secret) {
+				t.Fatal("bare credential reached Event.ErrText")
+			}
+			if !strings.Contains(events[0].ErrText, reset) {
+				t.Fatal("useful reset wording was redacted")
+			}
+		})
 	}
 }
 

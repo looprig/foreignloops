@@ -33,7 +33,7 @@ var (
 	toolAuthPattern            = regexp.MustCompile(`(?i)(\b(?:authorization|proxy-authorization)\b(?:\s*["']?\s*[:=]|\s+)\s*)([^\r\n,;&}\]]+)`)
 	toolSecretPattern          = regexp.MustCompile(`(?i)(\b(?:api[\s_-]*key|access[\s_-]*token|refresh[\s_-]*token|secret[\s_-]*key|token|password|secret|credential|provider|error)\b\s*["']?\s*[:=]\s*)(?:"[^"]*"|'[^']*'|[^\s,;&}\]]+)`)
 	toolSensitivePhrasePattern = regexp.MustCompile(`(?i)\b(?:api[\s_-]*key|access[\s_-]*token|refresh[\s_-]*token|secret[\s_-]*key|token|password|secret|credential|provider|authorization|proxy-authorization|error)\b(?:\s*["']?\s*[:=]\s*|\s+)[^\r\n,;]+`)
-	toolCredentialTokenPattern = regexp.MustCompile(`(?i)\b(?:sk|pk|ghp|gho|ghu|ghs|ghr|xox[baprs]|AIza)[-_][a-z0-9][a-z0-9._-]*\b`)
+	toolCredentialTokenPattern = regexp.MustCompile(`(?i)\b(?:(?:sk|pk|ghp|gho|ghu|ghs|ghr|xox[baprs])[-_][a-z0-9][a-z0-9._-]*|AIza[0-9A-Za-z_-]+|(?:AKIA|ASIA|AIDA|AROA)[0-9A-Z]{16}|eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+)\b`)
 )
 
 var safeToolJSONFields = map[string]struct{}{
