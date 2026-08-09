@@ -70,6 +70,29 @@ var newClaudeConnector claudeConnectorFactory = func(models launch.ClaudeModels,
 	return &realClaudeConnector{connector: connector}
 }
 
+// codexConnector is the session-level portion of launch.CodexConnector.
+// launch's public methods accept *client.Session, so production uses the
+// adapter below while construction tests can use a narrow in-process fake.
+type codexConnector interface {
+	SelectModel(context.Context, session) error
+	SelectEffort(context.Context, session) error
+}
+
+type codexConnectorFactory func(string, string) codexConnector
+
+var newCodexConnector codexConnectorFactory = func(model, effort string) codexConnector {
+	connector := launch.Codex("")
+	switch {
+	case model == "" && effort == "":
+		// Leave both selectors empty so native Codex remains harness-managed.
+	case effort == "":
+		connector = connector.WithModel(model)
+	default:
+		connector = connector.WithModelEffort(model, effort)
+	}
+	return &realCodexConnector{connector: connector}
+}
+
 // Driver owns one launch.Dial result and one ACP session for its entire
 // lifetime. Turns will use this session in later driver work; construction
 // never creates a per-turn client or process.
@@ -108,7 +131,7 @@ func New(ctx context.Context, cfg Config) (*Driver, error) {
 		}
 	}()
 
-	harness, claude, err := connectorFor(cfg)
+	harness, claude, codex, err := connectorFor(cfg)
 	if err != nil {
 		return nil, err
 	}
@@ -168,11 +191,12 @@ func New(ctx context.Context, cfg Config) (*Driver, error) {
 		driverCancel:   driverCancel,
 	}
 
-	// A loaded Claude session owns its existing configuration. ACP does not
-	// populate mutable config/mode capabilities for session/load, so only a
-	// fresh session receives the requested model and permission setup. When
-	// both aliases are empty, native Claude is harness-managed: leave model
-	// selection entirely to the adapter and apply only the posture.
+	// A loaded Claude session owns its existing configuration. ACP may populate
+	// mutable config/mode capabilities in the session/load response, but the
+	// driver preserves that loaded configuration; only a fresh session receives
+	// the requested model and permission setup. When both aliases are empty,
+	// native Claude is harness-managed: leave model selection entirely to the
+	// adapter and apply only the posture.
 	if claude != nil && cfg.AgentSessionID == "" {
 		if cfg.ModelAlias != "" {
 			if err := claude.SelectDefaultModel(driverCtx, sess); err != nil {
@@ -191,12 +215,24 @@ func New(ctx context.Context, cfg Config) (*Driver, error) {
 			return nil, closeAfterConstructionFailure(d, fmt.Errorf("acp: apply permission mode: %w", err))
 		}
 	}
+	if codex != nil {
+		if cfg.ModelAlias != "" {
+			if err := codex.SelectModel(driverCtx, sess); err != nil {
+				return nil, closeAfterConstructionFailure(d, fmt.Errorf("acp: select model: %w", err))
+			}
+		}
+		if nativeEffort(cfg.Effort) != "" {
+			if err := codex.SelectEffort(driverCtx, sess); err != nil {
+				return nil, closeAfterConstructionFailure(d, fmt.Errorf("acp: select effort: %w", err))
+			}
+		}
+	}
 
 	driverOwnsContext = true
 	return d, nil
 }
 
-func connectorFor(cfg Config) (launch.HarnessAdapter, claudeConnector, error) {
+func connectorFor(cfg Config) (launch.HarnessAdapter, claudeConnector, codexConnector, error) {
 	switch cfg.Harness {
 	case HarnessClaudeCode:
 		models := launch.ClaudeModels{
@@ -206,24 +242,28 @@ func connectorFor(cfg Config) (launch.HarnessAdapter, claudeConnector, error) {
 		effort := nativeEffort(cfg.Effort)
 		claude := launch.ClaudeCode(models)
 		claude.Effort = effort
-		return claude, newClaudeConnector(models, effort), nil
+		return claude, newClaudeConnector(models, effort), nil, nil
 	case HarnessCodex:
 		var codex *launch.CodexConnector
 		if cfg.gatewayBacked() {
 			codex = launch.Codex("").WithModel(cfg.ModelAlias)
-		} else if nativeEffort(cfg.Effort) == "" {
+			codex.Posture = codexPosture(cfg.Posture, true)
+			return codex, nil, nil, nil
+		}
+		effort := nativeEffort(cfg.Effort)
+		if effort == "" {
 			if cfg.ModelAlias == "" {
 				codex = launch.Codex("")
 			} else {
 				codex = launch.Codex("").WithModel(cfg.ModelAlias)
 			}
 		} else {
-			codex = launch.Codex("").WithModelEffort(cfg.ModelAlias, nativeEffort(cfg.Effort))
+			codex = launch.Codex("").WithModelEffort(cfg.ModelAlias, effort)
 		}
-		codex.Posture = codexPosture(cfg.Posture, cfg.gatewayBacked())
-		return codex, nil, nil
+		codex.Posture = codexPosture(cfg.Posture, false)
+		return codex, nil, newCodexConnector(cfg.ModelAlias, effort), nil
 	default:
-		return nil, nil, &ConfigError{Field: "Harness", Reason: "must be a supported harness"}
+		return nil, nil, nil, &ConfigError{Field: "Harness", Reason: "must be a supported harness"}
 	}
 }
 
@@ -381,6 +421,26 @@ type realClaudeConnector struct {
 	connector *launch.ClaudeConnector
 }
 
+type realCodexConnector struct {
+	connector *launch.CodexConnector
+}
+
+func (c *realCodexConnector) SelectModel(ctx context.Context, sess session) error {
+	concrete, err := concreteSession(sess)
+	if err != nil {
+		return err
+	}
+	return c.connector.SelectModel(ctx, concrete)
+}
+
+func (c *realCodexConnector) SelectEffort(ctx context.Context, sess session) error {
+	concrete, err := concreteSession(sess)
+	if err != nil {
+		return err
+	}
+	return c.connector.SelectEffort(ctx, concrete)
+}
+
 func (c *realClaudeConnector) SelectDefaultModel(ctx context.Context, sess session) error {
 	concrete, err := concreteSession(sess)
 	if err != nil {
@@ -425,4 +485,7 @@ var _ dialFunc = dialLaunch
 var _ nativeDialFunc = dialNativeLaunch
 var _ claudeConnectorFactory = func(launch.ClaudeModels, string) claudeConnector {
 	return &realClaudeConnector{}
+}
+var _ codexConnectorFactory = func(string, string) codexConnector {
+	return &realCodexConnector{}
 }
