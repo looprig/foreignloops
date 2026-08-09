@@ -20,6 +20,7 @@ import (
 	"github.com/looprig/foreignloops/driver"
 	"github.com/looprig/harness/pkg/command"
 	"github.com/looprig/harness/pkg/event"
+	"github.com/looprig/harness/pkg/foreign"
 	"github.com/looprig/harness/pkg/identity"
 	"github.com/looprig/harness/pkg/loop"
 )
@@ -766,6 +767,129 @@ func TestLateBoundSIDPersistsWhenInterruptDrainTimesOut(t *testing.T) {
 	turn := agent.lastForeignTurn()
 	if turn.StartNew || turn.ForeignSID != "learned" {
 		t.Fatalf("resumed turn = {StartNew:%v ForeignSID:%q}, want false/learned", turn.StartNew, turn.ForeignSID)
+	}
+}
+
+func TestInterruptDrainPublishesBufferedBoundForRestore(t *testing.T) {
+	agent := &fakeAgent{events: []driver.Event{{Kind: driver.KindTerminalOK}}}
+	hook := &recordingDeliveryHook{}
+	l, machine, pub, cancel := newSteeringUnit(t, agent, hook)
+	t.Cleanup(cancel)
+	l.backendCfg.Cwd = t.TempDir()
+	l.cfg = validBoundDefinition()
+	factory := &manualSteeringTimerFactory{}
+	timerCreated := make(chan struct{}, 1)
+	machine.timerFactory = func(timeout time.Duration) steeringTimer {
+		timer := factory.new(timeout)
+		timerCreated <- struct{}{}
+		return timer
+	}
+	mailbox := make(chan turnObservation, 1)
+	mailbox <- turnObservation{event: event.ForeignSessionBound{ForeignSID: "restore-me"}}
+	result := make(chan turnOutcome)
+	ack := make(chan bool, 1)
+	activeID, turnID, stepID := mustID(t), mustID(t), mustID(t)
+	commandDone := make(chan struct {
+		done bool
+		exit bool
+	}, 1)
+	go func() {
+		done, exit := l.handleTurnCommand(
+			context.Background(), command.Interrupt{Ack: ack}, 1, activeID, turnID, stepID,
+			cancel, l.publisher(context.Background(), turnID, stepID), mailbox, result, machine,
+		)
+		commandDone <- struct {
+			done bool
+			exit bool
+		}{done: done, exit: exit}
+	}()
+	select {
+	case <-timerCreated:
+	case <-time.After(time.Second):
+		t.Fatal("interrupt drain did not arm bounded provider wait")
+	}
+	timers, _ := factory.snapshot()
+	if len(timers) != 1 {
+		t.Fatalf("interrupt drain timers = %d, want one", len(timers))
+	}
+	timers[0].fire()
+	select {
+	case outcome := <-commandDone:
+		if !outcome.done || outcome.exit {
+			t.Fatalf("interrupt result = done:%t exit:%t, want done/continue", outcome.done, outcome.exit)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("interrupt did not finish after bounded provider wait")
+	}
+	if !<-ack {
+		t.Fatal("interrupt ack = false, want true")
+	}
+	if l.sid != "restore-me" || !l.sidBound {
+		t.Fatalf("bound SID after interrupt = %q bound:%t, want restore-me/true", l.sid, l.sidBound)
+	}
+	checked := pub.checkedSnapshot()
+	var boundCount int
+	for _, checkedEvent := range checked {
+		bound, ok := checkedEvent.(event.ForeignSessionBound)
+		if !ok {
+			continue
+		}
+		boundCount++
+		if bound.ForeignSID != l.sid {
+			t.Fatalf("checked bound event = %#v, want SID %q", checkedEvent, l.sid)
+		}
+	}
+	if boundCount != 1 {
+		t.Fatalf("checked bound events = %d in %#v, want one", boundCount, checked)
+	}
+	restored, err := newRestoredState(context.Background(), mustID(t), mustID(t), loop.Provenance{}, &fakePublisher{}, validBoundDefinition(), Config{Agent: &fakeAgent{}, Cwd: t.TempDir(), SIDMode: SIDLateBound}, seqIDGen(), workingFac(), foreign.RestoredForeign{ForeignSID: l.sid})
+	if err != nil {
+		t.Fatalf("restore from bound SID: %v", err)
+	}
+	if restored.sid != l.sid || !restored.sidBound || !restored.hasSpawned {
+		t.Fatalf("restored binding = sid:%q bound:%t spawned:%t, want %q/true/true", restored.sid, restored.sidBound, restored.hasSpawned, l.sid)
+	}
+}
+
+func TestInterruptDrainBoundPublicationFailureStopsWithoutSID(t *testing.T) {
+	sentinel := errors.New("bound publication unavailable")
+	agent := &fakeAgent{}
+	hook := &recordingDeliveryHook{}
+	l, machine, _, cancel := newSteeringUnit(t, agent, hook)
+	t.Cleanup(cancel)
+	l.pub = &terminalFailurePublisher{failOn: "event.ForeignSessionBound", err: sentinel}
+	mailbox := make(chan turnObservation, 1)
+	mailbox <- turnObservation{event: event.ForeignSessionBound{ForeignSID: "must-not-bind"}}
+	result := make(chan turnOutcome)
+	ack := make(chan bool, 1)
+	activeID, turnID, stepID := mustID(t), mustID(t), mustID(t)
+	commandDone := make(chan struct {
+		done bool
+		exit bool
+	}, 1)
+	go func() {
+		done, exit := l.handleTurnCommand(
+			context.Background(), command.Interrupt{Ack: ack}, 1, activeID, turnID, stepID,
+			cancel, l.publisher(context.Background(), turnID, stepID), mailbox, result, machine,
+		)
+		commandDone <- struct {
+			done bool
+			exit bool
+		}{done: done, exit: exit}
+	}()
+	select {
+	case outcome := <-commandDone:
+		if !outcome.done || !outcome.exit {
+			t.Fatalf("interrupt failure result = done:%t exit:%t, want done/exit", outcome.done, outcome.exit)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("interrupt did not stop after bound publication failure")
+	}
+	if !<-ack {
+		t.Fatal("interrupt ack = false, want true")
+	}
+	if l.sid != "" || l.sidBound {
+		t.Fatalf("SID after failed bound publication = %q bound:%t, want empty/false", l.sid, l.sidBound)
 	}
 }
 

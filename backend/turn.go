@@ -800,9 +800,13 @@ func (l *Loop) processTurnOutcomeObservation(ctx context.Context, cur event.Turn
 	}
 	if !publish {
 		// Cancellation may consume the authoritative binding after the normal
-		// checked publication path has stopped. Retain it for the next turn even
-		// when no late lifecycle event is emitted.
-		l.applyBoundObservation(observation.event)
+		// checked publication path has stopped. The binding is still durable
+		// lifecycle state: publish it through the checked path before applying it
+		// locally so restore can recover the same SID. Other late lifecycle facts
+		// remain suppressed during cancellation.
+		if _, ok := observation.event.(event.ForeignSessionBound); ok {
+			return l.publishTurnObservation(ctx, cur, turnID, stepID, observation)
+		}
 		return nil
 	}
 	return l.publishTurnObservation(ctx, cur, turnID, stepID, observation)
