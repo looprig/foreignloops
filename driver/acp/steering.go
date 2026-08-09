@@ -169,13 +169,6 @@ func normalizeSteering(result client.SteerResult, callErr error) (driver.SteerRe
 		ReceiveSequence:  result.ReceiveSequence,
 		ResponseSequence: result.ResponseSequence,
 	}
-	if normalized.ReceiveSequence == 0 {
-		normalized.ReceiveSequence = normalized.ResponseSequence
-	}
-	if normalized.ResponseSequence == 0 {
-		normalized.ResponseSequence = normalized.ReceiveSequence
-	}
-
 	if callErr != nil {
 		if !result.WriteAdmitted || steeringErrorGuaranteesNoDelivery(callErr) {
 			normalized.Outcome = driver.SteerOutcomeFallbackRequired

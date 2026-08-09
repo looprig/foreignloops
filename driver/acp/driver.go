@@ -2,7 +2,6 @@ package acp
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"sync"
@@ -103,9 +102,7 @@ type Driver struct {
 	steeringOn   bool
 	steeringOff  bool
 	activeMu     sync.Mutex
-	active       *stream
-	pendingMu    sync.Mutex
-	pending      []client.Update
+	active       *turnHandle
 
 	closeOnce sync.Once
 	closeErr  error
@@ -339,10 +336,10 @@ func (d *Driver) AgentSessionID() string {
 	return d.agentSessionID
 }
 
-// Steer attempts one active-turn injection through the fixed ACP extension.
-// Capability policy is decided during initialize; no unknown-method probe is
-// ever issued. Steering calls serialize in call order so a target receives
-// FIFO observations even when multiple callers race.
+// Steer queues one active-turn injection through the turn arbiter. The arbiter
+// owns provider translation and the dispatcher owns the single in-flight ACP
+// request; this method only waits for the one result paired with its
+// observation.
 func (d *Driver) Steer(ctx context.Context, request driver.SteerRequest) (driver.SteerResult, error) {
 	if d == nil {
 		return driver.SteerResult{Outcome: driver.SteerOutcomeUnsupported}, errors.New("acp: driver unavailable")
@@ -350,121 +347,35 @@ func (d *Driver) Steer(ctx context.Context, request driver.SteerRequest) (driver
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	if err := request.Validate(); err != nil {
-		result := driver.SteerResult{Outcome: driver.SteerOutcomeUnsupported}
-		if active := d.activeStream(); active != nil {
-			d.admitSteer(ctx, active, driver.SteerObservation{SteerResult: result, Err: err})
+	h := d.activeHandle()
+	if h == nil {
+		return driver.SteerResult{Outcome: driver.SteerOutcomeUnsupported}, nil
+	}
+	reply := make(chan steerReply, 1)
+	if !h.send(ctx, steerCommand{ctx: ctx, request: request, reply: reply}) {
+		if err := ctx.Err(); err != nil {
+			return driver.SteerResult{Outcome: driver.SteerOutcomeDeliveryUnknown, WriteAdmitted: true}, err
 		}
-		return result, err
+		return driver.SteerResult{Outcome: driver.SteerOutcomeUnsupported}, nil
 	}
-
-	d.steeringMu.Lock()
-	steeringOn, steeringOff := d.steeringOn, d.steeringOff
-	d.steeringMu.Unlock()
-	active := d.activeStream()
-	unsupported := driver.SteerResult{Outcome: driver.SteerOutcomeUnsupported}
-	if !steeringOn || steeringOff || active == nil {
-		if active != nil {
-			d.admitSteer(ctx, active, driver.SteerObservation{SteerResult: unsupported})
-		}
-		return unsupported, nil
+	select {
+	case result := <-reply:
+		return result.result, result.err
+	case <-ctx.Done():
+		// The arbiter still owns the attempt and may later emit its observation.
+		// Return a bounded caller result without allowing this caller to consume
+		// or cancel the arbiter's reply.
+		return driver.SteerResult{Outcome: driver.SteerOutcomeDeliveryUnknown, WriteAdmitted: true}, ctx.Err()
 	}
-	sess, ok := d.session.(steerSession)
-	if !ok {
-		d.admitSteer(ctx, active, driver.SteerObservation{SteerResult: unsupported})
-		return unsupported, nil
-	}
-	prompt, err := steerPromptBlocks(request)
-	if err != nil {
-		result := driver.SteerResult{Outcome: driver.SteerOutcomeUnsupported}
-		d.admitSteer(ctx, active, driver.SteerObservation{SteerResult: result, Err: err})
-		return result, err
-	}
-	call, admitted := active.registerSteer()
-	if !admitted {
-		emitObservation(active, driver.SteerObservation{SteerResult: unsupported})
-		return unsupported, nil
-	}
-	params := client.SteerParams{
-		SessionID: sess.ID(),
-		Prompt:    prompt,
-		Meta:      json.RawMessage(steeringIdleMeta),
-	}
-	var result client.SteerResult
-	var callErr error
-	if async, ok := d.session.(asyncSteerSession); ok {
-		d.steeringMu.Lock()
-		call.setHandle(async.StartSteer(ctx, params))
-		admittedValue, admissionOK := <-call.handle.Admission()
-		call.setAdmission(true, admissionOK && admittedValue)
-		d.steeringMu.Unlock()
-		completion, resultOK := <-call.handle.Result()
-		if resultOK {
-			result, callErr = completion.Result, completion.Err
-		} else {
-			callErr = errors.New("acp: steering completion unavailable")
-		}
-	} else {
-		result, callErr = sess.Steer(ctx, params)
-		call.setAdmission(true, result.WriteAdmitted)
-	}
-	normalized, normalizedErr := normalizeSteering(result, callErr)
-	if normalized.Outcome == driver.SteerOutcomeDeliveryUnknown || normalized.Outcome == driver.SteerOutcomeDeliveredUntrackable || steeringErrorGuaranteesNoDelivery(callErr) {
-		d.steeringMu.Lock()
-		d.steeringOff = true
-		d.steeringMu.Unlock()
-	}
-	if active.completeSteer(call) {
-		d.admitSteer(ctx, active, driver.SteerObservation{SteerResult: normalized, Err: normalizedErr})
-	} else if active.terminalSteer() {
-		known, admitted := call.admission()
-		normalized = driver.SteerResult{Outcome: driver.SteerOutcomeDeliveryUnknown, WriteAdmitted: admitted}
-		if known && !admitted {
-			normalized.Outcome = driver.SteerOutcomeFallbackRequired
-		}
-		normalizedErr = errors.New("acp: steer completed after terminal resolution")
-		d.steeringMu.Lock()
-		d.steeringOff = true
-		d.steeringMu.Unlock()
-	}
-	return normalized, normalizedErr
 }
 
-func (d *Driver) activeStream() *stream {
+func (d *Driver) activeHandle() *turnHandle {
 	if d == nil {
 		return nil
 	}
 	d.activeMu.Lock()
 	defer d.activeMu.Unlock()
 	return d.active
-}
-
-func (d *Driver) takePendingUpdates() []client.Update {
-	d.pendingMu.Lock()
-	defer d.pendingMu.Unlock()
-	updates := d.pending
-	d.pending = nil
-	return updates
-}
-
-func (d *Driver) returnPendingUpdates(updates []client.Update) {
-	if len(updates) == 0 {
-		return
-	}
-	d.pendingMu.Lock()
-	d.pending = append(updates, d.pending...)
-	d.pendingMu.Unlock()
-}
-
-func (d *Driver) admitSteer(ctx context.Context, active *stream, observation driver.SteerObservation) {
-	ok, admitted := active.enqueueSteer(observation)
-	if !ok {
-		return
-	}
-	select {
-	case <-admitted:
-	case <-ctx.Done():
-	}
 }
 
 // Close cancels active turns, releases the owned ACP connection/process exactly

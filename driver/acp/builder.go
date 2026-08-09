@@ -5,7 +5,6 @@ import (
 	"errors"
 	"sync"
 
-	"github.com/looprig/acp/protocol"
 	"github.com/looprig/core/uuid"
 	"github.com/looprig/foreignloops/backend"
 	"github.com/looprig/foreignloops/driver"
@@ -191,9 +190,6 @@ func (a *initAgent) Spawn(ctx context.Context, turn driver.Turn) (driver.Stream,
 	if !first {
 		return stream, nil
 	}
-	if a.agent.steeringOn {
-		return newOrderedInitStream(stream, a.sessionID), nil
-	}
 	return newInitStream(stream, a.sessionID), nil
 }
 
@@ -203,184 +199,138 @@ func (a *initAgent) Steer(ctx context.Context, request driver.SteerRequest) (dri
 	return a.agent.Steer(ctx, request)
 }
 
+// initStream prefixes exactly one synthetic init value and then forwards the
+// wrapped stream's already-selected projection. It has its own projection
+// owner so no wrapper goroutine sends to or closes a public channel directly.
 type initStream struct {
-	inner  driver.Stream
-	events <-chan driver.Event
-	done   <-chan struct{}
-	cancel context.CancelFunc
+	inner      driver.Stream
+	projection *projection
+	done       chan struct{}
+	ctx        context.Context
+	cancel     context.CancelFunc
+	sessionID  string
 
+	startOnce sync.Once
+	selectMu  sync.Mutex
+	selected  streamView
+	doneOnce  sync.Once
 	closeOnce sync.Once
 	closeErr  error
 }
 
-// orderedInitStream preserves the legacy Events projection for the backend
-// while exposing the authoritative ordered observation view without probing
-// Events on the wrapped stream.
-type orderedInitStream struct {
-	inner              driver.Stream
-	events             chan driver.Event
-	observations       chan driver.Observation
-	done               chan struct{}
-	cancel             context.CancelFunc
-	startOnce          sync.Once
-	mu                 sync.Mutex
-	selected           bool
-	closedEvents       bool
-	closedObservations bool
-	closeOnce          sync.Once
-	closeErr           error
-	ctx                context.Context
-	sessionID          string
-}
-
 func newOrderedInitStream(inner driver.Stream, sessionID string) driver.Stream {
-	_ = inner.(driver.OrderedStream)
-	ctx, cancel := context.WithCancel(context.Background())
-	return &orderedInitStream{inner: inner, events: make(chan driver.Event, 4096), observations: make(chan driver.Observation, 4096), done: make(chan struct{}), cancel: cancel, ctx: ctx, sessionID: sessionID}
-}
-
-func (s *orderedInitStream) Events() <-chan driver.Event {
-	s.start(false)
-	return s.events
-}
-func (s *orderedInitStream) Observations() <-chan driver.Observation {
-	s.start(true)
-	return s.observations
-}
-func (s *orderedInitStream) start(observations bool) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.selected {
-		return
-	}
-	s.selected = true
-	if observations {
-		close(s.events)
-		s.closedEvents = true
-	} else {
-		close(s.observations)
-		s.closedObservations = true
-	}
-	s.startOnce.Do(func() { go s.forward(observations) })
-}
-func (s *orderedInitStream) forward(observations bool) {
-	defer close(s.done)
-	defer func() {
-		s.mu.Lock()
-		if !s.closedEvents {
-			close(s.events)
-			s.closedEvents = true
-		}
-		if !s.closedObservations {
-			close(s.observations)
-			s.closedObservations = true
-		}
-		s.mu.Unlock()
-	}()
-	ordered := s.inner.(driver.OrderedStream)
-	if observations {
-		select {
-		case s.observations <- driver.UpdateObservation{Event: driver.Event{Kind: driver.KindInit, SessionID: s.sessionID}}:
-		case <-s.ctx.Done():
-			return
-		}
-	} else {
-		select {
-		case s.events <- driver.Event{Kind: driver.KindInit, SessionID: s.sessionID}:
-		case <-s.ctx.Done():
-			return
-		}
-	}
-	for observation := range ordered.Observations() {
-		if observations {
-			select {
-			case s.observations <- observation:
-			case <-s.ctx.Done():
-				return
-			}
-			continue
-		}
-		if update, ok := observation.(driver.UpdateObservation); ok {
-			select {
-			case s.events <- update.Event:
-			case <-s.ctx.Done():
-				return
-			}
-		} else if prompt, ok := observation.(driver.PromptObservation); ok {
-			event := driver.Event{Kind: driver.KindTerminalOK}
-			if prompt.Err != nil {
-				event.Kind = driver.KindTerminalError
-				event.ErrText = "acp prompt failed"
-			}
-			if prompt.StopReason == string(protocol.StopReasonRefusal) || prompt.StopReason == string(protocol.StopReasonMaxTokens) || prompt.StopReason == string(protocol.StopReasonMaxTurnRequests) {
-				event.Kind = driver.KindTerminalError
-			}
-			select {
-			case s.events <- event:
-			case <-s.ctx.Done():
-				return
-			}
-		}
-	}
-}
-func (s *orderedInitStream) History() (driver.History, error) { return s.inner.History() }
-func (s *orderedInitStream) Close() error {
-	s.closeOnce.Do(func() { s.start(false); s.cancel(); s.closeErr = s.inner.Close(); <-s.done })
-	return s.closeErr
+	return newInitStream(inner, sessionID)
 }
 
 func newInitStream(inner driver.Stream, sessionID string) driver.Stream {
 	ctx, cancel := context.WithCancel(context.Background())
-	events := make(chan driver.Event, 1)
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		defer close(events)
-		select {
-		case events <- driver.Event{Kind: driver.KindInit, SessionID: sessionID}:
-		case <-ctx.Done():
+	projectionOwner := newProjection()
+	projectionOwner.stopOn(ctx)
+	return &initStream{
+		inner:      inner,
+		projection: projectionOwner,
+		done:       make(chan struct{}),
+		ctx:        ctx,
+		cancel:     cancel,
+		sessionID:  sessionID,
+	}
+}
+
+func (s *initStream) Events() <-chan driver.Event {
+	if s == nil {
+		return nil
+	}
+	s.start(viewEvents)
+	return s.projection.eventsView()
+}
+
+func (s *initStream) Observations() <-chan driver.Observation {
+	if s == nil {
+		return nil
+	}
+	s.start(viewObservations)
+	return s.projection.observationsView()
+}
+
+func (s *initStream) start(view streamView) {
+	s.selectMu.Lock()
+	defer s.selectMu.Unlock()
+	if s.selected == viewUnselected {
+		s.selected = view
+		s.projection.selectView(view)
+		s.startOnce.Do(func() { go s.forward(view) })
+	}
+}
+
+func (s *initStream) forward(view streamView) {
+	defer s.finishDone()
+	defer s.projection.close()
+	if view == viewObservations {
+		ordered, ok := s.inner.(driver.OrderedStream)
+		if !ok {
 			return
 		}
-		innerEvents := inner.Events()
+		s.projection.emitObservation(driver.UpdateObservation{Event: driver.Event{Kind: driver.KindInit, SessionID: s.sessionID}})
+		innerObservations := ordered.Observations()
 		for {
 			select {
-			case <-ctx.Done():
+			case <-s.ctx.Done():
 				return
-			case event, ok := <-innerEvents:
+			case observation, ok := <-innerObservations:
 				if !ok {
 					return
 				}
-				select {
-				case events <- event:
-				case <-ctx.Done():
-					return
-				}
+				s.projection.emitObservation(observation)
 			}
 		}
-	}()
-	return &initStream{inner: inner, events: events, done: done, cancel: cancel}
-}
-
-func (s *initStream) Events() <-chan driver.Event { return s.events }
-
-func (s *initStream) Observations() <-chan driver.Observation {
-	ordered, ok := s.inner.(driver.OrderedStream)
-	if !ok {
-		return nil
 	}
-	return ordered.Observations()
+	s.projection.emitEvent(driver.Event{Kind: driver.KindInit, SessionID: s.sessionID})
+	innerEvents := s.inner.Events()
+	if innerEvents == nil {
+		return
+	}
+	for {
+		select {
+		case <-s.ctx.Done():
+			return
+		case event, ok := <-innerEvents:
+			if !ok {
+				return
+			}
+			s.projection.emitEvent(event)
+		}
+	}
 }
 
-func (s *initStream) History() (driver.History, error) { return s.inner.History() }
+func (s *initStream) finishDone() {
+	if s == nil {
+		return
+	}
+	s.doneOnce.Do(func() { close(s.done) })
+}
+
+func (s *initStream) History() (driver.History, error) {
+	if s == nil || s.inner == nil {
+		return driver.History{Available: false}, nil
+	}
+	return s.inner.History()
+}
 
 func (s *initStream) Close() error {
 	if s == nil {
 		return nil
 	}
 	s.closeOnce.Do(func() {
-		s.cancel()
-		s.closeErr = s.inner.Close()
-		<-s.done
+		if s.cancel != nil {
+			s.cancel()
+		}
+		if s.inner != nil {
+			s.closeErr = s.inner.Close()
+		}
+		// Close-before-selection must still make the wrapper's lifecycle
+		// observable and must not start a forwarding goroutine.
+		s.projection.close()
+		s.finishDone()
 	})
 	return s.closeErr
 }

@@ -34,11 +34,6 @@ type orderedUpdateBarrier interface {
 	WaitForUpdatesThrough(context.Context, uint64) error
 }
 
-// promptSession is the pre-barrier ACP client shape. The checked-out ACP
-// client does not expose WaitForUpdates yet, so Spawn wraps this legacy shape
-// with the compatibility stub below. Once the client-side ordered barrier
-// lands, *client.Session will satisfy turnSession directly and the wrapper is
-// bypassed.
 type promptSession interface {
 	session
 	Prompt(context.Context, []protocol.ContentBlock) (*client.PromptResult, error)
@@ -46,14 +41,8 @@ type promptSession interface {
 	Cancel(context.Context) error
 }
 
-type legacyTurnSession struct {
-	promptSession
-}
+type legacyTurnSession struct{ promptSession }
 
-// WaitForUpdates is an explicit compatibility seam for ACP clients built
-// before the ordered-delivery API. It intentionally has no behavior; the
-// client implementation that provides the barrier satisfies turnSession
-// directly and never uses this fallback.
 func (legacyTurnSession) WaitForUpdates(context.Context) error { return nil }
 
 type promptOutcome struct {
@@ -61,10 +50,9 @@ type promptOutcome struct {
 	err    error
 }
 
-// turnLifecycle closes the small race between a prompt completing and its
-// caller context being cancelled. A watcher that wins the race reserves the
-// cancellation before calling the ACP session; a completed turn prevents a
-// late session/cancel from reaching the next turn.
+// turnLifecycle closes the race between a prompt completing and its caller
+// context being cancelled. It remains a small compatibility seam for the
+// interrupt tests and is also used by the arbiter's cancellation watcher.
 type turnLifecycle struct {
 	mu         sync.Mutex
 	finished   bool
@@ -87,30 +75,6 @@ func (l *turnLifecycle) finish() {
 	l.mu.Unlock()
 }
 
-// stream is one prompt view over Driver's persistent ACP session. Its close
-// function only cancels forwarding for this turn; the session and its owned
-// process remain with Driver.
-type stream struct {
-	events       chan driver.Event
-	observations chan driver.Observation
-	done         <-chan struct{}
-	ctx          context.Context
-	cancel       context.CancelFunc
-	steerIn      chan steerInput
-
-	mu                 sync.Mutex
-	closed             bool
-	selected           streamView
-	closedEvents       bool
-	closedObservations bool
-	nextOrder          uint64
-	steers             map[*steerCall]struct{}
-	terminal           bool
-
-	once     sync.Once
-	closeErr error
-}
-
 type streamView uint8
 
 const (
@@ -119,42 +83,158 @@ const (
 	viewObservations
 )
 
-type steerInput struct {
-	observation driver.SteerObservation
-	admitted    chan struct{}
+// turnHandle is deliberately narrower than stream. A handle outlives the
+// driver's active pointer during a close race, so its command channel is never
+// closed and every send is guarded by done.
+type turnHandle struct {
+	commands chan steerCommand
+	done     <-chan struct{}
 }
 
-type steerCall struct {
-	mu             sync.Mutex
-	admitted       chan struct{}
-	finalized      bool
-	writeAdmitted  bool
-	admissionKnown bool
-	handle         *client.SteerHandle
+func (h *turnHandle) send(ctx context.Context, command steerCommand) bool {
+	if h == nil {
+		return false
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	accepted := make(chan struct{})
+	command.accepted = accepted
+	select {
+	case <-h.done:
+		return false
+	default:
+	}
+	if ctx.Err() != nil {
+		select {
+		case <-h.done:
+			return false
+		case h.commands <- command:
+		default:
+			return false
+		}
+	} else {
+		select {
+		case h.commands <- command:
+		case <-h.done:
+			return false
+		case <-ctx.Done():
+			return false
+		}
+	}
+	// Once the command entered the mailbox, caller cancellation only stops
+	// waiting for its reply. The arbiter must either acknowledge ownership or
+	// retire the handle; this prevents a stale buffered command from stranding
+	// a background Steer caller after terminal publication.
+	select {
+	case <-accepted:
+		return true
+	case <-h.done:
+		return false
+	case <-ctx.Done():
+		// The command is already in the arbiter mailbox. Return control to the
+		// caller's deadline while leaving the arbiter responsible for the
+		// eventual exactly-once observation.
+		return true
+	}
 }
 
-func (c *steerCall) setAdmission(known, admitted bool) {
-	c.mu.Lock()
-	c.admissionKnown, c.writeAdmitted = known, admitted
-	c.mu.Unlock()
-}
-func (c *steerCall) setHandle(h *client.SteerHandle) { c.mu.Lock(); c.handle = h; c.mu.Unlock() }
-func (c *steerCall) getHandle() *client.SteerHandle {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.handle
-}
-func (c *steerCall) admission() (bool, bool) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.admissionKnown, c.writeAdmitted
+type steerCommand struct {
+	ctx      context.Context
+	request  driver.SteerRequest
+	reply    chan steerReply
+	accepted chan struct{}
 }
 
-// Spawn starts one prompt on the session created by New. The prompt itself is
-// deliberately run under the driver's context. The caller's context controls
-// this stream's forwarding lifetime, and the driver's context cancels it when
-// Driver.Close is called; protocol cancellation is handled by the interrupt
-// watcher in the turn phase.
+type steerReply struct {
+	result driver.SteerResult
+	err    error
+}
+
+// stream is one prompt view over Driver's persistent ACP session. The
+// projection owner is the only goroutine that touches the two public channels;
+// this object only carries lifecycle and history operations.
+type stream struct {
+	projection *projection
+	handle     *turnHandle
+	ordered    bool
+
+	ctx    context.Context
+	cancel context.CancelFunc
+	done   chan struct{}
+
+	once     sync.Once
+	closeErr error
+}
+
+func (s *stream) Events() <-chan driver.Event {
+	if s == nil || s.projection == nil {
+		return nil
+	}
+	return s.projection.eventsView()
+}
+
+func (s *stream) Observations() <-chan driver.Observation {
+	if s == nil || s.projection == nil {
+		return nil
+	}
+	return s.projection.observationsView()
+}
+
+func (s *stream) orderedProjection() bool {
+	return s != nil && s.ordered
+}
+
+func (s *stream) History() (driver.History, error) {
+	return driver.History{Available: false}, nil
+}
+
+func (s *stream) Close() error {
+	if s == nil {
+		return nil
+	}
+	s.once.Do(func() {
+		if s.cancel != nil {
+			s.cancel()
+		}
+	})
+	return s.closeErr
+}
+
+// orderedStream keeps the existing concrete shape used by callers that
+// discover driver.OrderedStream, while leaving channel ownership to stream's
+// projection owner.
+type orderedStream struct{ stream *stream }
+
+func (s *orderedStream) Events() <-chan driver.Event {
+	if s == nil {
+		return nil
+	}
+	return s.stream.Events()
+}
+func (s *orderedStream) Observations() <-chan driver.Observation {
+	if s == nil {
+		return nil
+	}
+	return s.stream.Observations()
+}
+func (s *orderedStream) orderedProjection() bool { return true }
+func (s *orderedStream) History() (driver.History, error) {
+	if s == nil {
+		return driver.History{Available: false}, nil
+	}
+	return s.stream.History()
+}
+func (s *orderedStream) Close() error {
+	if s == nil {
+		return nil
+	}
+	return s.stream.Close()
+}
+
+// Spawn starts one prompt on the session created by New. The caller context
+// owns stream forwarding and cancellation; the driver's context owns the
+// protocol operation and is canceled only when the driver closes.
 func (d *Driver) Spawn(ctx context.Context, turn driver.Turn) (driver.Stream, error) {
 	if d == nil || d.session == nil {
 		return nil, &driver.SpawnError{Cause: errors.New("acp: session unavailable")}
@@ -173,108 +253,53 @@ func (d *Driver) Spawn(ctx context.Context, turn driver.Turn) (driver.Stream, er
 	if ctx == nil {
 		ctx = context.Background()
 	}
+
 	d.turnMu.Lock()
 	if d.closed {
 		d.turnMu.Unlock()
 		return nil, &driver.SpawnError{Cause: errors.New("acp: driver is closed")}
 	}
-
 	driverCtx := d.driverCtx
 	if driverCtx == nil {
 		driverCtx = context.Background()
 	}
 	turnCtx, cancel := context.WithCancel(ctx)
-	events := make(chan driver.Event, 2048)
-	done := make(chan struct{})
+	projectionOwner := newProjection()
+	projectionOwner.stopOn(driverCtx)
+	handleDone := make(chan struct{})
+	// The mailbox is never closed. Each accepted command is acknowledged by
+	// the arbiter, while done retires buffered stale sends at terminal close.
+	handle := &turnHandle{commands: make(chan steerCommand, 512), done: handleDone}
 	s := &stream{
-		events:       events,
-		observations: make(chan driver.Observation, 2048),
-		done:         done,
-		ctx:          turnCtx,
-		cancel:       cancel,
-		steerIn:      make(chan steerInput, 512),
-		steers:       make(map[*steerCall]struct{}),
+		projection: projectionOwner,
+		handle:     handle,
+		ordered:    d.steeringEnabled(),
+		ctx:        turnCtx,
+		cancel:     cancel,
+		done:       make(chan struct{}),
 	}
-	if d.steeringOn {
-		s.selected = viewObservations
-		close(s.events)
-		s.closedEvents = true
+	if s.ordered {
+		projectionOwner.selectView(viewObservations)
 	} else {
-		s.selected = viewEvents
-		close(s.observations)
-		s.closedObservations = true
+		projectionOwner.selectView(viewEvents)
 	}
 	d.activeMu.Lock()
-	d.active = s
+	d.active = handle
 	d.activeMu.Unlock()
-	go d.runTurn(turnCtx, cancel, driverCtx, sess, turn, s, events, done)
-	if d.steeringOn {
+	go d.runTurn(turnCtx, cancel, driverCtx, sess, turn, s, handleDone)
+	if s.ordered {
 		return &orderedStream{stream: s}, nil
 	}
 	return s, nil
 }
 
-type orderedStream struct{ stream *stream }
-
-func (s *orderedStream) Events() <-chan driver.Event             { return nil }
-func (s *orderedStream) Observations() <-chan driver.Observation { return s.stream.Observations() }
-func (s *orderedStream) History() (driver.History, error)        { return s.stream.History() }
-func (s *orderedStream) Close() error                            { return s.stream.Close() }
-
-func (s *stream) registerSteer() (*steerCall, bool) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.closed || s.terminal {
-		return nil, false
-	}
-	call := &steerCall{admitted: make(chan struct{})}
-	s.steers[call] = struct{}{}
-	return call, true
-}
-
-func (s *stream) completeSteer(call *steerCall) bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if _, ok := s.steers[call]; !ok {
+func (d *Driver) steeringEnabled() bool {
+	if d == nil {
 		return false
 	}
-	if s.terminal {
-		return false
-	}
-	delete(s.steers, call)
-	return !call.finalized
-}
-
-func (s *stream) terminalSteer() bool { s.mu.Lock(); defer s.mu.Unlock(); return s.terminal }
-
-func (s *stream) holdTerminalSteers() []*steerCall {
-	s.mu.Lock()
-	s.terminal = true
-	calls := make([]*steerCall, 0, len(s.steers))
-	for call := range s.steers {
-		calls = append(calls, call)
-	}
-	s.mu.Unlock()
-	return calls
-}
-
-func (s *stream) cancelPendingSteers(calls []*steerCall) {
-	for _, call := range calls {
-		if call.handle != nil {
-			call.handle.Cancel()
-		}
-	}
-}
-
-func (s *stream) finalizeSteer(call *steerCall) bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if _, ok := s.steers[call]; !ok {
-		return false
-	}
-	call.finalized = true
-	delete(s.steers, call)
-	return true
+	d.steeringMu.Lock()
+	defer d.steeringMu.Unlock()
+	return d.steeringOn && !d.steeringOff
 }
 
 func (d *Driver) runTurn(
@@ -284,224 +309,708 @@ func (d *Driver) runTurn(
 	sess turnSession,
 	turn driver.Turn,
 	streamState *stream,
-	events chan<- driver.Event,
-	done chan<- struct{},
+	handleDone chan struct{},
 ) {
-	pendingUpdates := d.takePendingUpdates()
+	defer close(streamState.done)
+	lifecycle := &turnLifecycle{}
 	turnDone := make(chan struct{})
 	watcherDone := make(chan struct{})
-	lifecycle := &turnLifecycle{}
 	go watchTurnCancellation(turnCtx, driverCtx, turnCancel, sess, turnDone, watcherDone, lifecycle)
-	defer func() {
-		lifecycle.finish()
-		close(turnDone)
-		<-watcherDone
-		turnCancel()
-		streamState.mu.Lock()
-		streamState.closed = true
-		streamState.mu.Unlock()
-		d.returnPendingUpdates(pendingUpdates)
-		for {
-			select {
-			case pending := <-streamState.steerIn:
-				close(pending.admitted)
-			default:
-				goto pendingSteersDrained
-			}
-		}
-	pendingSteersDrained:
-		d.activeMu.Lock()
-		if d.active == streamState {
-			d.active = nil
-		}
-		d.activeMu.Unlock()
-		close(done)
-		streamState.mu.Lock()
-		if !streamState.closedEvents {
-			close(streamState.events)
-			streamState.closedEvents = true
-		}
-		if !streamState.closedObservations {
-			close(streamState.observations)
-			streamState.closedObservations = true
-		}
-		streamState.mu.Unlock()
-		d.turnMu.Unlock()
-	}()
 
+	barrier := newBarrierWorker(driverCtx, sess)
+	dispatcher := newSteerDispatcher(driverCtx, d.session)
+	updates := sess.Updates()
 	promptDone := make(chan promptOutcome, 1)
+	promptReturned := make(chan struct{})
 	go func() {
+		defer close(promptReturned)
 		result, err := sess.Prompt(driverCtx, promptBlocks(turn))
 		promptDone <- promptOutcome{result: result, err: err}
 	}()
 
-	state := &translationState{}
-	updates := sess.Updates()
+	a := &turnArbiter{
+		driver:     d,
+		turnCtx:    turnCtx,
+		driverCtx:  driverCtx,
+		session:    sess,
+		stream:     streamState,
+		projection: streamState.projection,
+		handle:     streamState.handle,
+		updates:    updates,
+		promptDone: promptDone,
+		barrier:    barrier,
+		dispatcher: dispatcher,
+		commands:   streamState.handle.commands,
+		state:      &translationState{},
+		pending:    make([]arbObservation, 0, 32),
+		steers:     make(map[uint64]steerCommand),
+	}
+	a.run()
+	if driverCtx.Err() != nil {
+		// Driver.Close must cancel the protocol operation before closing its
+		// owned client. The arbiter may have exited on cancellation while the
+		// provider is still unwinding Prompt, so retain that lifecycle fence.
+		<-promptReturned
+	}
+	// No command can be admitted after the arbiter returns. Retire the handle
+	// before cleanup so callers racing terminal publication cannot strand on a
+	// mailbox with no consumer.
+	close(handleDone)
+
+	// The arbiter has stopped accepting commands. Close the handle's done
+	// signal before clearing Driver.active, so any stale caller is guaranteed to
+	// select the done case rather than enqueueing into a retired turn.
+	lifecycle.finish()
+	close(turnDone)
+	<-watcherDone
+	turnCancel()
+	barrier.stop()
+	dispatcher.stop()
+	streamState.projection.close()
+	d.activeMu.Lock()
+	if d.active == streamState.handle {
+		d.active = nil
+	}
+	d.activeMu.Unlock()
+	d.turnMu.Unlock()
+}
+
+type barrierRequest struct {
+	sequence uint64
+}
+
+type barrierResult struct {
+	sequence uint64
+	err      error
+}
+
+type barrierWorker struct {
+	ctx      context.Context
+	cancel   context.CancelFunc
+	session  turnSession
+	requests chan barrierRequest
+	results  chan barrierResult
+	done     chan struct{}
+	stopOnce sync.Once
+}
+
+func newBarrierWorker(ctx context.Context, sess turnSession) *barrierWorker {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	workerCtx, cancel := context.WithCancel(ctx)
+	b := &barrierWorker{
+		ctx:      workerCtx,
+		cancel:   cancel,
+		session:  sess,
+		requests: make(chan barrierRequest, 32),
+		results:  make(chan barrierResult, 32),
+		done:     make(chan struct{}),
+	}
+	go b.run()
+	return b
+}
+
+func (b *barrierWorker) run() {
+	defer close(b.results)
+	defer close(b.done)
 	for {
-		if len(pendingUpdates) > 0 {
-			update := pendingUpdates[0]
-			pendingUpdates = pendingUpdates[1:]
-			emitTranslatedUpdate(turnCtx, streamState, update, state, events)
+		select {
+		case request := <-b.requests:
+			err := waitForUpdatesThrough(b.ctx, b.session, request.sequence)
+			select {
+			case b.results <- barrierResult{sequence: request.sequence, err: err}:
+			case <-b.ctx.Done():
+				return
+			}
+		case <-b.ctx.Done():
+			return
+		}
+	}
+}
+
+func (b *barrierWorker) request(sequence uint64) bool {
+	if b == nil {
+		return false
+	}
+	select {
+	case b.requests <- barrierRequest{sequence: sequence}:
+		return true
+	case <-b.done:
+		return false
+	case <-b.ctx.Done():
+		return false
+	}
+}
+
+func (b *barrierWorker) stop() {
+	if b == nil {
+		return
+	}
+	b.stopOnce.Do(func() { b.cancel() })
+	select {
+	case <-b.done:
+	case <-time.After(steerTerminalGrace):
+	}
+}
+
+type arbObservation struct {
+	observation driver.Observation
+	events      []driver.Event
+	sequence    uint64
+	local       bool
+	reply       chan steerReply
+	result      steerReply
+}
+
+type turnArbiter struct {
+	driver     *Driver
+	turnCtx    context.Context
+	driverCtx  context.Context
+	session    turnSession
+	stream     *stream
+	projection *projection
+	handle     *turnHandle
+	commands   <-chan steerCommand
+	updates    <-chan client.Update
+	promptDone <-chan promptOutcome
+
+	barrier    *barrierWorker
+	dispatcher *steerDispatcher
+	state      *translationState
+	pending    []arbObservation
+	steers     map[uint64]steerCommand
+	nextSteer  uint64
+
+	prompt                 *promptOutcome
+	promptQueued           bool
+	terminalAsked          bool
+	terminalReady          bool
+	updatesDrained         bool
+	promptBarrierRequested bool
+
+	barrierBusy      bool
+	barrierCompleted uint64
+	barrierFence     bool
+	lastRaw          uint64
+	lastOrder        uint64
+	failed           bool
+}
+
+func (a *turnArbiter) run() {
+	for {
+		select {
+		case <-a.driverCtx.Done():
+			// Check before draining any producer so a shutdown cannot be
+			// starved by a continuously ready update or command source.
+			return
+		default:
+		}
+		if a.failed {
+			return
+		}
+		a.drainQueuedCommands()
+		if a.prompt != nil && !a.terminalAsked {
+			a.beginTerminal()
+		}
+		if a.prompt != nil && a.terminalAsked && !a.promptBarrierRequested {
+			a.maybeRequestPromptBarrier()
+		}
+		if a.prompt != nil && a.terminalAsked && a.promptBarrierRequested && !a.barrierBusy && !a.updatesDrained {
+			a.updatesDrained = !a.drainTerminalUpdates()
+			if !a.updatesDrained {
+				continue
+			}
+		}
+		if a.prompt != nil && a.terminalAsked && a.updatesDrained && !a.promptQueued {
+			a.pending = append(a.pending, a.promptObservation(*a.prompt))
+			a.promptQueued = true
+		}
+		if a.tryEmit() {
 			continue
 		}
+		if a.prompt != nil && a.terminalAsked && a.terminalReady && a.updatesDrained && len(a.steers) == 0 && len(a.pending) == 0 && !a.barrierBusy {
+			a.emitPromptTerminal(*a.prompt)
+			return
+		}
+		var dispatcherEvents <-chan dispatcherEvent
+		if a.dispatcher != nil {
+			dispatcherEvents = a.dispatcher.Events()
+		}
+		var barrierResults <-chan barrierResult
+		if a.barrier != nil {
+			barrierResults = a.barrier.results
+		}
+
 		select {
-		case update, ok := <-updates:
+		case update, ok := <-a.updates:
 			if !ok {
-				updates = nil
+				a.updates = nil
 				continue
 			}
-			emitTranslatedUpdate(turnCtx, streamState, update, state, events)
-		case steer, ok := <-streamState.steerIn:
+			a.acceptUpdate(update)
+		case command, ok := <-a.commands:
 			if !ok {
+				// The command mailbox is intentionally never closed. A nil read is
+				// treated as a stale source and does not close any public channel.
 				continue
 			}
-			processSteerInput(driverCtx, turnCtx, sess, updates, &pendingUpdates, state, events, streamState, steer)
-		case outcome := <-promptDone:
-			// The prompt response can become visible before the ordered
-			// notification handler has delivered the final session/update.
-			// Wait for the client barrier in a separate goroutine while this
-			// goroutine keeps consuming Updates; the client may need that
-			// consumer to make the barrier progress.
-			barrierDone := make(chan error, 1)
-			go func() {
-				barrierDone <- waitForPromptUpdates(driverCtx, sess, promptSequence(outcome))
-			}()
-			for {
-				if len(pendingUpdates) > 0 {
-					update := pendingUpdates[0]
-					pendingUpdates = pendingUpdates[1:]
-					emitTranslatedUpdate(turnCtx, streamState, update, state, events)
-					continue
-				}
+			a.acknowledgeCommand(command)
+			a.acceptSteer(command)
+		case outcome := <-a.promptDone:
+			a.promptDone = nil
+			a.prompt = &outcome
+		case event, ok := <-dispatcherEvents:
+			if !ok {
+				a.dispatcher = nil
+				continue
+			}
+			a.acceptDispatcherEvent(event)
+		case result, ok := <-barrierResults:
+			if !ok {
+				// Driver cancellation can stop the serialized worker before it
+				// publishes its final result. Retire the in-flight marker with the
+				// worker; otherwise terminal publication waits forever on a worker
+				// that has already exited.
+				a.barrierBusy = false
+				a.barrier = nil
+				continue
+			}
+			a.barrierBusy = false
+			a.barrierCompleted = maxUint64(a.barrierCompleted, result.sequence)
+			if result.sequence == 0 {
+				a.barrierFence = true
+			}
+			if result.err != nil && a.driverCtx.Err() == nil {
+				slog.Warn("acp: update delivery barrier failed")
+			}
+			if a.prompt != nil && a.terminalAsked {
+				a.updatesDrained = !a.drainTerminalUpdates()
+			}
+		case <-a.driverCtx.Done():
+			// Driver shutdown owns the protocol lifetime. Abandon any pending
+			// terminal projection and retire the arbiter so Close cannot wait on
+			// an output consumer that has already been aborted.
+			return
+		}
+	}
+}
+
+func (a *turnArbiter) drainQueuedCommands() {
+	for {
+		select {
+		case command := <-a.commands:
+			a.acknowledgeCommand(command)
+			a.acceptSteer(command)
+		default:
+			return
+		}
+	}
+}
+
+func (a *turnArbiter) acknowledgeCommand(command steerCommand) {
+	if command.accepted != nil {
+		close(command.accepted)
+	}
+}
+
+func (a *turnArbiter) acceptUpdate(update client.Update) {
+	if update.Meta.IsReplay {
+		slog.Debug("acp: ignored replay session update")
+		return
+	}
+	events := translateUpdate(update.SessionUpdate, a.state)
+	for _, event := range events {
+		a.pending = append(a.pending, arbObservation{
+			observation: driver.UpdateObservation{Event: event, ReceiveSequence: update.ReceiveSequence},
+			events:      []driver.Event{event},
+			sequence:    update.ReceiveSequence,
+			local:       update.ReceiveSequence == 0,
+		})
+	}
+}
+
+func (a *turnArbiter) acceptSteer(command steerCommand) {
+	if command.reply == nil {
+		return
+	}
+	if err := command.request.Validate(); err != nil {
+		a.queueLocalSteer(command, driver.SteerResult{Outcome: driver.SteerOutcomeUnsupported}, err)
+		return
+	}
+	if !a.driver.steeringEnabled() {
+		a.queueLocalSteer(command, driver.SteerResult{Outcome: driver.SteerOutcomeUnsupported}, nil)
+		return
+	}
+	prompt, err := steerPromptBlocks(command.request)
+	if err != nil {
+		a.queueLocalSteer(command, driver.SteerResult{Outcome: driver.SteerOutcomeUnsupported}, err)
+		return
+	}
+	a.nextSteer++
+	id := a.nextSteer
+	a.steers[id] = command
+	params := client.SteerParams{
+		SessionID: a.session.ID(),
+		Prompt:    prompt,
+		Meta:      jsonRaw(steeringIdleMeta),
+	}
+	if !a.dispatcher.submit(steerJob{id: id, ctx: command.ctx, params: params}) {
+		delete(a.steers, id)
+		a.queueLocalSteer(command, driver.SteerResult{Outcome: driver.SteerOutcomeDeliveryUnknown, WriteAdmitted: true}, errors.New("acp: steering dispatcher unavailable"))
+	}
+}
+
+func (a *turnArbiter) queueLocalSteer(command steerCommand, result driver.SteerResult, err error) {
+	a.pending = append(a.pending, arbObservation{
+		observation: driver.SteerObservation{SteerResult: result, Err: err},
+		sequence:    result.ReceiveSequence,
+		local:       result.ReceiveSequence == 0,
+		reply:       command.reply,
+		result:      steerReply{result: result, err: err},
+	})
+}
+
+func (a *turnArbiter) acceptDispatcherEvent(event dispatcherEvent) {
+	if event.terminalComplete {
+		a.terminalReady = true
+		return
+	}
+	command, ok := a.steers[event.id]
+	if !ok {
+		if event.late || event.err != nil || event.result.WriteAdmitted {
+			a.disableSteering()
+		}
+		return
+	}
+	if event.late {
+		delete(a.steers, event.id)
+		a.disableSteering()
+		result := driver.SteerResult{
+			Outcome:       driver.SteerOutcomeDeliveryUnknown,
+			WriteAdmitted: event.writeAdmitted || event.result.WriteAdmitted,
+		}
+		if !result.WriteAdmitted {
+			result.WriteAdmitted = true
+		}
+		err := event.err
+		if err == nil {
+			err = errors.New("acp: steering result arrived after caller deadline")
+		}
+		a.pending = append(a.pending, arbObservation{
+			observation: driver.SteerObservation{SteerResult: result, Err: err},
+			sequence:    0,
+			local:       true,
+			reply:       command.reply,
+			result:      steerReply{result: result, err: err},
+		})
+		return
+	}
+	delete(a.steers, event.id)
+	if a.terminalAsked && len(a.steers) == 0 {
+		a.maybeRequestPromptBarrier()
+	}
+	normalized, err := normalizeSteering(event.result, event.err)
+	if normalized.Outcome == driver.SteerOutcomeDeliveryUnknown || normalized.Outcome == driver.SteerOutcomeDeliveredUntrackable || steeringErrorGuaranteesNoDelivery(event.err) {
+		a.disableSteering()
+	}
+	a.pending = append(a.pending, arbObservation{
+		observation: driver.SteerObservation{SteerResult: normalized, Err: err},
+		sequence:    normalized.ReceiveSequence,
+		local:       normalized.ReceiveSequence == 0,
+		reply:       command.reply,
+		result:      steerReply{result: normalized, err: err},
+	})
+}
+
+func (a *turnArbiter) disableSteering() {
+	a.driver.steeringMu.Lock()
+	a.driver.steeringOff = true
+	a.driver.steeringMu.Unlock()
+}
+
+func (a *turnArbiter) beginTerminal() {
+	a.terminalAsked = true
+	a.updatesDrained = false
+	// Commands already in the turn mailbox belong before the terminal. The
+	// arbiter drains them before sending the FIFO terminal marker to the
+	// dispatcher, preventing a queued call from disappearing during a prompt
+	// completion race.
+	a.drainQueuedCommands()
+	if a.prompt == nil {
+		return
+	}
+	if !a.dispatcher.resolveTerminal() {
+		a.terminalReady = true
+	}
+}
+
+func (a *turnArbiter) maybeRequestPromptBarrier() {
+	if a.prompt == nil || !a.terminalAsked || !a.terminalReady || a.promptBarrierRequested || len(a.steers) != 0 || hasPendingSteer(a.pending) {
+		return
+	}
+	a.promptBarrierRequested = true
+	a.requestBarrier(promptSequence(*a.prompt))
+}
+
+func hasPendingSteer(pending []arbObservation) bool {
+	for _, candidate := range pending {
+		if _, ok := candidate.observation.(driver.SteerObservation); ok {
+			return true
+		}
+	}
+	return false
+}
+
+// drainTerminalUpdates takes the updates that were delivered before the
+// prompt barrier. The session update channel is shared by turns, so this is a
+// non-blocking drain: it never waits for a future turn's notification.
+func (a *turnArbiter) drainTerminalUpdates() bool {
+	drained := false
+	for a.updates != nil {
+		select {
+		case update, ok := <-a.updates:
+			if !ok {
+				a.updates = nil
+				return drained
+			}
+			a.acceptUpdate(update)
+			drained = true
+		default:
+			return drained
+		}
+	}
+	return drained
+}
+
+func (a *turnArbiter) promptObservation(outcome promptOutcome) arbObservation {
+	if outcome.result == nil {
+		return arbObservation{
+			observation: driver.PromptObservation{Err: outcome.err},
+			sequence:    0,
+			local:       true,
+		}
+	}
+	return arbObservation{
+		observation: driver.PromptObservation{
+			StopReason:       string(outcome.result.StopReason),
+			WriteAdmitted:    outcome.result.WriteAdmitted,
+			ReceiveSequence:  outcome.result.ReceiveSequence,
+			ResponseSequence: outcome.result.ResponseSequence,
+			Err:              outcome.err,
+		},
+		sequence: outcome.result.ReceiveSequence,
+		local:    outcome.result.ReceiveSequence == 0,
+	}
+}
+
+func (a *turnArbiter) requestBarrier(sequence uint64) {
+	if a.barrier == nil {
+		a.barrierFence = true
+		return
+	}
+	if sequence != 0 && sequence <= a.barrierCompleted {
+		return
+	}
+	if sequence == 0 && a.barrierFence {
+		return
+	}
+	if a.barrierBusy {
+		return
+	}
+	a.barrierBusy = a.barrier.request(sequence)
+}
+
+func (a *turnArbiter) tryEmit() bool {
+	if len(a.pending) == 0 {
+		return false
+	}
+	index := a.nextObservationIndex()
+	if index < 0 {
+		return false
+	}
+	candidate := a.pending[index]
+	if candidate.sequence != 0 {
+		if candidate.sequence < a.lastRaw {
+			a.failSequenceRegression()
+			return true
+		}
+		_, isUpdate := candidate.observation.(driver.UpdateObservation)
+		if !isUpdate && candidate.sequence > a.barrierCompleted {
+			a.requestBarrier(candidate.sequence)
+			return false
+		}
+		// A positive update observed while a steer is unresolved may have a
+		// greater sequence than the steer response. Hold it until the FIFO
+		// dispatcher reports the call, allowing scheduler inversion without
+		// relabeling the raw sequence.
+		if _, update := candidate.observation.(driver.UpdateObservation); update && len(a.steers) > 0 {
+			return false
+		}
+	} else {
+		if hasPositivePending(a.pending) || len(a.steers) > 0 {
+			return false
+		}
+		if a.prompt != nil && !a.barrierFence {
+			a.requestBarrier(0)
+			return false
+		}
+		a.lastOrder = maxUint64(a.lastOrder, a.lastRaw) + 1
+		candidate = a.withLocalOrder(candidate)
+	}
+	a.pending = append(a.pending[:index], a.pending[index+1:]...)
+	if candidate.sequence != 0 {
+		a.lastRaw = candidate.sequence
+		a.lastOrder = maxUint64(a.lastOrder, candidate.sequence)
+	}
+	a.emitObservation(candidate)
+	return true
+}
+
+func (a *turnArbiter) withLocalOrder(candidate arbObservation) arbObservation {
+	order := a.lastOrder
+	switch typed := candidate.observation.(type) {
+	case driver.PromptObservation:
+		typed.OrderSequence = order
+		candidate.observation = typed
+	case driver.UpdateObservation:
+		typed.OrderSequence = order
+		candidate.observation = typed
+	case driver.SteerObservation:
+		typed.OrderSequence = order
+		typed.SteerResult.OrderSequence = order
+		candidate.observation = typed
+		candidate.result.result.OrderSequence = order
+	}
+	return candidate
+}
+
+func (a *turnArbiter) nextObservationIndex() int {
+	best := -1
+	bestSequence := uint64(0)
+	for i, candidate := range a.pending {
+		if candidate.sequence == 0 {
+			if best < 0 {
+				best = i
+			}
+			continue
+		}
+		if best < 0 || bestSequence == 0 || candidate.sequence < bestSequence {
+			best = i
+			bestSequence = candidate.sequence
+		}
+	}
+	return best
+}
+
+func hasPositivePending(pending []arbObservation) bool {
+	for _, candidate := range pending {
+		if candidate.sequence != 0 {
+			return true
+		}
+	}
+	return false
+}
+
+func (a *turnArbiter) emitObservation(candidate arbObservation) {
+	observation, events := candidate.observation, candidate.events
+	if observation == nil {
+		return
+	}
+	var ready <-chan struct{}
+	if typed, ok := observation.(driver.UpdateObservation); ok {
+		a.projection.emitObservation(typed)
+		for _, event := range events {
+			a.projection.emitEvent(event)
+		}
+		return
+	}
+	if typed, ok := observation.(driver.SteerObservation); ok {
+		ready = a.projection.emitObservation(typed)
+		// Steer acknowledgements intentionally have no legacy event projection.
+	} else if typed, ok := observation.(driver.PromptObservation); ok {
+		a.projection.emitObservation(typed)
+		a.emitPromptEvents(typed)
+	}
+	if candidate.reply != nil {
+		if ready != nil {
+			timer := time.NewTimer(steerTerminalGrace)
+			select {
+			case <-ready:
+			case <-timer.C:
+			}
+			if !timer.Stop() {
 				select {
-				case update, ok := <-updates:
-					if !ok {
-						updates = nil
-						continue
-					}
-					emitTranslatedUpdate(turnCtx, streamState, update, state, events)
-				case steer, ok := <-streamState.steerIn:
-					if !ok {
-						continue
-					}
-					processSteerInput(driverCtx, turnCtx, sess, updates, &pendingUpdates, state, events, streamState, steer)
-				case err := <-barrierDone:
-					if err != nil && driverCtx.Err() == nil {
-						// Keep the diagnostic fixed-category: ACP errors may
-						// contain protocol payloads or credentials.
-						slog.Warn("acp: update delivery barrier failed")
-					}
-					// The barrier covers ordered handler delivery. Drain steering
-					// requests already admitted to this stream, but never wait for
-					// an ACP call still running in another goroutine: that call is
-					// bounded solely by its request context.
-					var deferredSteers []steerInput
-					for {
-						select {
-						case steer, ok := <-streamState.steerIn:
-							if !ok {
-								continue
-							}
-							if promptSeq := promptSequence(outcome); promptSeq != 0 && steer.observation.Sequence() > promptSeq {
-								deferredSteers = append(deferredSteers, steer)
-								continue
-							}
-							processSteerInput(driverCtx, turnCtx, sess, updates, &pendingUpdates, state, events, streamState, steer)
-						default:
-							goto pendingSteerInputsDrained
-						}
-					}
-				pendingSteerInputsDrained:
-					pendingCalls := streamState.holdTerminalSteers()
-					if len(pendingCalls) > 0 {
-						timer := time.NewTimer(100 * time.Millisecond)
-						<-timer.C
-						for _, call := range pendingCalls {
-							callOutcome := driver.SteerOutcomeDeliveryUnknown
-							known, admitted := call.admission()
-							if known && !admitted {
-								callOutcome = driver.SteerOutcomeFallbackRequired
-							}
-							if handle := call.getHandle(); handle != nil {
-								handle.Cancel()
-							}
-							if streamState.finalizeSteer(call) {
-								emitObservation(streamState, driver.SteerObservation{SteerResult: driver.SteerResult{Outcome: callOutcome, WriteAdmitted: admitted}, Err: errors.New("acp: steer response unavailable")})
-								close(call.admitted)
-							}
-						}
-					}
-					drainTurnUpdatesThrough(turnCtx, updates, &pendingUpdates, state, events, streamState, promptSequence(outcome))
-					emitPromptObservation(streamState, outcome)
-					for _, steer := range deferredSteers {
-						emitObservation(streamState, steer.observation)
-						close(steer.admitted)
-					}
-					sendPromptTerminal(turnCtx, streamState, events, state, outcome)
-					return
+				case <-timer.C:
+				default:
 				}
 			}
 		}
+		// The channel is one-shot and buffered. A caller may have hit its own
+		// deadline, but the arbiter still records exactly one result paired with
+		// the emitted observation.
+		candidate.reply <- candidate.result
 	}
 }
 
-func processSteerInput(
-	driverCtx, turnCtx context.Context,
-	sess turnSession,
-	updates <-chan client.Update,
-	pending *[]client.Update,
-	state *translationState,
-	events chan<- driver.Event,
-	streamState *stream,
-	steer steerInput,
-) {
-	if sequence := steer.observation.Sequence(); sequence != 0 {
-		if err := waitForSteeringUpdates(driverCtx, sess, sequence); err != nil && driverCtx.Err() == nil {
-			slog.Warn("acp: steering update barrier failed")
+func (a *turnArbiter) emitPromptEvents(observation driver.PromptObservation) {
+	if observation.Err != nil || observation.StopReason == "" {
+		a.projection.emitEvent(promptFailureEvent(observation.Err))
+		return
+	}
+	if message := a.state.message(); message != nil {
+		a.projection.emitEvent(driver.Event{Kind: driver.KindStepComplete, Message: message})
+	}
+	a.projection.emitEvent(terminalEvent(protocol.StopReason(observation.StopReason)))
+}
+
+func (a *turnArbiter) emitPromptTerminal(_ promptOutcome) {
+	// The prompt observation itself is emitted by tryEmit, where its transport
+	// sequence participates in the same ordering fence as updates and steers.
+}
+
+func (a *turnArbiter) failSequenceRegression() {
+	if a.failed {
+		return
+	}
+	a.failed = true
+	a.disableSteering()
+	failure := steerReply{
+		result: driver.SteerResult{Outcome: driver.SteerOutcomeDeliveryUnknown, WriteAdmitted: true},
+		err:    errors.New("acp update order invalid"),
+	}
+	for id, command := range a.steers {
+		delete(a.steers, id)
+		a.projection.emitObservation(driver.SteerObservation{SteerResult: failure.result, Err: failure.err})
+		if command.reply != nil {
+			command.reply <- failure
 		}
-		drainTurnUpdatesThrough(turnCtx, updates, pending, state, events, streamState, sequence)
 	}
-	emitObservation(streamState, steer.observation)
-	close(steer.admitted)
+	for _, candidate := range a.pending {
+		if candidate.reply != nil {
+			a.projection.emitObservation(candidate.observation)
+			candidate.reply <- candidate.result
+		}
+	}
+	a.pending = nil
+	// Fail closed with a fixed diagnostic. No positive observation is rewritten
+	// to make the sequence appear monotonic.
+	a.projection.emitEvent(driver.Event{Kind: driver.KindTerminalError, ErrText: "acp update order invalid"})
+	a.projection.emitObservation(driver.PromptObservation{Err: errors.New("acp update order invalid")})
 }
 
-func waitForSteeringUpdates(ctx context.Context, sess turnSession, sequence uint64) error {
-	if ordered, ok := sess.(orderedUpdateBarrier); ok {
-		return ordered.WaitForUpdatesThrough(ctx, sequence)
-	}
-	return sess.WaitForUpdates(ctx)
-}
-
-func waitForPromptUpdates(ctx context.Context, sess turnSession, sequence uint64) error {
+func waitForUpdatesThrough(ctx context.Context, sess turnSession, sequence uint64) error {
 	if ordered, ok := sess.(orderedUpdateBarrier); ok && sequence != 0 {
 		return ordered.WaitForUpdatesThrough(ctx, sequence)
 	}
 	return sess.WaitForUpdates(ctx)
 }
 
-func emitTranslatedUpdate(ctx context.Context, streamState *stream, update client.Update, state *translationState, events chan<- driver.Event) {
-	for _, event := range translateLiveUpdate(update, state) {
-		emitObservation(streamState, driver.UpdateObservation{Event: event, ReceiveSequence: update.ReceiveSequence})
-		sendTurnEvent(ctx, streamState, events, event)
-	}
-}
-
-func emitPromptObservation(streamState *stream, outcome promptOutcome) {
+func promptSequence(outcome promptOutcome) uint64 {
 	if outcome.result == nil {
-		emitObservation(streamState, driver.PromptObservation{Err: outcome.err})
-		return
+		return 0
 	}
-	sequence := outcome.result.ReceiveSequence
-	if sequence == 0 {
-		sequence = outcome.result.ResponseSequence
-	}
-	emitObservation(streamState, driver.PromptObservation{
-		StopReason:       string(outcome.result.StopReason),
-		WriteAdmitted:    outcome.result.WriteAdmitted,
-		ReceiveSequence:  sequence,
-		ResponseSequence: sequence,
-		Err:              outcome.err,
-	})
+	return outcome.result.ReceiveSequence
 }
 
 func watchTurnCancellation(
@@ -516,9 +1025,6 @@ func watchTurnCancellation(
 	select {
 	case <-turnCtx.Done():
 	case <-driverCtx.Done():
-		// Driver.Close owns driverCtx, while turnCtx belongs to this stream.
-		// Cancel forwarding before attempting protocol cancellation so an
-		// abandoned full Events channel cannot hold turnMu indefinitely.
 		turnCancel()
 	case <-turnDone:
 		return
@@ -527,41 +1033,14 @@ func watchTurnCancellation(
 		return
 	}
 	if err := sess.Cancel(driverCtx); err != nil {
-		// Keep cancellation diagnostics fixed-category and avoid copying ACP
-		// error text, which may contain protocol payloads or credentials.
 		slog.Warn("acp: session cancel failed")
 	}
 }
 
-func drainTurnUpdates(
-	turnCtx context.Context,
-	updates <-chan client.Update,
-	state *translationState,
-	events chan<- driver.Event,
-) {
-	drainTurnUpdatesOrdered(turnCtx, updates, state, events, nil)
-}
-
-func drainTurnUpdatesOrdered(
-	turnCtx context.Context,
-	updates <-chan client.Update,
-	state *translationState,
-	events chan<- driver.Event,
-	streamState *stream,
-) {
-	var pending []client.Update
-	drainTurnUpdatesThrough(turnCtx, updates, &pending, state, events, streamState, 0)
-}
-
-func drainTurnUpdatesThrough(
-	turnCtx context.Context,
-	updates <-chan client.Update,
-	pending *[]client.Update,
-	state *translationState,
-	events chan<- driver.Event,
-	streamState *stream,
-	boundary uint64,
-) {
+// drainTurnUpdates remains a small compatibility utility for callers that
+// need to drain a legacy stream outside a live arbiter. The live arbiter never
+// calls it, so it cannot compete with the session's sole update reader.
+func drainTurnUpdates(turnCtx context.Context, updates <-chan client.Update, state *translationState, events chan<- driver.Event) {
 	if updates == nil {
 		return
 	}
@@ -571,68 +1050,32 @@ func drainTurnUpdatesThrough(
 			if !ok {
 				return
 			}
-			if boundary != 0 && update.ReceiveSequence > boundary {
-				*pending = append(*pending, update)
-				return
-			}
-			if streamState == nil {
-				for _, event := range translateLiveUpdate(update, state) {
-					sendTurnEvent(turnCtx, streamState, events, event)
-				}
+			if update.Meta.IsReplay {
 				continue
 			}
-			emitTranslatedUpdate(turnCtx, streamState, update, state, events)
+			for _, event := range translateUpdate(update.SessionUpdate, state) {
+				select {
+				case events <- event:
+				case <-turnCtx.Done():
+					return
+				}
+			}
 		default:
 			return
 		}
 	}
 }
 
-func promptSequence(outcome promptOutcome) uint64 {
-	if outcome.result == nil {
-		return 0
+func maxUint64(a, b uint64) uint64 {
+	if a > b {
+		return a
 	}
-	if outcome.result.ReceiveSequence != 0 {
-		return outcome.result.ReceiveSequence
-	}
-	return outcome.result.ResponseSequence
+	return b
 }
 
-func translateLiveUpdate(update client.Update, state *translationState) []driver.Event {
-	if update.Meta.IsReplay {
-		slog.Debug("acp: ignored replay session update")
-		return nil
-	}
-	return translateUpdate(update.SessionUpdate, state)
-}
+func jsonRaw(raw string) []byte { return []byte(raw) }
 
-func sendTurnEvent(ctx context.Context, streamState *stream, events chan<- driver.Event, event driver.Event) {
-	if streamState == nil {
-		select {
-		case events <- event:
-		case <-ctx.Done():
-		}
-		return
-	}
-	streamState.mu.Lock()
-	selected := streamState.selected
-	streamState.mu.Unlock()
-	if selected == viewObservations {
-		return
-	}
-	select {
-	case events <- event:
-	case <-ctx.Done():
-		// The stream is closed or its caller context has ended. Keep draining
-		// the ACP session until Prompt returns, but release this stream's
-		// consumer without blocking on an abandoned channel.
-	}
-}
-
-// maxACPModelFacingErrorBytes bounds the complete model-facing projection,
-// including its fixed prefix. Keeping this at 512 bytes leaves enough room for
-// useful reset-time text while preventing an ACP message from becoming an
-// unbounded model-facing payload.
+// maxACPModelFacingErrorBytes bounds the complete model-facing projection.
 const maxACPModelFacingErrorBytes = 512
 
 const (
@@ -654,19 +1097,11 @@ var (
 
 func promptFailureEvent(err error) driver.Event {
 	if detail, ok := safeACPErrorDetail(err); ok {
-		return driver.Event{
-			Kind:    driver.KindModelFacingError,
-			ErrText: detail,
-		}
+		return driver.Event{Kind: driver.KindModelFacingError, ErrText: detail}
 	}
 	return driver.Event{Kind: driver.KindTerminalError, ErrText: "acp prompt failed"}
 }
 
-// safeACPErrorDetail intentionally reads only Code and Message from an actual
-// ACP protocol failure. It never calls errors.As: an arbitrary error can use
-// As(any) bool to fabricate a protocol value, and Error()/Data()/causes may
-// contain provider-internal secrets. Only direct protocol values and standard
-// Unwrap-shaped wrappers are traversed, with finite bounds for hostile chains.
 func safeACPErrorDetail(err error) (string, bool) {
 	type node struct {
 		err   error
@@ -691,7 +1126,6 @@ func safeACPErrorDetail(err error) (string, bool) {
 		if current.depth >= maxACPErrorDepth {
 			continue
 		}
-
 		if wrapper, ok := current.err.(interface{ Unwrap() []error }); ok {
 			children := safeACPUnwrapMany(wrapper)
 			if len(children) > maxACPErrorChildren {
@@ -825,42 +1259,6 @@ func truncateValidUTF8(input string, maxBytes int) string {
 	return input[:cut]
 }
 
-func sendPromptTerminal(ctx context.Context, streamState *stream, events chan<- driver.Event, state *translationState, outcome promptOutcome) {
-	if outcome.err != nil || outcome.result == nil {
-		sendTerminalEvent(ctx, streamState, events, promptFailureEvent(outcome.err))
-		return
-	}
-	if message := state.message(); message != nil {
-		sendTurnEvent(ctx, streamState, events, driver.Event{
-			Kind:    driver.KindStepComplete,
-			Message: message,
-		})
-	}
-	sendTerminalEvent(ctx, streamState, events, terminalEvent(outcome.result.StopReason))
-}
-
-// sendTerminalEvent preserves the terminal marker when a cancelled turn is
-// still being drained. If the caller has abandoned the stream and its buffer
-// is full, the non-blocking fallback keeps the persistent session from being
-// wedged behind an unobserved stream; the backend already treats the canceled
-// turn context as interrupted.
-func sendTerminalEvent(ctx context.Context, streamState *stream, events chan<- driver.Event, event driver.Event) {
-	streamState.mu.Lock()
-	selected := streamState.selected
-	streamState.mu.Unlock()
-	if selected == viewObservations {
-		return
-	}
-	select {
-	case events <- event:
-	case <-ctx.Done():
-		select {
-		case events <- event:
-		default:
-		}
-	}
-}
-
 func terminalEvent(reason protocol.StopReason) driver.Event {
 	switch reason {
 	case protocol.StopReasonEndTurn, protocol.StopReasonCancelled:
@@ -893,89 +1291,9 @@ func promptBlocks(turn driver.Turn) []protocol.ContentBlock {
 	return []protocol.ContentBlock{{Text: &protocol.TextContent{Text: task.String()}}}
 }
 
-func (s *stream) Events() <-chan driver.Event {
-	if s == nil {
-		return nil
-	}
-	return s.events
-}
-
-func (s *stream) Observations() <-chan driver.Observation {
-	if s == nil {
-		return nil
-	}
-	return s.observations
-}
-
-func (s *stream) enqueueSteer(observation driver.SteerObservation) (bool, <-chan struct{}) {
-	admitted := make(chan struct{})
-	if s == nil {
-		return false, admitted
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.closed {
-		return false, admitted
-	}
-	s.steerIn <- steerInput{observation: observation, admitted: admitted}
-	return true, admitted
-}
-
-func emitObservation(streamState *stream, observation driver.Observation) {
-	if streamState == nil || observation == nil {
-		return
-	}
-	streamState.mu.Lock()
-	selected := streamState.selected
-	rawSequence := observation.Sequence()
-	if rawSequence > streamState.nextOrder {
-		streamState.nextOrder = rawSequence
-	}
-	if rawSequence == 0 || (rawSequence != 0 && rawSequence < streamState.nextOrder) {
-		streamState.nextOrder++
-		switch typed := observation.(type) {
-		case driver.PromptObservation:
-			typed.OrderSequence = streamState.nextOrder
-			observation = typed
-		case driver.UpdateObservation:
-			typed.OrderSequence = streamState.nextOrder
-			observation = typed
-		case driver.SteerObservation:
-			typed.SteerResult.OrderSequence = streamState.nextOrder
-			observation = typed
-		}
-	}
-	streamState.mu.Unlock()
-	if selected != viewObservations {
-		return
-	}
-	select {
-	case streamState.observations <- observation:
-	case <-streamState.done:
-	}
-}
-
-func (s *stream) History() (driver.History, error) {
-	return driver.History{Available: false}, nil
-}
-
-// Close cancels only this stream's forwarding context. The ACP session remains
-// open and the turn goroutine continues draining until Prompt returns so a
-// later turn cannot consume updates from an abandoned prompt.
-func (s *stream) Close() error {
-	if s == nil {
-		return nil
-	}
-	s.once.Do(func() {
-		if s.cancel != nil {
-			s.cancel()
-		}
-	})
-	return s.closeErr
-}
-
-var _ driver.Agent = (*Driver)(nil)
-var _ driver.Steerer = (*Driver)(nil)
-var _ driver.Stream = (*stream)(nil)
-var _ driver.OrderedStream = (*stream)(nil)
-var _ turnSession = legacyTurnSession{}
+var (
+	_ driver.Agent         = (*Driver)(nil)
+	_ driver.Steerer       = (*Driver)(nil)
+	_ driver.Stream        = (*stream)(nil)
+	_ driver.OrderedStream = (*stream)(nil)
+)
