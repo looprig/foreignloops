@@ -99,6 +99,8 @@ type Driver struct {
 	steeringOff  bool
 	activeMu     sync.Mutex
 	active       *stream
+	pendingMu    sync.Mutex
+	pending      []client.Update
 
 	closeOnce sync.Once
 	closeErr  error
@@ -372,10 +374,6 @@ func (d *Driver) Steer(ctx context.Context, request driver.SteerRequest) (driver
 		d.admitSteer(ctx, active, driver.SteerObservation{SteerResult: result, Err: err})
 		return result, err
 	}
-	if !active.beginSteer() {
-		return unsupported, nil
-	}
-	defer active.finishSteer()
 	result, callErr := sess.Steer(ctx, client.SteerParams{
 		SessionID: sess.ID(),
 		Prompt:    prompt,
@@ -396,6 +394,23 @@ func (d *Driver) activeStream() *stream {
 	d.activeMu.Lock()
 	defer d.activeMu.Unlock()
 	return d.active
+}
+
+func (d *Driver) takePendingUpdates() []client.Update {
+	d.pendingMu.Lock()
+	defer d.pendingMu.Unlock()
+	updates := d.pending
+	d.pending = nil
+	return updates
+}
+
+func (d *Driver) returnPendingUpdates(updates []client.Update) {
+	if len(updates) == 0 {
+		return
+	}
+	d.pendingMu.Lock()
+	d.pending = append(updates, d.pending...)
+	d.pendingMu.Unlock()
 }
 
 func (d *Driver) admitSteer(ctx context.Context, active *stream, observation driver.SteerObservation) {

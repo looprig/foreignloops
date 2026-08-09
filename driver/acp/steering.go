@@ -12,12 +12,11 @@ import (
 )
 
 const (
-	claudeAgentACPName       = "@agentclientprotocol/claude-agent-acp"
-	legacyClaudeAgentACPName = "claude-agent-acp"
-	claudeSteeringVersion    = "0.65.0"
-	codexAgentACPName        = "@agentclientprotocol/codex-acp"
-	legacyCodexAgentACPName  = "codex-acp"
-	codexSteeringVersion     = "1.1.9"
+	claudeAgentACPName      = "@agentclientprotocol/claude-agent-acp"
+	claudeSteeringVersion   = "0.65.0"
+	codexAgentACPName       = "@agentclientprotocol/codex-acp"
+	legacyCodexAgentACPName = "codex-acp"
+	codexSteeringVersion    = "1.1.9"
 )
 
 // steeringCapability applies the ACP steering policy at the initialize
@@ -30,12 +29,12 @@ func steeringCapability(harness Harness, metadata client.InitializeMetadata) boo
 	if harness != HarnessClaudeCode && harness != HarnessCodex {
 		return false
 	}
-	if metadata.AgentInfo == nil {
-		return false
-	}
 	supported, safeIdle := parseSteeringAdvertisement(metadata.Meta)
 	if !supported {
 		return false
+	}
+	if metadata.AgentInfo == nil {
+		return safeIdle
 	}
 	name, version := metadata.AgentInfo.Name, metadata.AgentInfo.Version
 	if harness == HarnessCodex && (version == codexSteeringVersion || isCurrentCodexProfile(name, version)) {
@@ -72,7 +71,7 @@ func parseSteeringAdvertisement(raw json.RawMessage) (supported, safeIdle bool) 
 }
 
 func isExactClaudeProfile(name, version string) bool {
-	return (name == claudeAgentACPName || name == legacyClaudeAgentACPName) && version == claudeSteeringVersion
+	return name == claudeAgentACPName && version == claudeSteeringVersion
 }
 
 func isCurrentCodexProfile(name, version string) bool {

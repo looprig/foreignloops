@@ -37,6 +37,7 @@ func BuildWith(cfg Config) foreign.Builder {
 // which the backend binds on the first live turn through a synthetic KindInit
 // event.
 func BuildWithServices(cfg Config) foreign.ServicesBuilder {
+	cfg.McpServers = cloneMcpServers(cfg.McpServers)
 	return func(
 		loopCtx context.Context,
 		sessionID, loopID uuid.UUID,
@@ -90,6 +91,7 @@ func BuildRestoredWith(cfg Config) foreign.RestoredBuilder {
 // ACP session/load; ForeignSID remains the backend's recovered routing
 // identity. An empty AgentSessionID preserves legacy session/new behavior.
 func BuildRestoredWithServices(cfg Config) foreign.ServicesRestoredBuilder {
+	cfg.McpServers = cloneMcpServers(cfg.McpServers)
 	return func(
 		loopCtx context.Context,
 		sessionID, loopID uuid.UUID,

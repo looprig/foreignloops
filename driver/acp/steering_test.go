@@ -6,6 +6,7 @@ import (
 	"errors"
 	"reflect"
 	"testing"
+	"time"
 
 	"github.com/looprig/acp/client"
 	"github.com/looprig/acp/launch"
@@ -53,6 +54,20 @@ func TestSteeringCapabilityRequiresAdvertisedSafeIdleFallback(t *testing.T) {
 			version:  "0.65.0",
 			meta:     `{"steering":{"supported":true}}`,
 			want:     true,
+		},
+		{
+			name:     "unscoped Claude exception rejected",
+			harness:  HarnessClaudeCode,
+			nameInfo: "claude-agent-acp",
+			version:  "0.65.0",
+			meta:     `{"steering":{"supported":true}}`,
+			want:     false,
+		},
+		{
+			name:    "safe advertisement without identity",
+			harness: HarnessClaudeCode,
+			meta:    `{"steering":{"supported":true,"idleBehaviors":["promptRequired"]}}`,
+			want:    true,
 		},
 		{
 			name:     "unknown Claude version",
@@ -226,15 +241,23 @@ type steeringSession struct {
 	steerErr    error
 	steerParams []client.SteerParams
 	barriers    []uint64
+	steerHook   func(context.Context, client.SteerParams) (client.SteerResult, error)
+	barrierHook func(context.Context, uint64) error
 }
 
-func (s *steeringSession) Steer(_ context.Context, params client.SteerParams) (client.SteerResult, error) {
+func (s *steeringSession) Steer(ctx context.Context, params client.SteerParams) (client.SteerResult, error) {
 	s.steerParams = append(s.steerParams, params)
+	if s.steerHook != nil {
+		return s.steerHook(ctx, params)
+	}
 	return s.steerResult, s.steerErr
 }
 
-func (s *steeringSession) WaitForUpdatesThrough(_ context.Context, sequence uint64) error {
+func (s *steeringSession) WaitForUpdatesThrough(ctx context.Context, sequence uint64) error {
 	s.barriers = append(s.barriers, sequence)
+	if s.barrierHook != nil {
+		return s.barrierHook(ctx, sequence)
+	}
 	return nil
 }
 
@@ -405,4 +428,145 @@ func TestACPSteeringDisablesAfterKnownMethodRejection(t *testing.T) {
 	}
 	close(release)
 	_ = collectTurnEvents(t, stream)
+}
+
+func TestACPSteeringTerminalDoesNotWaitForUnboundedSteerCall(t *testing.T) {
+	sess := &steeringSession{scriptedSession: newScriptedSession("terminal-wins")}
+	steerStarted := make(chan struct{})
+	steerRelease := make(chan struct{})
+	sess.steerHook = func(context.Context, client.SteerParams) (client.SteerResult, error) {
+		close(steerStarted)
+		<-steerRelease
+		return client.SteerResult{Outcome: client.SteerOutcomeInjected, WriteAdmitted: true, ReceiveSequence: 2, ResponseSequence: 2}, nil
+	}
+	sess.promptHook = func(int, []protocol.ContentBlock) (*client.PromptResult, error) {
+		<-steerStarted
+		return &client.PromptResult{StopReason: protocol.StopReasonEndTurn, ReceiveSequence: 3, ResponseSequence: 3, WriteAdmitted: true}, nil
+	}
+	d := newTurnTestDriver(sess.scriptedSession)
+	d.session, d.steeringOn = sess, true
+	stream, err := d.Spawn(context.Background(), driver.Turn{})
+	if err != nil {
+		t.Fatalf("Spawn() error = %v", err)
+	}
+	request, err := driver.NewSteerRequest([]content.Block{&content.TextBlock{Text: "blocked"}})
+	if err != nil {
+		t.Fatalf("NewSteerRequest() error = %v", err)
+	}
+	steerDone := make(chan struct{})
+	go func() { _, _ = d.Steer(context.Background(), request); close(steerDone) }()
+	<-steerStarted
+	select {
+	case _, ok := <-stream.Events():
+		if !ok {
+			t.Fatal("Events closed before terminal event")
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("terminal event waited for unbounded Steer call")
+	}
+	close(steerRelease)
+	select {
+	case <-steerDone:
+	case <-time.After(time.Second):
+		t.Fatal("Steer did not finish after release")
+	}
+	_ = stream.Close()
+}
+
+func TestACPOrderedSteerDoesNotDrainGreaterSequenceUpdates(t *testing.T) {
+	sess := &steeringSession{
+		scriptedSession: newScriptedSession("boundary"),
+		steerResult:     client.SteerResult{Outcome: client.SteerOutcomeInjected, WriteAdmitted: true, ReceiveSequence: 2, ResponseSequence: 2},
+	}
+	sess.barrierHook = func(_ context.Context, sequence uint64) error {
+		if sequence == 2 {
+			sess.updates <- client.Update{ReceiveSequence: 1, SessionUpdate: protocol.SessionUpdate{AgentMessageChunk: &protocol.ContentChunk{Content: protocol.ContentBlock{Text: &protocol.TextContent{Text: "before"}}}}}
+			sess.updates <- client.Update{ReceiveSequence: 3, SessionUpdate: protocol.SessionUpdate{AgentMessageChunk: &protocol.ContentChunk{Content: protocol.ContentBlock{Text: &protocol.TextContent{Text: "after"}}}}}
+		}
+		return nil
+	}
+	sess.promptHook = func(int, []protocol.ContentBlock) (*client.PromptResult, error) {
+		return &client.PromptResult{StopReason: protocol.StopReasonEndTurn, WriteAdmitted: true, ReceiveSequence: 4, ResponseSequence: 4}, nil
+	}
+	d := newTurnTestDriver(sess.scriptedSession)
+	d.session, d.steeringOn = sess, true
+	stream, err := d.Spawn(context.Background(), driver.Turn{})
+	if err != nil {
+		t.Fatalf("Spawn() error = %v", err)
+	}
+	request, err := driver.NewSteerRequest([]content.Block{&content.TextBlock{Text: "steer"}})
+	if err != nil {
+		t.Fatalf("NewSteerRequest() error = %v", err)
+	}
+	if _, err := d.Steer(context.Background(), request); err != nil {
+		t.Fatalf("Steer() error = %v", err)
+	}
+	_ = collectTurnEvents(t, stream)
+	var got []uint64
+	for observation := range stream.(driver.OrderedStream).Observations() {
+		got = append(got, observation.Sequence())
+	}
+	if !reflect.DeepEqual(got, []uint64{1, 2, 3, 4}) {
+		t.Fatalf("observation sequences = %v, want [1 2 3 4]", got)
+	}
+}
+
+func TestACPEventsOnlyConsumerDoesNotBlockOrderedObservationQueue(t *testing.T) {
+	sess := &steeringSession{scriptedSession: newScriptedSession("events-only")}
+	release := make(chan struct{})
+	sess.promptHook = func(int, []protocol.ContentBlock) (*client.PromptResult, error) {
+		<-release
+		return &client.PromptResult{StopReason: protocol.StopReasonEndTurn}, nil
+	}
+	d := newTurnTestDriver(sess.scriptedSession)
+	d.session = sess
+	stream, err := d.Spawn(context.Background(), driver.Turn{})
+	if err != nil {
+		t.Fatalf("Spawn() error = %v", err)
+	}
+	eventsDone := make(chan struct{})
+	go func() {
+		for range stream.Events() {
+		}
+		close(eventsDone)
+	}()
+	for i := 1; i <= 600; i++ {
+		sess.updates <- client.Update{ReceiveSequence: uint64(i), SessionUpdate: protocol.SessionUpdate{AgentMessageChunk: &protocol.ContentChunk{Content: protocol.ContentBlock{Text: &protocol.TextContent{Text: "x"}}}}}
+	}
+	close(release)
+	select {
+	case <-eventsDone:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("legacy-only consumer blocked on observations")
+	}
+}
+
+func TestACPObservationsOnlyConsumerDoesNotBlockLegacyEvents(t *testing.T) {
+	sess := &steeringSession{scriptedSession: newScriptedSession("observations-only")}
+	release := make(chan struct{})
+	sess.promptHook = func(int, []protocol.ContentBlock) (*client.PromptResult, error) {
+		<-release
+		return &client.PromptResult{StopReason: protocol.StopReasonEndTurn}, nil
+	}
+	d := newTurnTestDriver(sess.scriptedSession)
+	d.session = sess
+	stream, err := d.Spawn(context.Background(), driver.Turn{})
+	if err != nil {
+		t.Fatalf("Spawn() error = %v", err)
+	}
+	obsDone := make(chan struct{})
+	go func() {
+		for range stream.(driver.OrderedStream).Observations() {
+		}
+		close(obsDone)
+	}()
+	for i := 1; i <= 100; i++ {
+		sess.updates <- client.Update{ReceiveSequence: uint64(i), SessionUpdate: protocol.SessionUpdate{AgentMessageChunk: &protocol.ContentChunk{Content: protocol.ContentBlock{Text: &protocol.TextContent{Text: "x"}}}}}
+	}
+	close(release)
+	select {
+	case <-obsDone:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("observation-only consumer blocked on Events")
+	}
 }

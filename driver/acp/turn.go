@@ -96,10 +96,8 @@ type stream struct {
 	cancel       context.CancelFunc
 	steerIn      chan steerInput
 
-	mu            sync.Mutex
-	closed        bool
-	pendingSteers int
-	steerChanged  chan struct{}
+	mu     sync.Mutex
+	closed bool
 
 	once     sync.Once
 	closeErr error
@@ -144,15 +142,14 @@ func (d *Driver) Spawn(ctx context.Context, turn driver.Turn) (driver.Stream, er
 		driverCtx = context.Background()
 	}
 	turnCtx, cancel := context.WithCancel(ctx)
-	events := make(chan driver.Event, 32)
+	events := make(chan driver.Event, 1024)
 	done := make(chan struct{})
 	s := &stream{
 		events:       events,
-		observations: make(chan driver.Observation, 512),
+		observations: make(chan driver.Observation, 1024),
 		done:         done,
 		cancel:       cancel,
 		steerIn:      make(chan steerInput, 512),
-		steerChanged: make(chan struct{}),
 	}
 	d.activeMu.Lock()
 	d.active = s
@@ -171,6 +168,7 @@ func (d *Driver) runTurn(
 	events chan<- driver.Event,
 	done chan<- struct{},
 ) {
+	pendingUpdates := d.takePendingUpdates()
 	turnDone := make(chan struct{})
 	watcherDone := make(chan struct{})
 	lifecycle := &turnLifecycle{}
@@ -183,6 +181,7 @@ func (d *Driver) runTurn(
 		streamState.mu.Lock()
 		streamState.closed = true
 		streamState.mu.Unlock()
+		d.returnPendingUpdates(pendingUpdates)
 		for {
 			select {
 			case pending := <-streamState.steerIn:
@@ -212,6 +211,12 @@ func (d *Driver) runTurn(
 	state := &translationState{}
 	updates := sess.Updates()
 	for {
+		if len(pendingUpdates) > 0 {
+			update := pendingUpdates[0]
+			pendingUpdates = pendingUpdates[1:]
+			emitTranslatedUpdate(turnCtx, streamState, update, state, events)
+			continue
+		}
 		select {
 		case update, ok := <-updates:
 			if !ok {
@@ -223,7 +228,7 @@ func (d *Driver) runTurn(
 			if !ok {
 				continue
 			}
-			processSteerInput(driverCtx, turnCtx, sess, updates, state, events, streamState, steer)
+			processSteerInput(driverCtx, turnCtx, sess, updates, &pendingUpdates, state, events, streamState, steer)
 		case outcome := <-promptDone:
 			// The prompt response can become visible before the ordered
 			// notification handler has delivered the final session/update.
@@ -232,9 +237,15 @@ func (d *Driver) runTurn(
 			// consumer to make the barrier progress.
 			barrierDone := make(chan error, 1)
 			go func() {
-				barrierDone <- sess.WaitForUpdates(driverCtx)
+				barrierDone <- waitForPromptUpdates(driverCtx, sess, promptSequence(outcome))
 			}()
 			for {
+				if len(pendingUpdates) > 0 {
+					update := pendingUpdates[0]
+					pendingUpdates = pendingUpdates[1:]
+					emitTranslatedUpdate(turnCtx, streamState, update, state, events)
+					continue
+				}
 				select {
 				case update, ok := <-updates:
 					if !ok {
@@ -246,35 +257,30 @@ func (d *Driver) runTurn(
 					if !ok {
 						continue
 					}
-					processSteerInput(driverCtx, turnCtx, sess, updates, state, events, streamState, steer)
+					processSteerInput(driverCtx, turnCtx, sess, updates, &pendingUpdates, state, events, streamState, steer)
 				case err := <-barrierDone:
 					if err != nil && driverCtx.Err() == nil {
 						// Keep the diagnostic fixed-category: ACP errors may
 						// contain protocol payloads or credentials.
 						slog.Warn("acp: update delivery barrier failed")
 					}
-					// Hold the terminal until any steering call that raced the
-					// prompt has either admitted its ordered observation or
-					// resolved through its bounded runtime context. The barrier
-					// covers ordered handler delivery. Drain the
-					// session channel once more so a final handoff that became
-					// ready with the barrier cannot be consumed by the next turn.
-					if err := streamState.waitSteers(driverCtx); err != nil && driverCtx.Err() == nil {
-						slog.Warn("acp: steering acknowledgement wait failed")
-					}
+					// The barrier covers ordered handler delivery. Drain steering
+					// requests already admitted to this stream, but never wait for
+					// an ACP call still running in another goroutine: that call is
+					// bounded solely by its request context.
 					for {
 						select {
 						case steer, ok := <-streamState.steerIn:
 							if !ok {
 								continue
 							}
-							processSteerInput(driverCtx, turnCtx, sess, updates, state, events, streamState, steer)
+							processSteerInput(driverCtx, turnCtx, sess, updates, &pendingUpdates, state, events, streamState, steer)
 						default:
 							goto pendingSteerInputsDrained
 						}
 					}
 				pendingSteerInputsDrained:
-					drainTurnUpdatesOrdered(turnCtx, updates, state, events, streamState)
+					drainTurnUpdatesThrough(turnCtx, updates, &pendingUpdates, state, events, streamState, promptSequence(outcome))
 					emitPromptObservation(streamState, outcome)
 					sendPromptTerminal(turnCtx, events, state, outcome)
 					return
@@ -288,6 +294,7 @@ func processSteerInput(
 	driverCtx, turnCtx context.Context,
 	sess turnSession,
 	updates <-chan client.Update,
+	pending *[]client.Update,
 	state *translationState,
 	events chan<- driver.Event,
 	streamState *stream,
@@ -297,7 +304,7 @@ func processSteerInput(
 		if err := waitForSteeringUpdates(driverCtx, sess, sequence); err != nil && driverCtx.Err() == nil {
 			slog.Warn("acp: steering update barrier failed")
 		}
-		drainTurnUpdatesOrdered(turnCtx, updates, state, events, streamState)
+		drainTurnUpdatesThrough(turnCtx, updates, pending, state, events, streamState, sequence)
 	}
 	emitObservation(streamState, steer.observation)
 	close(steer.admitted)
@@ -305,6 +312,13 @@ func processSteerInput(
 
 func waitForSteeringUpdates(ctx context.Context, sess turnSession, sequence uint64) error {
 	if ordered, ok := sess.(orderedUpdateBarrier); ok {
+		return ordered.WaitForUpdatesThrough(ctx, sequence)
+	}
+	return sess.WaitForUpdates(ctx)
+}
+
+func waitForPromptUpdates(ctx context.Context, sess turnSession, sequence uint64) error {
+	if ordered, ok := sess.(orderedUpdateBarrier); ok && sequence != 0 {
 		return ordered.WaitForUpdatesThrough(ctx, sequence)
 	}
 	return sess.WaitForUpdates(ctx)
@@ -380,6 +394,19 @@ func drainTurnUpdatesOrdered(
 	events chan<- driver.Event,
 	streamState *stream,
 ) {
+	var pending []client.Update
+	drainTurnUpdatesThrough(turnCtx, updates, &pending, state, events, streamState, 0)
+}
+
+func drainTurnUpdatesThrough(
+	turnCtx context.Context,
+	updates <-chan client.Update,
+	pending *[]client.Update,
+	state *translationState,
+	events chan<- driver.Event,
+	streamState *stream,
+	boundary uint64,
+) {
 	if updates == nil {
 		return
 	}
@@ -387,6 +414,10 @@ func drainTurnUpdatesOrdered(
 		select {
 		case update, ok := <-updates:
 			if !ok {
+				return
+			}
+			if boundary != 0 && update.ReceiveSequence > boundary {
+				*pending = append(*pending, update)
 				return
 			}
 			if streamState == nil {
@@ -400,6 +431,16 @@ func drainTurnUpdatesOrdered(
 			return
 		}
 	}
+}
+
+func promptSequence(outcome promptOutcome) uint64 {
+	if outcome.result == nil {
+		return 0
+	}
+	if outcome.result.ReceiveSequence != 0 {
+		return outcome.result.ReceiveSequence
+	}
+	return outcome.result.ResponseSequence
 }
 
 func translateLiveUpdate(update client.Update, state *translationState) []driver.Event {
@@ -701,51 +742,16 @@ func (s *stream) enqueueSteer(observation driver.SteerObservation) (bool, <-chan
 	return true, admitted
 }
 
-func (s *stream) beginSteer() bool {
-	if s == nil {
-		return false
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.closed {
-		return false
-	}
-	s.pendingSteers++
-	return true
-}
-
-func (s *stream) finishSteer() {
-	s.mu.Lock()
-	if s.pendingSteers > 0 {
-		s.pendingSteers--
-	}
-	close(s.steerChanged)
-	s.steerChanged = make(chan struct{})
-	s.mu.Unlock()
-}
-
-func (s *stream) waitSteers(ctx context.Context) error {
-	for {
-		s.mu.Lock()
-		if s.pendingSteers == 0 {
-			s.mu.Unlock()
-			return nil
-		}
-		changed := s.steerChanged
-		s.mu.Unlock()
-		select {
-		case <-changed:
-		case <-ctx.Done():
-			return ctx.Err()
-		}
-	}
-}
-
 func emitObservation(streamState *stream, observation driver.Observation) {
 	if streamState == nil || observation == nil {
 		return
 	}
-	streamState.observations <- observation
+	// Ordered observations are best-effort once their bounded consumer queue is
+	// full; a caller that abandons Events must never prevent turn cancellation.
+	select {
+	case streamState.observations <- observation:
+	default:
+	}
 }
 
 func (s *stream) History() (driver.History, error) {
