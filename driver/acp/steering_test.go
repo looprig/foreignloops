@@ -581,31 +581,80 @@ func TestACPObservationsOnlyConsumerDoesNotBlockLegacyEvents(t *testing.T) {
 }
 
 func TestACPStreamViewSelectionIsMutuallyExclusiveAndStable(t *testing.T) {
-	sess := &steeringSession{scriptedSession: newScriptedSession("view-selection")}
-	release := make(chan struct{})
-	sess.promptHook = func(int, []protocol.ContentBlock) (*client.PromptResult, error) {
-		<-release
-		return &client.PromptResult{StopReason: protocol.StopReasonEndTurn}, nil
-	}
-	d := newTurnTestDriver(sess.scriptedSession)
-	d.session = sess
-	stream, err := d.Spawn(context.Background(), driver.Turn{})
-	if err != nil {
-		t.Fatalf("Spawn() error = %v", err)
-	}
-	events := stream.Events()
-	if events != stream.Events() {
-		t.Fatal("repeated Events() did not return the same channel")
-	}
-	observations := stream.(driver.OrderedStream).Observations()
-	select {
-	case _, ok := <-observations:
-		if ok {
-			t.Fatal("inactive observations channel carried traffic")
+	t.Run("legacy events", func(t *testing.T) {
+		sess := &steeringSession{scriptedSession: newScriptedSession("legacy-view-selection")}
+		release := make(chan struct{})
+		sess.promptHook = func(int, []protocol.ContentBlock) (*client.PromptResult, error) {
+			<-release
+			return &client.PromptResult{StopReason: protocol.StopReasonEndTurn}, nil
 		}
-	default:
-	}
-	close(release)
-	for range events {
-	}
+		d := newTurnTestDriver(sess.scriptedSession)
+		d.session = sess
+		stream, err := d.Spawn(context.Background(), driver.Turn{})
+		if err != nil {
+			t.Fatalf("Spawn() error = %v", err)
+		}
+		if _, ok := stream.(driver.OrderedStream); ok {
+			t.Fatalf("legacy stream %T implements OrderedStream", stream)
+		}
+		events := stream.Events()
+		if events != stream.Events() {
+			t.Fatal("repeated Events() did not return the same channel")
+		}
+		close(release)
+		var got []driver.Event
+		for event := range events {
+			got = append(got, event)
+		}
+		if !reflect.DeepEqual(eventKinds(got), []driver.Kind{driver.KindTerminalOK}) {
+			t.Fatalf("legacy events = %#v, want one terminal event", got)
+		}
+	})
+
+	t.Run("ordered observations", func(t *testing.T) {
+		sess := &steeringSession{scriptedSession: newScriptedSession("ordered-view-selection")}
+		release := make(chan struct{})
+		sess.promptHook = func(int, []protocol.ContentBlock) (*client.PromptResult, error) {
+			<-release
+			return &client.PromptResult{StopReason: protocol.StopReasonEndTurn}, nil
+		}
+		d := newTurnTestDriver(sess.scriptedSession)
+		d.session, d.steeringOn = sess, true
+		stream, err := d.Spawn(context.Background(), driver.Turn{})
+		if err != nil {
+			t.Fatalf("Spawn() error = %v", err)
+		}
+		ordered, ok := stream.(driver.OrderedStream)
+		if !ok {
+			t.Fatalf("steering-enabled stream %T does not implement OrderedStream", stream)
+		}
+		observations := ordered.Observations()
+		if observations != ordered.Observations() {
+			t.Fatal("repeated Observations() did not return the same channel")
+		}
+		events := stream.Events()
+		if events != stream.Events() {
+			t.Fatal("repeated Events() did not return the same channel")
+		}
+		select {
+		case event, ok := <-events:
+			if ok {
+				t.Fatalf("inactive events channel carried %#v", event)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("inactive events channel did not close")
+		}
+		close(release)
+		var got []driver.Observation
+		for observation := range observations {
+			got = append(got, observation)
+		}
+		if len(got) != 1 {
+			t.Fatalf("ordered observations = %#v, want one prompt observation", got)
+		}
+		prompt, ok := got[0].(driver.PromptObservation)
+		if !ok || prompt.StopReason != string(protocol.StopReasonEndTurn) {
+			t.Fatalf("ordered observation = %#v, want completed prompt", got[0])
+		}
+	})
 }
