@@ -321,7 +321,8 @@ func TestACPSteerSendsExactTypedRequestAndOrderedObservation(t *testing.T) {
 		t.Fatal("Steer() returned before ordered steer observation was admitted")
 	}
 	close(release)
-	_ = collectTurnEvents(t, stream)
+	for range ordered.Observations() {
+	}
 }
 
 func TestACPOrderedObservationsUseReceiveSequenceAndBarrier(t *testing.T) {
@@ -366,8 +367,6 @@ func TestACPOrderedObservationsUseReceiveSequenceAndBarrier(t *testing.T) {
 		t.Fatalf("Steer() error = %v", err)
 	}
 	close(release)
-	_ = collectTurnEvents(t, stream)
-
 	ordered := stream.(driver.OrderedStream).Observations()
 	var got []driver.Observation
 	for observation := range ordered {
@@ -427,7 +426,7 @@ func TestACPSteeringDisablesAfterKnownMethodRejection(t *testing.T) {
 		t.Fatalf("ACP Steer calls = %d, want one before steering was disabled", len(sess.steerParams))
 	}
 	close(release)
-	_ = collectTurnEvents(t, stream)
+	_ = stream.Close()
 }
 
 func TestACPSteeringTerminalDoesNotWaitForUnboundedSteerCall(t *testing.T) {
@@ -501,7 +500,6 @@ func TestACPOrderedSteerDoesNotDrainGreaterSequenceUpdates(t *testing.T) {
 	if _, err := d.Steer(context.Background(), request); err != nil {
 		t.Fatalf("Steer() error = %v", err)
 	}
-	_ = collectTurnEvents(t, stream)
 	var got []uint64
 	for observation := range stream.(driver.OrderedStream).Observations() {
 		got = append(got, observation.Sequence())
@@ -524,18 +522,23 @@ func TestACPEventsOnlyConsumerDoesNotBlockOrderedObservationQueue(t *testing.T) 
 	if err != nil {
 		t.Fatalf("Spawn() error = %v", err)
 	}
-	eventsDone := make(chan struct{})
+	eventsDone := make(chan int, 1)
 	go func() {
+		count := 0
 		for range stream.Events() {
+			count++
 		}
-		close(eventsDone)
+		eventsDone <- count
 	}()
-	for i := 1; i <= 600; i++ {
+	for i := 1; i <= 3000; i++ {
 		sess.updates <- client.Update{ReceiveSequence: uint64(i), SessionUpdate: protocol.SessionUpdate{AgentMessageChunk: &protocol.ContentChunk{Content: protocol.ContentBlock{Text: &protocol.TextContent{Text: "x"}}}}}
 	}
 	close(release)
 	select {
-	case <-eventsDone:
+	case count := <-eventsDone:
+		if count != 3002 {
+			t.Fatalf("legacy event count = %d, want 3002", count)
+		}
 	case <-time.After(500 * time.Millisecond):
 		t.Fatal("legacy-only consumer blocked on observations")
 	}
@@ -554,19 +557,54 @@ func TestACPObservationsOnlyConsumerDoesNotBlockLegacyEvents(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Spawn() error = %v", err)
 	}
-	obsDone := make(chan struct{})
+	obsDone := make(chan int, 1)
 	go func() {
+		count := 0
 		for range stream.(driver.OrderedStream).Observations() {
+			count++
 		}
-		close(obsDone)
+		obsDone <- count
 	}()
-	for i := 1; i <= 100; i++ {
+	for i := 1; i <= 3000; i++ {
 		sess.updates <- client.Update{ReceiveSequence: uint64(i), SessionUpdate: protocol.SessionUpdate{AgentMessageChunk: &protocol.ContentChunk{Content: protocol.ContentBlock{Text: &protocol.TextContent{Text: "x"}}}}}
 	}
 	close(release)
 	select {
-	case <-obsDone:
+	case count := <-obsDone:
+		if count != 3001 {
+			t.Fatalf("ordered observation count = %d, want 3001", count)
+		}
 	case <-time.After(500 * time.Millisecond):
 		t.Fatal("observation-only consumer blocked on Events")
+	}
+}
+
+func TestACPStreamViewSelectionIsMutuallyExclusiveAndStable(t *testing.T) {
+	sess := &steeringSession{scriptedSession: newScriptedSession("view-selection")}
+	release := make(chan struct{})
+	sess.promptHook = func(int, []protocol.ContentBlock) (*client.PromptResult, error) {
+		<-release
+		return &client.PromptResult{StopReason: protocol.StopReasonEndTurn}, nil
+	}
+	d := newTurnTestDriver(sess.scriptedSession)
+	d.session = sess
+	stream, err := d.Spawn(context.Background(), driver.Turn{})
+	if err != nil {
+		t.Fatalf("Spawn() error = %v", err)
+	}
+	events := stream.Events()
+	if events != stream.Events() {
+		t.Fatal("repeated Events() did not return the same channel")
+	}
+	observations := stream.(driver.OrderedStream).Observations()
+	select {
+	case _, ok := <-observations:
+		if ok {
+			t.Fatal("inactive observations channel carried traffic")
+		}
+	default:
+	}
+	close(release)
+	for range events {
 	}
 }

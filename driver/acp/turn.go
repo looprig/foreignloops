@@ -836,8 +836,10 @@ func (s *stream) Events() <-chan driver.Event {
 	defer s.mu.Unlock()
 	if s.selected == viewUnselected {
 		s.selected = viewEvents
-		for _, event := range s.pendingEvents {
-			s.events <- event
+		if !s.closed {
+			for _, event := range s.pendingEvents {
+				s.events <- event
+			}
 		}
 		s.pendingEvents = nil
 		if !s.closedObservations {
@@ -856,8 +858,10 @@ func (s *stream) Observations() <-chan driver.Observation {
 	defer s.mu.Unlock()
 	if s.selected == viewUnselected {
 		s.selected = viewObservations
-		for _, observation := range s.pendingObservations {
-			s.observations <- observation
+		if !s.closed {
+			for _, observation := range s.pendingObservations {
+				s.observations <- observation
+			}
 		}
 		s.pendingObservations = nil
 		if !s.closedEvents {
