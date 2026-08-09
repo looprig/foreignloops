@@ -351,13 +351,27 @@ func (d *Driver) Steer(ctx context.Context, request driver.SteerRequest) (driver
 	if h == nil {
 		return driver.SteerResult{Outcome: driver.SteerOutcomeUnsupported}, nil
 	}
+	var reservation *steerObservationReservation
+	if h.lane != nil {
+		var ok bool
+		reservation, ok = h.reserveSteer()
+		if !ok {
+			return driver.SteerResult{Outcome: driver.SteerOutcomeFallbackRequired}, &driver.SteerAdmissionError{}
+		}
+	}
 	reply := make(chan steerReply, 1)
 	attempt := &steerAttempt{}
-	if !h.send(ctx, steerCommand{ctx: ctx, request: request, reply: reply, attempt: attempt}) {
+	if ctx.Err() != nil {
+		attempt.cancelAndSnapshot()
+	}
+	if !h.send(ctx, steerCommand{ctx: ctx, request: request, reply: reply, attempt: attempt, reservation: reservation}) {
+		reservation.release()
 		if err := ctx.Err(); err != nil {
-			result := driver.SteerResult{Outcome: driver.SteerOutcomeFallbackRequired}
-			h.rejectSteer(result, err)
-			return result, err
+			attempt.cancelAndSnapshot()
+			return driver.SteerResult{Outcome: driver.SteerOutcomeFallbackRequired}, err
+		}
+		if reservation != nil {
+			return driver.SteerResult{Outcome: driver.SteerOutcomeFallbackRequired}, &driver.SteerAdmissionError{}
 		}
 		return driver.SteerResult{Outcome: driver.SteerOutcomeUnsupported}, nil
 	}
@@ -373,21 +387,16 @@ func (d *Driver) Steer(ctx context.Context, request driver.SteerRequest) (driver
 }
 
 func callerTimeoutSteerResult(attempt *steerAttempt) driver.SteerResult {
-	started, admissionKnown, admitted := attempt.snapshot()
-	if admissionKnown {
-		if admitted {
-			return driver.SteerResult{Outcome: driver.SteerOutcomeDeliveryUnknown, WriteAdmitted: true}
-		}
-		return driver.SteerResult{Outcome: driver.SteerOutcomeFallbackRequired}
-	}
-	if started {
-		// An ACP attempt exists but has not published admission yet. Delivery
-		// remains possible, so unknown is the only safe caller projection; the
-		// true bit reflects possibility from a started attempt, not a fabricated
-		// admission fact.
+	switch attempt.cancelAndSnapshot() {
+	case steerAdmissionAdmitted:
 		return driver.SteerResult{Outcome: driver.SteerOutcomeDeliveryUnknown, WriteAdmitted: true}
+	case steerAdmissionPendingWriter:
+		return driver.SteerResult{Outcome: driver.SteerOutcomeAdmissionUnknown}
+	case steerAdmissionPending, steerAdmissionNotAdmitted:
+		return driver.SteerResult{Outcome: driver.SteerOutcomeFallbackRequired}
+	default:
+		return driver.SteerResult{Outcome: driver.SteerOutcomeAdmissionUnknown}
 	}
-	return driver.SteerResult{Outcome: driver.SteerOutcomeFallbackRequired}
 }
 
 func (d *Driver) activeHandle() *turnHandle {

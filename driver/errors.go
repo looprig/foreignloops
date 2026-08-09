@@ -1,6 +1,22 @@
 package driver
 
-import "fmt"
+import (
+	"errors"
+	"fmt"
+)
+
+// ErrSteerAdmissionCapacity identifies a bounded, pre-admission rejection.
+// It means no ACP steering write was attempted and the caller may safely
+// choose its normal queued fallback.
+var ErrSteerAdmissionCapacity = errors.New("foreignloop: steering admission capacity exhausted")
+
+// SteerAdmissionError reports that the fixed steering-observation reservation
+// lane was full before the request entered the actor mailbox. Its text is
+// intentionally bounded and does not include provider or request details.
+type SteerAdmissionError struct{}
+
+func (*SteerAdmissionError) Error() string { return ErrSteerAdmissionCapacity.Error() }
+func (*SteerAdmissionError) Unwrap() error { return ErrSteerAdmissionCapacity }
 
 // SpawnError reports that a foreign agent could not be started.
 type SpawnError struct{ Cause error }

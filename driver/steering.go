@@ -179,6 +179,7 @@ const (
 	SteerOutcomeInjected             SteerOutcome = "injected"
 	SteerOutcomeFallbackRequired     SteerOutcome = "fallback_required"
 	SteerOutcomeUnsupported          SteerOutcome = "unsupported"
+	SteerOutcomeAdmissionUnknown     SteerOutcome = "admission_unknown"
 	SteerOutcomeDeliveryUnknown      SteerOutcome = "delivery_unknown"
 	SteerOutcomeDeliveredUntrackable SteerOutcome = "delivered_untrackable"
 )
@@ -187,11 +188,20 @@ const (
 func (o SteerOutcome) Valid() bool {
 	switch o {
 	case SteerOutcomeInjected, SteerOutcomeFallbackRequired, SteerOutcomeUnsupported,
+		SteerOutcomeAdmissionUnknown,
 		SteerOutcomeDeliveryUnknown, SteerOutcomeDeliveredUntrackable:
 		return true
 	default:
 		return false
 	}
+}
+
+// RetrySafe reports whether the adapter proved that no steering delivery can
+// have occurred. Only unsupported and fallback_required permit an automatic
+// normal-turn retry; all uncertainty and lifecycle-breach outcomes are
+// intentionally non-retryable.
+func (o SteerOutcome) RetrySafe() bool {
+	return o == SteerOutcomeUnsupported || o == SteerOutcomeFallbackRequired
 }
 
 // SteerResult is the transport-normalized result of one steering attempt.
@@ -239,6 +249,14 @@ func (r SteerResult) Validate() error {
 		if r.WriteAdmitted && r.ResponseSequence == 0 {
 			return errors.New("driver: admitted steering fallback has no response sequence")
 		}
+	case SteerOutcomeAdmissionUnknown:
+		// AdmissionUnknown means the adapter may have been invoked, but no
+		// writer fact was observed. A true bit would turn uncertainty into a
+		// fabricated admission claim; a response sequence is likewise invalid
+		// without a positive admission fact (checked above).
+		if r.WriteAdmitted {
+			return errors.New("driver: admission-unknown steering was writer-admitted")
+		}
 	case SteerOutcomeDeliveryUnknown:
 		if !r.WriteAdmitted {
 			return errors.New("driver: unknown steering delivery was not writer-admitted")
@@ -282,11 +300,13 @@ type Observation interface {
 // only by consumers and is closed exactly once after the stream has finished
 // producing observations; consumers must not close it. Stream.Close remains
 // the lifecycle operation and remains idempotent. Every Steerer.Steer call
-// produces exactly one SteerObservation, including calls ending in a typed
-// error or a pre-admission result. A producer emits observations in
-// nondecreasing ReceiveSequence order. Multiple translated observations may
-// share one receive sequence; their channel order is the tie-breaker and
-// consumers must not reorder equal-sequence observations.
+// produces exactly one SteerObservation for every call accepted by the
+// steering actor, including accepted calls ending in a typed error or a
+// pre-admission result. A call rejected before actor admission (for example by
+// a bounded reservation lane) produces no observation. A producer emits
+// observations in nondecreasing ReceiveSequence order. Multiple translated
+// observations may share one receive sequence; their channel order is the
+// tie-breaker and consumers must not reorder equal-sequence observations.
 // Sequence reports an effective order key: raw ReceiveSequence is preserved
 // for protocol facts, while observations without transport sequence receive a
 // strictly increasing adapter-owned key.

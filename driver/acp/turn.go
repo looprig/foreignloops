@@ -88,8 +88,15 @@ const (
 // closed and every send is guarded by done.
 type turnHandle struct {
 	commands chan steerCommand
-	rejects  chan steerCommand
 	done     <-chan struct{}
+	lane     *steerObservationLane
+}
+
+func (h *turnHandle) reserveSteer() (*steerObservationReservation, bool) {
+	if h == nil || h.lane == nil {
+		return nil, false
+	}
+	return h.lane.reserve()
 }
 
 func (h *turnHandle) send(ctx context.Context, command steerCommand) bool {
@@ -106,18 +113,32 @@ func (h *turnHandle) send(ctx context.Context, command steerCommand) bool {
 		return false
 	default:
 	}
-	// A canceled caller has no steering attempt to observe. Check before the
-	// mailbox send so an already-canceled context cannot enqueue work that may
-	// later reach the ACP dispatcher.
-	if ctx.Err() != nil {
-		return false
-	}
-	select {
-	case h.commands <- command:
-	case <-h.done:
-		return false
-	case <-ctx.Done():
-		return false
+	// Reserved steering calls use a nonblocking mailbox admission. This keeps
+	// the reservation lane a bounded pre-acceptance contract even when the
+	// arbiter is blocked behind a saturated non-steer projection. Cancellation
+	// is represented by the attempt state and is still observed exactly once.
+	if command.reservation != nil {
+		select {
+		case h.commands <- command:
+		case <-h.done:
+			return false
+		default:
+			return false
+		}
+	} else {
+		// A canceled caller has no steering attempt to observe for unreserved
+		// compatibility sends. Keep this path for the narrow internal tests and
+		// legacy callers that do not participate in the reservation lane.
+		if ctx.Err() != nil {
+			return false
+		}
+		select {
+		case h.commands <- command:
+		case <-h.done:
+			return false
+		case <-ctx.Done():
+			return false
+		}
 	}
 	// Once the command entered the mailbox, caller cancellation only stops
 	// waiting for its reply. The arbiter must either acknowledge ownership or
@@ -136,27 +157,13 @@ func (h *turnHandle) send(ctx context.Context, command steerCommand) bool {
 	}
 }
 
-// rejectSteer routes a proven pre-admission caller rejection into the arbiter
-// as a local observation. It never enters the ordinary command mailbox and
-// therefore cannot reach ACP transport.
-func (h *turnHandle) rejectSteer(result driver.SteerResult, err error) {
-	if h == nil || h.rejects == nil {
-		return
-	}
-	command := steerCommand{localResult: &steerReply{result: result, err: err}}
-	select {
-	case h.rejects <- command:
-	case <-h.done:
-	}
-}
-
 type steerCommand struct {
 	ctx         context.Context
 	request     driver.SteerRequest
 	reply       chan steerReply
 	accepted    chan struct{}
 	attempt     *steerAttempt
-	localResult *steerReply
+	reservation *steerObservationReservation
 }
 
 type steerReply struct {
@@ -284,8 +291,8 @@ func (d *Driver) Spawn(ctx context.Context, turn driver.Turn) (driver.Stream, er
 	// the arbiter, while done retires buffered stale sends at terminal close.
 	handle := &turnHandle{
 		commands: make(chan steerCommand, 512),
-		rejects:  make(chan steerCommand, 64),
 		done:     handleDone,
+		lane:     newSteerObservationLane(steeringObservationCapacity),
 	}
 	s := &stream{
 		projection: projectionOwner,
@@ -358,7 +365,6 @@ func (d *Driver) runTurn(
 		barrier:    barrier,
 		dispatcher: dispatcher,
 		commands:   streamState.handle.commands,
-		rejects:    streamState.handle.rejects,
 		state:      &translationState{},
 		pending:    make([]arbObservation, 0, 32),
 		steers:     make(map[uint64]steerCommand),
@@ -374,6 +380,7 @@ func (d *Driver) runTurn(
 	// before cleanup so callers racing terminal publication cannot strand on a
 	// mailbox with no consumer.
 	close(handleDone)
+	streamState.handle.lane.close()
 
 	// The arbiter has stopped accepting commands. Close the handle's done
 	// signal before clearing Driver.active, so any stale caller is guaranteed to
@@ -479,6 +486,7 @@ type arbObservation struct {
 	local       bool
 	reply       chan steerReply
 	result      steerReply
+	reservation *steerObservationReservation
 }
 
 type turnArbiter struct {
@@ -490,7 +498,6 @@ type turnArbiter struct {
 	projection *projection
 	handle     *turnHandle
 	commands   <-chan steerCommand
-	rejects    <-chan steerCommand
 	updates    <-chan client.Update
 	promptDone <-chan promptOutcome
 
@@ -517,6 +524,7 @@ type turnArbiter struct {
 }
 
 func (a *turnArbiter) run() {
+	defer a.releaseReservations()
 	for {
 		select {
 		case <-a.driverCtx.Done():
@@ -529,7 +537,6 @@ func (a *turnArbiter) run() {
 			return
 		}
 		a.drainQueuedCommands()
-		a.drainRejectedSteers()
 		if a.prompt != nil && !a.terminalAsked {
 			a.beginTerminal()
 		}
@@ -549,7 +556,7 @@ func (a *turnArbiter) run() {
 		if a.tryEmit() {
 			continue
 		}
-		if a.prompt != nil && a.terminalAsked && a.terminalReady && a.updatesDrained && len(a.steers) == 0 && len(a.pending) == 0 && len(a.rejects) == 0 && !a.barrierBusy {
+		if a.prompt != nil && a.terminalAsked && a.terminalReady && a.updatesDrained && len(a.steers) == 0 && len(a.pending) == 0 && !a.barrierBusy {
 			a.emitPromptTerminal(*a.prompt)
 			return
 		}
@@ -577,14 +584,6 @@ func (a *turnArbiter) run() {
 			}
 			a.acknowledgeCommand(command)
 			a.acceptSteer(command)
-		case command, ok := <-a.rejects:
-			if !ok {
-				a.rejects = nil
-				continue
-			}
-			if command.localResult != nil {
-				a.queueLocalSteer(command, command.localResult.result, command.localResult.err)
-			}
 		case outcome := <-a.promptDone:
 			a.promptDone = nil
 			a.prompt = &outcome
@@ -636,23 +635,24 @@ func (a *turnArbiter) drainQueuedCommands() {
 	}
 }
 
-func (a *turnArbiter) drainRejectedSteers() {
-	for a.rejects != nil {
-		select {
-		case command := <-a.rejects:
-			if command.localResult != nil {
-				a.queueLocalSteer(command, command.localResult.result, command.localResult.err)
-			}
-		default:
-			return
-		}
-	}
-}
-
 func (a *turnArbiter) acknowledgeCommand(command steerCommand) {
 	if command.accepted != nil {
 		close(command.accepted)
 	}
+}
+
+func (a *turnArbiter) releaseReservations() {
+	if a == nil {
+		return
+	}
+	for id, command := range a.steers {
+		delete(a.steers, id)
+		command.reservation.release()
+	}
+	for _, candidate := range a.pending {
+		candidate.reservation.release()
+	}
+	a.pending = nil
 }
 
 func (a *turnArbiter) acceptUpdate(update client.Update) {
@@ -673,14 +673,23 @@ func (a *turnArbiter) acceptUpdate(update client.Update) {
 
 func (a *turnArbiter) acceptSteer(command steerCommand) {
 	if command.reply == nil {
+		command.reservation.release()
 		return
 	}
 	if command.attempt == nil {
 		command.attempt = &steerAttempt{}
 	}
 	if command.ctx != nil && command.ctx.Err() != nil {
-		command.attempt.markAdmission(false)
+		command.attempt.cancelAndSnapshot()
 		a.queueLocalSteer(command, driver.SteerResult{Outcome: driver.SteerOutcomeFallbackRequired}, command.ctx.Err())
+		return
+	}
+	if admission := command.attempt.snapshot(); admission != steerAdmissionPending {
+		if admission == steerAdmissionAdmitted || admission == steerAdmissionPendingWriter {
+			a.queueLocalSteer(command, driver.SteerResult{Outcome: driver.SteerOutcomeAdmissionUnknown}, errors.New("acp: steering admission unresolved"))
+			return
+		}
+		a.queueLocalSteer(command, driver.SteerResult{Outcome: driver.SteerOutcomeFallbackRequired}, errors.New("acp: steering canceled before start"))
 		return
 	}
 	if err := command.request.Validate(); err != nil {
@@ -721,6 +730,7 @@ func (a *turnArbiter) queueLocalSteer(command steerCommand, result driver.SteerR
 		local:       result.ReceiveSequence == 0,
 		reply:       command.reply,
 		result:      steerReply{result: result, err: err},
+		reservation: command.reservation,
 	})
 }
 
@@ -738,21 +748,9 @@ func (a *turnArbiter) acceptDispatcherEvent(event dispatcherEvent) {
 	}
 	if event.late {
 		delete(a.steers, event.id)
-		a.disableSteering()
-		admitted := event.writeAdmitted || event.result.WriteAdmitted
-		outcome := driver.SteerOutcomeFallbackRequired
-		if !event.admissionKnown && event.admissionPossible {
-			// A started ACP attempt has not published admission yet. Preserve
-			// the conservative unknown classification, but only when the
-			// attempt state proves delivery was possible.
-			admitted = true
-			outcome = driver.SteerOutcomeDeliveryUnknown
-		} else if event.admissionKnown && admitted {
-			outcome = driver.SteerOutcomeDeliveryUnknown
-		}
-		result := driver.SteerResult{
-			Outcome:       outcome,
-			WriteAdmitted: admitted,
+		result := lateSteerResult(event.admission, event.result)
+		if result.Outcome == driver.SteerOutcomeDeliveryUnknown || result.Outcome == driver.SteerOutcomeAdmissionUnknown {
+			a.disableSteering()
 		}
 		err := event.err
 		if err == nil {
@@ -764,6 +762,7 @@ func (a *turnArbiter) acceptDispatcherEvent(event dispatcherEvent) {
 			local:       true,
 			reply:       command.reply,
 			result:      steerReply{result: result, err: err},
+			reservation: command.reservation,
 		})
 		return
 	}
@@ -771,14 +770,26 @@ func (a *turnArbiter) acceptDispatcherEvent(event dispatcherEvent) {
 	if a.terminalAsked && len(a.steers) == 0 {
 		a.maybeRequestPromptBarrier()
 	}
-	eventResult := event.result
-	if !event.admissionKnown && event.admissionPossible && !eventResult.WriteAdmitted {
-		// The result/error arrived before the separate Admission signal. The
-		// active attempt makes delivery possible, so do not misclassify an
-		// admitted transport failure as a safe fallback.
+	var normalized driver.SteerResult
+	var err error
+	switch event.admission {
+	case steerAdmissionPending, steerAdmissionPendingWriter:
+		// StartSteer was invoked (or is still in the linearization window),
+		// but no positive writer fact exists. Keep the admission bit false and
+		// discard transport sequence aliases that would imply admission.
+		normalized = driver.SteerResult{Outcome: driver.SteerOutcomeAdmissionUnknown, Reason: event.result.Reason}
+		err = event.err
+		if err == nil {
+			err = errors.New("acp: steering admission unresolved")
+		}
+	case steerAdmissionNotAdmitted:
+		normalized = driver.SteerResult{Outcome: driver.SteerOutcomeFallbackRequired, Reason: event.result.Reason}
+		err = event.err
+	default:
+		eventResult := event.result
 		eventResult.WriteAdmitted = true
+		normalized, err = normalizeSteering(eventResult, event.err)
 	}
-	normalized, err := normalizeSteering(eventResult, event.err)
 	if normalized.Outcome == driver.SteerOutcomeDeliveryUnknown || normalized.Outcome == driver.SteerOutcomeDeliveredUntrackable || steeringErrorGuaranteesNoDelivery(event.err) {
 		a.disableSteering()
 	}
@@ -788,7 +799,19 @@ func (a *turnArbiter) acceptDispatcherEvent(event dispatcherEvent) {
 		local:       normalized.ReceiveSequence == 0,
 		reply:       command.reply,
 		result:      steerReply{result: normalized, err: err},
+		reservation: command.reservation,
 	})
+}
+
+func lateSteerResult(admission steerAdmission, result client.SteerResult) driver.SteerResult {
+	switch admission {
+	case steerAdmissionAdmitted:
+		return driver.SteerResult{Outcome: driver.SteerOutcomeDeliveryUnknown, WriteAdmitted: true}
+	case steerAdmissionNotAdmitted:
+		return driver.SteerResult{Outcome: driver.SteerOutcomeFallbackRequired}
+	default:
+		return driver.SteerResult{Outcome: driver.SteerOutcomeAdmissionUnknown}
+	}
 }
 
 func (a *turnArbiter) disableSteering() {
@@ -983,7 +1006,11 @@ func hasPositivePending(pending []arbObservation) bool {
 func (a *turnArbiter) emitObservation(candidate arbObservation) {
 	observation, events := candidate.observation, candidate.events
 	if observation == nil {
+		candidate.reservation.release()
 		return
+	}
+	if _, ok := observation.(driver.SteerObservation); ok {
+		defer candidate.reservation.release()
 	}
 	var ready <-chan struct{}
 	if typed, ok := observation.(driver.UpdateObservation); ok {
@@ -1043,18 +1070,18 @@ func (a *turnArbiter) failSequenceRegression() {
 	}
 	a.failed = true
 	a.disableSteering()
-	failure := steerReply{
-		result: driver.SteerResult{Outcome: driver.SteerOutcomeDeliveryUnknown, WriteAdmitted: true},
-		err:    errors.New("acp update order invalid"),
-	}
+	failureErr := errors.New("acp update order invalid")
 	for id, command := range a.steers {
 		delete(a.steers, id)
+		failure := steerReply{result: sequenceFailureResult(command.attempt), err: failureErr}
 		a.projection.emitObservation(driver.SteerObservation{SteerResult: failure.result, Err: failure.err})
+		command.reservation.release()
 		if command.reply != nil {
 			command.reply <- failure
 		}
 	}
 	for _, candidate := range a.pending {
+		candidate.reservation.release()
 		if candidate.reply != nil {
 			a.projection.emitObservation(candidate.observation)
 			candidate.reply <- candidate.result
@@ -1065,6 +1092,20 @@ func (a *turnArbiter) failSequenceRegression() {
 	// to make the sequence appear monotonic.
 	a.projection.emitEvent(driver.Event{Kind: driver.KindTerminalError, ErrText: "acp update order invalid"})
 	a.projection.emitObservation(driver.PromptObservation{Err: errors.New("acp update order invalid")})
+}
+
+func sequenceFailureResult(attempt *steerAttempt) driver.SteerResult {
+	if attempt == nil {
+		return driver.SteerResult{Outcome: driver.SteerOutcomeAdmissionUnknown}
+	}
+	switch attempt.snapshot() {
+	case steerAdmissionAdmitted:
+		return driver.SteerResult{Outcome: driver.SteerOutcomeDeliveryUnknown, WriteAdmitted: true}
+	case steerAdmissionNotAdmitted:
+		return driver.SteerResult{Outcome: driver.SteerOutcomeFallbackRequired}
+	default:
+		return driver.SteerResult{Outcome: driver.SteerOutcomeAdmissionUnknown}
+	}
 }
 
 func waitForUpdatesThrough(ctx context.Context, sess turnSession, sequence uint64) error {

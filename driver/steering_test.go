@@ -116,6 +116,7 @@ func TestSteerOutcomesAreClosedAndExact(t *testing.T) {
 		{SteerOutcomeInjected, "injected"},
 		{SteerOutcomeFallbackRequired, "fallback_required"},
 		{SteerOutcomeUnsupported, "unsupported"},
+		{SteerOutcomeAdmissionUnknown, "admission_unknown"},
 		{SteerOutcomeDeliveryUnknown, "delivery_unknown"},
 		{SteerOutcomeDeliveredUntrackable, "delivered_untrackable"},
 	}
@@ -132,6 +133,16 @@ func TestSteerOutcomesAreClosedAndExact(t *testing.T) {
 	}
 	if err := (SteerResult{Outcome: SteerOutcome("future")}).Validate(); err == nil {
 		t.Fatal("SteerResult.Validate() error = nil for unknown outcome")
+	}
+	for _, outcome := range []SteerOutcome{SteerOutcomeInjected, SteerOutcomeAdmissionUnknown, SteerOutcomeDeliveryUnknown, SteerOutcomeDeliveredUntrackable} {
+		if outcome.RetrySafe() {
+			t.Errorf("%q is retry-safe; uncertain/lifecycle-breach outcome must not be retried", outcome)
+		}
+	}
+	for _, outcome := range []SteerOutcome{SteerOutcomeUnsupported, SteerOutcomeFallbackRequired} {
+		if !outcome.RetrySafe() {
+			t.Errorf("%q is not retry-safe; proven non-delivery must permit fallback", outcome)
+		}
 	}
 }
 
@@ -200,6 +211,9 @@ func TestSteerResultValidationEnforcesDeliveryFacts(t *testing.T) {
 		{name: "unknown not admitted", got: SteerResult{Outcome: SteerOutcomeDeliveryUnknown}, want: false},
 		{name: "unknown response without admission", got: SteerResult{Outcome: SteerOutcomeDeliveryUnknown, ReceiveSequence: 3, ResponseSequence: 3}, want: false},
 		{name: "unknown sequence mismatch", got: SteerResult{Outcome: SteerOutcomeDeliveryUnknown, WriteAdmitted: true, ReceiveSequence: 1, ResponseSequence: 2}, want: false},
+		{name: "admission unknown without admission", got: SteerResult{Outcome: SteerOutcomeAdmissionUnknown}, want: true},
+		{name: "admission unknown cannot claim admission", got: SteerResult{Outcome: SteerOutcomeAdmissionUnknown, WriteAdmitted: true}, want: false},
+		{name: "delivery unknown cannot omit admission", got: SteerResult{Outcome: SteerOutcomeDeliveryUnknown}, want: false},
 
 		{name: "untrackable admitted response", got: SteerResult{Outcome: SteerOutcomeDeliveredUntrackable, WriteAdmitted: true, ReceiveSequence: 4, ResponseSequence: 4}, want: true},
 		{name: "untrackable not admitted", got: SteerResult{Outcome: SteerOutcomeDeliveredUntrackable, ReceiveSequence: 4, ResponseSequence: 4}, want: false},

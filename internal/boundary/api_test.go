@@ -23,14 +23,14 @@ func TestBackendAndDriverPublicTopLevelSymbols(t *testing.T) {
 			name: "driver",
 			dir:  filepath.Join(root, "driver"),
 			want: []string{
-				"Agent", "Closer", "DecodeError", "Event", "ExitError", "History", "HistoryError",
+				"Agent", "Closer", "DecodeError", "ErrSteerAdmissionCapacity", "Event", "ExitError", "History", "HistoryError",
 				"Kind", "KindInit", "KindModelFacingError", "KindStepComplete", "KindTerminalError", "KindTerminalOK",
 				"KindTextDelta", "KindThinkingDelta", "KindToolResult", "KindToolUse",
 				"Observation", "ObservationKind", "ObservationPrompt", "ObservationSteer", "ObservationUpdate",
 				"OrderedStream", "PermissionPosture", "Posture", "PostureAcceptEdits", "PostureDefault", "PostureReadOnly",
-				"PostureWorkspaceWrite", "PromptObservation", "SpawnError", "SteerObservation", "SteerOutcome",
+				"PostureWorkspaceWrite", "PromptObservation", "SpawnError", "SteerAdmissionError", "SteerObservation", "SteerOutcome",
 				"SteerOutcomeDeliveredUntrackable", "SteerOutcomeDeliveryUnknown", "SteerOutcomeFallbackRequired",
-				"SteerOutcomeInjected", "SteerOutcomeUnsupported", "SteerRequest", "SteerResult", "Steerer",
+				"SteerOutcomeAdmissionUnknown", "SteerOutcomeInjected", "SteerOutcomeUnsupported", "SteerRequest", "SteerResult", "Steerer",
 				"Stream", "Turn", "UpdateObservation", "NewSteerRequest",
 			},
 		},
@@ -64,7 +64,7 @@ func TestPublicErrorOwnershipSets(t *testing.T) {
 	t.Parallel()
 	root := filepath.Clean(filepath.Join("..", ".."))
 	want := map[string][]string{
-		"driver":        {"DecodeError", "ExitError", "HistoryError", "SpawnError"},
+		"driver":        {"DecodeError", "ExitError", "HistoryError", "SpawnError", "SteerAdmissionError"},
 		"driver/claude": {"ConfigError", "PathError", "PlatformError", "SpawnConfigError", "WrapError"},
 		"driver/codex":  {"ConfigError", "PlatformError", "SpawnConfigError"},
 		"backend": {

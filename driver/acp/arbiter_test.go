@@ -486,7 +486,7 @@ func TestSteerDispatcherQueuedTerminalResolvesWithoutStartingQueuedCall(t *testi
 		case event := <-dispatcher.Events():
 			if event.id == 2 {
 				seenQueued = true
-				if event.err == nil || event.writeAdmitted {
+				if event.err == nil || event.admission != steerAdmissionNotAdmitted {
 					t.Fatalf("queued event = %#v, want pre-admission terminal resolution", event)
 				}
 			}
@@ -502,7 +502,7 @@ func TestSteerDispatcherQueuedTerminalResolvesWithoutStartingQueuedCall(t *testi
 	}
 }
 
-func TestSteerCallerDeadlineIgnoresLateResultAndPublishesUnknown(t *testing.T) {
+func TestSteerCallerDeadlineWithAdmissionBlockedPublishesAdmissionUnknown(t *testing.T) {
 	sess := &steeringSession{scriptedSession: newScriptedSession("caller-deadline")}
 	steerRelease := make(chan struct{})
 	promptRelease := make(chan struct{})
@@ -527,8 +527,8 @@ func TestSteerCallerDeadlineIgnoresLateResultAndPublishesUnknown(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
 	result, steerErr := d.Steer(ctx, request)
 	cancel()
-	if steerErr == nil || result.Outcome != driver.SteerOutcomeDeliveryUnknown {
-		t.Fatalf("Steer() = %#v, %v, want caller deadline unknown", result, steerErr)
+	if steerErr == nil || result.Outcome != driver.SteerOutcomeAdmissionUnknown || result.WriteAdmitted {
+		t.Fatalf("Steer() = %#v, %v, want caller deadline admission_unknown without fabricated admission", result, steerErr)
 	}
 	close(steerRelease)
 	close(promptRelease)
@@ -536,13 +536,53 @@ func TestSteerCallerDeadlineIgnoresLateResultAndPublishesUnknown(t *testing.T) {
 	for observation := range stream.(driver.OrderedStream).Observations() {
 		if steer, ok := observation.(driver.SteerObservation); ok {
 			steers++
-			if steer.Outcome != driver.SteerOutcomeDeliveryUnknown {
-				t.Fatalf("late steer observation = %#v, want unknown", steer)
+			if steer.Outcome != driver.SteerOutcomeDeliveryUnknown || !steer.WriteAdmitted {
+				t.Fatalf("late steer observation = %#v, want delivery_unknown after admitted late result", steer)
 			}
 		}
 	}
 	if steers != 1 {
 		t.Fatalf("steer observations = %d, want exactly one", steers)
+	}
+}
+
+func TestSteerCallerDeadlineLateExplicitNotAdmittedFallsBackWithoutTrue(t *testing.T) {
+	sess := &steeringSession{scriptedSession: newScriptedSession("late-not-admitted")}
+	steerRelease := make(chan struct{})
+	sess.steerHook = func(context.Context, client.SteerParams) (client.SteerResult, error) {
+		<-steerRelease
+		return client.SteerResult{Outcome: client.SteerOutcomePromptRequired}, nil
+	}
+	d := newTurnTestDriver(sess.scriptedSession)
+	d.session, d.steeringOn = sess, true
+	stream, err := d.Spawn(context.Background(), driver.Turn{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request, err := driver.NewSteerRequest([]content.Block{&content.TextBlock{Text: "late false"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+	result, steerErr := d.Steer(ctx, request)
+	cancel()
+	if steerErr == nil || result.Outcome != driver.SteerOutcomeAdmissionUnknown || result.WriteAdmitted {
+		t.Fatalf("caller result = %#v, %v, want admission_unknown without admission", result, steerErr)
+	}
+	close(steerRelease)
+	var found bool
+	for observation := range stream.(driver.OrderedStream).Observations() {
+		steer, ok := observation.(driver.SteerObservation)
+		if !ok {
+			continue
+		}
+		found = true
+		if steer.Outcome != driver.SteerOutcomeFallbackRequired || steer.WriteAdmitted {
+			t.Fatalf("late observation = %#v, want fallback without admission", steer)
+		}
+	}
+	if !found {
+		t.Fatal("late explicit not-admitted result produced no steer observation")
 	}
 }
 
@@ -580,5 +620,349 @@ func TestArbiterPositiveSequenceRegressionFailsClosed(t *testing.T) {
 	}
 	if !found {
 		t.Fatal("sequence regression did not produce a fail-closed prompt observation")
+	}
+}
+
+func TestSteerAdmissionStateNamesAndFailureClassification(t *testing.T) {
+	states := []struct {
+		state steerAdmission
+		name  string
+	}{
+		{steerAdmissionPending, "pending"},
+		{steerAdmissionNotAdmitted, "not_admitted"},
+		{steerAdmissionPendingWriter, "admission_pending"},
+		{steerAdmissionAdmitted, "admitted"},
+	}
+	for _, tt := range states {
+		if got := tt.state.String(); got != tt.name {
+			t.Errorf("steerAdmission(%d).String() = %q, want %q", tt.state, got, tt.name)
+		}
+	}
+
+	tests := []struct {
+		state steerAdmission
+		want  driver.SteerOutcome
+		admit bool
+	}{
+		{steerAdmissionPending, driver.SteerOutcomeAdmissionUnknown, false},
+		{steerAdmissionNotAdmitted, driver.SteerOutcomeFallbackRequired, false},
+		{steerAdmissionPendingWriter, driver.SteerOutcomeAdmissionUnknown, false},
+		{steerAdmissionAdmitted, driver.SteerOutcomeDeliveryUnknown, true},
+	}
+	for _, tt := range tests {
+		got := lateSteerResult(tt.state, client.SteerResult{})
+		if got.Outcome != tt.want || got.WriteAdmitted != tt.admit {
+			t.Errorf("lateSteerResult(%s) = %#v, want %s admitted=%t", tt.state, got, tt.want, tt.admit)
+		}
+		if err := got.Validate(); err != nil {
+			t.Errorf("lateSteerResult(%s) invalid: %v", tt.state, err)
+		}
+	}
+}
+
+func TestSteerAttemptCancellationLinearizesBeforeStart(t *testing.T) {
+	attempt := &steerAttempt{}
+	if got := attempt.cancelAndSnapshot(); got != steerAdmissionNotAdmitted {
+		t.Fatalf("cancelAndSnapshot() = %s, want not_admitted", got)
+	}
+	if attempt.beginStart() {
+		t.Fatal("beginStart() won after cancellation sealed pending admission")
+	}
+	if got := attempt.snapshot(); got != steerAdmissionNotAdmitted {
+		t.Fatalf("snapshot after canceled start = %s, want not_admitted", got)
+	}
+}
+
+func TestSteerAttemptStartWinsAdmissionPendingWithoutFabricatingTrue(t *testing.T) {
+	attempt := &steerAttempt{}
+	if !attempt.beginStart() {
+		t.Fatal("beginStart() did not claim pending attempt")
+	}
+	if got := attempt.cancelAndSnapshot(); got != steerAdmissionPendingWriter {
+		t.Fatalf("cancelAndSnapshot() = %s, want admission_pending", got)
+	}
+	result := callerTimeoutSteerResult(attempt)
+	if result.Outcome != driver.SteerOutcomeAdmissionUnknown || result.WriteAdmitted {
+		t.Fatalf("caller timeout result = %#v, want admission_unknown without admission", result)
+	}
+	if err := result.Validate(); err != nil {
+		t.Fatalf("caller timeout result invalid: %v", err)
+	}
+}
+
+func TestSequenceFailureNeverFabricatesAdmission(t *testing.T) {
+	pending := &steerAttempt{}
+	if !pending.beginStart() {
+		t.Fatal("beginStart() failed")
+	}
+	if got := sequenceFailureResult(pending); got.Outcome != driver.SteerOutcomeAdmissionUnknown || got.WriteAdmitted {
+		t.Fatalf("pending sequence failure = %#v, want admission_unknown without admission", got)
+	}
+	admitted := &steerAttempt{}
+	if !admitted.beginStart() {
+		t.Fatal("beginStart() failed for admitted attempt")
+	}
+	admitted.markAdmission(true)
+	if got := sequenceFailureResult(admitted); got.Outcome != driver.SteerOutcomeDeliveryUnknown || !got.WriteAdmitted {
+		t.Fatalf("admitted sequence failure = %#v, want delivery_unknown with admission", got)
+	}
+}
+
+func TestSteerDispatcherCanceledBeforeStartDoesNotInvokeProvider(t *testing.T) {
+	sess := &steeringSession{scriptedSession: newScriptedSession("cancel-before-start")}
+	var calls atomic.Int32
+	sess.steerHook = func(context.Context, client.SteerParams) (client.SteerResult, error) {
+		calls.Add(1)
+		return client.SteerResult{Outcome: client.SteerOutcomeInjected, WriteAdmitted: true, ReceiveSequence: 1, ResponseSequence: 1}, nil
+	}
+	dispatcher := newSteerDispatcher(context.Background(), sess)
+	attempt := &steerAttempt{}
+	if got := attempt.cancelAndSnapshot(); got != steerAdmissionNotAdmitted {
+		t.Fatalf("cancelAndSnapshot() = %s, want not_admitted", got)
+	}
+	if !dispatcher.submit(steerJob{
+		id:      1,
+		ctx:     context.Background(),
+		attempt: attempt,
+		params: client.SteerParams{Prompt: []protocol.ContentBlock{{
+			Text: &protocol.TextContent{Text: "must not send"},
+		}}},
+	}) {
+		t.Fatal("dispatcher.submit() failed")
+	}
+	defer dispatcher.stop()
+	select {
+	case event := <-dispatcher.Events():
+		if event.admission != steerAdmissionNotAdmitted {
+			t.Fatalf("canceled-before-start event admission = %s, want not_admitted", event.admission)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("canceled-before-start event did not arrive")
+	}
+	if got := calls.Load(); got != 0 {
+		t.Fatalf("provider calls = %d, want zero after cancellation won", got)
+	}
+}
+
+func TestSteerAdmissionCancelStartRaceAlwaysSealsState(t *testing.T) {
+	for i := 0; i < 1000; i++ {
+		attempt := &steerAttempt{}
+		start := make(chan struct{})
+		var cancelState, startWon bool
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			<-start
+			cancelState = attempt.cancelAndSnapshot() == steerAdmissionNotAdmitted
+		}()
+		go func() {
+			defer wg.Done()
+			<-start
+			startWon = attempt.beginStart()
+		}()
+		close(start)
+		wg.Wait()
+		state := attempt.snapshot()
+		if state == steerAdmissionPending {
+			t.Fatalf("iteration %d left attempt pending after cancel/start race", i)
+		}
+		if state == steerAdmissionNotAdmitted && startWon {
+			t.Fatalf("iteration %d both start and cancellation claimed the attempt", i)
+		}
+		if state == steerAdmissionPendingWriter && cancelState {
+			t.Fatalf("iteration %d cancellation reported not-admitted after start won", i)
+		}
+	}
+}
+
+func TestSteerObservationLaneCapacityAndClose(t *testing.T) {
+	lane := newSteerObservationLane(1)
+	first, ok := lane.reserve()
+	if !ok || first == nil {
+		t.Fatal("first reservation failed")
+	}
+	if _, ok := lane.reserve(); ok {
+		t.Fatal("reservation lane accepted beyond fixed capacity")
+	}
+	if got := lane.inUse(); got != 1 {
+		t.Fatalf("lane in-use = %d, want 1", got)
+	}
+	first.release()
+	first.release()
+	if got := lane.inUse(); got != 0 {
+		t.Fatalf("lane in-use after idempotent release = %d, want 0", got)
+	}
+	second, ok := lane.reserve()
+	if !ok || second == nil {
+		t.Fatal("reservation lane did not reuse released slot")
+	}
+	lane.close()
+	second.release()
+	if got := lane.inUse(); got != 0 {
+		t.Fatalf("lane in-use after close = %d, want 0", got)
+	}
+	if _, ok := lane.reserve(); ok {
+		t.Fatal("closed reservation lane accepted a new reservation")
+	}
+}
+
+func TestCanceledAcceptedSteerSurvivesSaturatedNonSteerProjection(t *testing.T) {
+	sess := &steeringSession{scriptedSession: newScriptedSession("saturated-non-steer")}
+	promptRelease := make(chan struct{})
+	sess.promptHook = func(int, []protocol.ContentBlock) (*client.PromptResult, error) {
+		<-promptRelease
+		return &client.PromptResult{StopReason: protocol.StopReasonEndTurn}, nil
+	}
+	d := newTurnTestDriver(sess.scriptedSession)
+	d.session, d.steeringOn = sess, true
+	stream, err := d.Spawn(context.Background(), driver.Turn{})
+	if err != nil {
+		t.Fatalf("Spawn() error = %v", err)
+	}
+	ordered, ok := stream.(*orderedStream)
+	if !ok {
+		t.Fatalf("Spawn() stream = %T, want ordered stream", stream)
+	}
+	p := ordered.stream.projection
+	observations := ordered.Observations()
+	budget := cap(p.observations)*2 + cap(p.commands)
+	accepted := make(chan struct{}, budget+1)
+	producerDone := make(chan struct{})
+	go func() {
+		defer close(producerDone)
+		for i := 0; i < budget+1; i++ {
+			p.emitObservation(driver.UpdateObservation{})
+			accepted <- struct{}{}
+		}
+	}()
+	for i := 0; i < budget; i++ {
+		select {
+		case <-accepted:
+		case <-time.After(2 * time.Second):
+			t.Fatalf("only %d/%d non-steer observations were accepted", i, budget)
+		}
+	}
+	select {
+	case <-accepted:
+		t.Fatal("non-steer projection accepted beyond its bounded budget")
+	case <-time.After(25 * time.Millisecond):
+	}
+
+	request, err := driver.NewSteerRequest([]content.Block{&content.TextBlock{Text: "cancel while saturated"}})
+	if err != nil {
+		t.Fatalf("NewSteerRequest() error = %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	result, steerErr := d.Steer(ctx, request)
+	if !errors.Is(steerErr, context.Canceled) || result.Outcome != driver.SteerOutcomeFallbackRequired || result.WriteAdmitted {
+		t.Fatalf("canceled saturated steer = %#v, %v, want fallback without admission", result, steerErr)
+	}
+
+	var steerCount atomic.Int32
+	drainDone := make(chan struct{})
+	go func() {
+		defer close(drainDone)
+		for observation := range observations {
+			if _, ok := observation.(driver.SteerObservation); ok {
+				steerCount.Add(1)
+			}
+		}
+	}()
+	close(promptRelease)
+	select {
+	case <-producerDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("saturated non-steer producer did not finish after drain")
+	}
+	select {
+	case <-drainDone:
+	case <-time.After(3 * time.Second):
+		t.Fatal("ordered stream did not close after draining saturated projection")
+	}
+	if got := steerCount.Load(); got != 1 {
+		t.Fatalf("steering observations = %d, want exactly one for accepted canceled steer", got)
+	}
+}
+
+func TestSteerReservationExhaustionRejectsBeforeACP(t *testing.T) {
+	sess := &steeringSession{scriptedSession: newScriptedSession("reservation-exhausted")}
+	promptRelease := make(chan struct{})
+	var providerCalls atomic.Int32
+	sess.steerHook = func(context.Context, client.SteerParams) (client.SteerResult, error) {
+		providerCalls.Add(1)
+		return client.SteerResult{Outcome: client.SteerOutcomeInjected, WriteAdmitted: true, ReceiveSequence: 1, ResponseSequence: 1}, nil
+	}
+	sess.promptHook = func(int, []protocol.ContentBlock) (*client.PromptResult, error) {
+		<-promptRelease
+		return &client.PromptResult{StopReason: protocol.StopReasonEndTurn}, nil
+	}
+	d := newTurnTestDriver(sess.scriptedSession)
+	d.session, d.steeringOn = sess, true
+	stream, err := d.Spawn(context.Background(), driver.Turn{})
+	if err != nil {
+		t.Fatalf("Spawn() error = %v", err)
+	}
+	lane := d.activeHandle().lane
+	reservations := make([]*steerObservationReservation, 0, steeringObservationCapacity)
+	for i := 0; i < steeringObservationCapacity; i++ {
+		reservation, ok := lane.reserve()
+		if !ok {
+			t.Fatalf("reservation %d failed before configured capacity", i)
+		}
+		reservations = append(reservations, reservation)
+	}
+	request, err := driver.NewSteerRequest([]content.Block{&content.TextBlock{Text: "must reject"}})
+	if err != nil {
+		t.Fatalf("NewSteerRequest() error = %v", err)
+	}
+	result, steerErr := d.Steer(context.Background(), request)
+	var admissionErr *driver.SteerAdmissionError
+	if !errors.As(steerErr, &admissionErr) {
+		t.Fatalf("Steer() error = %v (%T), want SteerAdmissionError", steerErr, steerErr)
+	}
+	if result.Outcome != driver.SteerOutcomeFallbackRequired || result.WriteAdmitted {
+		t.Fatalf("Steer() result = %#v, want retry-safe fallback without admission", result)
+	}
+	if got := providerCalls.Load(); got != 0 {
+		t.Fatalf("provider steering calls = %d, want zero on reservation exhaustion", got)
+	}
+	for _, reservation := range reservations {
+		reservation.release()
+	}
+	close(promptRelease)
+	for range stream.(driver.OrderedStream).Observations() {
+	}
+}
+
+func TestSteerReservationCloseRaceReleasesOutstandingSlots(t *testing.T) {
+	for i := 0; i < 1000; i++ {
+		lane := newSteerObservationLane(1)
+		reservation, ok := lane.reserve()
+		if !ok {
+			t.Fatalf("iteration %d: initial reservation failed", i)
+		}
+		start := make(chan struct{})
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			<-start
+			reservation.release()
+		}()
+		go func() {
+			defer wg.Done()
+			<-start
+			lane.close()
+		}()
+		close(start)
+		wg.Wait()
+		if got := lane.inUse(); got != 0 {
+			t.Fatalf("iteration %d: lane in-use = %d after close race, want 0", i, got)
+		}
+		if _, ok := lane.reserve(); ok {
+			t.Fatalf("iteration %d: closed lane accepted reservation", i)
+		}
 	}
 }
