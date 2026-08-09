@@ -287,11 +287,13 @@ type Observation interface {
 // nondecreasing ReceiveSequence order. Multiple translated observations may
 // share one receive sequence; their channel order is the tie-breaker and
 // consumers must not reorder equal-sequence observations.
+// Sequence reports an effective order key: raw ReceiveSequence is preserved
+// for protocol facts, while observations without transport sequence receive a
+// strictly increasing adapter-owned key.
 type OrderedStream interface {
-	// Observations returns the stream-owned ordered observation channel. A
-	// supported implementation returns the same channel for the stream's
-	// lifetime; a stream without this capability simply does not implement
-	// OrderedStream.
+	// Observations returns the stream-owned ordered projection. A stream selects
+	// exactly one projection before production starts: legacy Events or this
+	// channel. The inactive projection is closed and carries no traffic.
 	Observations() <-chan Observation
 }
 
@@ -344,8 +346,7 @@ func (UpdateObservation) observation() {}
 // representation.
 type SteerObservation struct {
 	SteerResult
-	Err           error
-	OrderSequence uint64
+	Err error
 }
 
 func (SteerObservation) Kind() ObservationKind { return ObservationSteer }

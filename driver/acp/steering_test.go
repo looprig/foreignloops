@@ -455,10 +455,11 @@ func TestACPSteeringTerminalDoesNotWaitForUnboundedSteerCall(t *testing.T) {
 	steerDone := make(chan struct{})
 	go func() { _, _ = d.Steer(context.Background(), request); close(steerDone) }()
 	<-steerStarted
+	ordered := stream.(driver.OrderedStream).Observations()
 	select {
-	case _, ok := <-stream.Events():
+	case _, ok := <-ordered:
 		if !ok {
-			t.Fatal("Events closed before terminal event")
+			t.Fatal("ordered observations closed before terminal")
 		}
 	case <-time.After(500 * time.Millisecond):
 		t.Fatal("terminal event waited for unbounded Steer call")
@@ -552,7 +553,7 @@ func TestACPObservationsOnlyConsumerDoesNotBlockLegacyEvents(t *testing.T) {
 		return &client.PromptResult{StopReason: protocol.StopReasonEndTurn}, nil
 	}
 	d := newTurnTestDriver(sess.scriptedSession)
-	d.session = sess
+	d.session, d.steeringOn = sess, true
 	stream, err := d.Spawn(context.Background(), driver.Turn{})
 	if err != nil {
 		t.Fatalf("Spawn() error = %v", err)

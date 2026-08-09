@@ -98,18 +98,14 @@ type stream struct {
 	cancel       context.CancelFunc
 	steerIn      chan steerInput
 
-	mu                  sync.Mutex
-	closed              bool
-	selected            streamView
-	closedEvents        bool
-	closedObservations  bool
-	pendingEvents       []driver.Event
-	pendingObservations []driver.Observation
-	nextOrder           uint64
-	viewReady           chan struct{}
-	viewReadyOnce       sync.Once
-	steers              map[*steerCall]struct{}
-	terminal            bool
+	mu                 sync.Mutex
+	closed             bool
+	selected           streamView
+	closedEvents       bool
+	closedObservations bool
+	nextOrder          uint64
+	steers             map[*steerCall]struct{}
+	terminal           bool
 
 	once     sync.Once
 	closeErr error
@@ -177,14 +173,32 @@ func (d *Driver) Spawn(ctx context.Context, turn driver.Turn) (driver.Stream, er
 		cancel:       cancel,
 		steerIn:      make(chan steerInput, 512),
 		steers:       make(map[*steerCall]struct{}),
-		viewReady:    make(chan struct{}),
+	}
+	if d.steeringOn {
+		s.selected = viewObservations
+		close(s.events)
+		s.closedEvents = true
+	} else {
+		s.selected = viewEvents
+		close(s.observations)
+		s.closedObservations = true
 	}
 	d.activeMu.Lock()
 	d.active = s
 	d.activeMu.Unlock()
 	go d.runTurn(turnCtx, cancel, driverCtx, sess, turn, s, events, done)
+	if d.steeringOn {
+		return &orderedStream{stream: s}, nil
+	}
 	return s, nil
 }
+
+type orderedStream struct{ stream *stream }
+
+func (s *orderedStream) Events() <-chan driver.Event             { return nil }
+func (s *orderedStream) Observations() <-chan driver.Observation { return s.stream.Observations() }
+func (s *orderedStream) History() (driver.History, error)        { return s.stream.History() }
+func (s *orderedStream) Close() error                            { return s.stream.Close() }
 
 func (s *stream) registerSteer() (*steerCall, bool) {
 	s.mu.Lock()
@@ -203,9 +217,14 @@ func (s *stream) completeSteer(call *steerCall) bool {
 	if _, ok := s.steers[call]; !ok {
 		return false
 	}
+	if s.terminal {
+		return false
+	}
 	delete(s.steers, call)
 	return !call.finalized
 }
+
+func (s *stream) terminalSteer() bool { s.mu.Lock(); defer s.mu.Unlock(); return s.terminal }
 
 func (s *stream) holdTerminalSteers() []*steerCall {
 	s.mu.Lock()
@@ -347,10 +366,15 @@ func (d *Driver) runTurn(
 					// requests already admitted to this stream, but never wait for
 					// an ACP call still running in another goroutine: that call is
 					// bounded solely by its request context.
+					var deferredSteers []steerInput
 					for {
 						select {
 						case steer, ok := <-streamState.steerIn:
 							if !ok {
+								continue
+							}
+							if promptSeq := promptSequence(outcome); promptSeq != 0 && steer.observation.Sequence() > promptSeq {
+								deferredSteers = append(deferredSteers, steer)
 								continue
 							}
 							processSteerInput(driverCtx, turnCtx, sess, updates, &pendingUpdates, state, events, streamState, steer)
@@ -372,6 +396,10 @@ func (d *Driver) runTurn(
 					}
 					drainTurnUpdatesThrough(turnCtx, updates, &pendingUpdates, state, events, streamState, promptSequence(outcome))
 					emitPromptObservation(streamState, outcome)
+					for _, steer := range deferredSteers {
+						emitObservation(streamState, steer.observation)
+						close(steer.admitted)
+					}
 					sendPromptTerminal(turnCtx, streamState, events, state, outcome)
 					return
 				}
@@ -551,23 +579,6 @@ func sendTurnEvent(ctx context.Context, streamState *stream, events chan<- drive
 	}
 	streamState.mu.Lock()
 	selected := streamState.selected
-	if selected == viewUnselected {
-		if len(streamState.pendingEvents) >= 2048 {
-			streamState.mu.Unlock()
-			select {
-			case <-streamState.viewReady:
-			case <-ctx.Done():
-			}
-			if ctx.Err() != nil {
-				return
-			}
-			sendTurnEvent(ctx, streamState, events, event)
-			return
-		}
-		streamState.pendingEvents = append(streamState.pendingEvents, event)
-		streamState.mu.Unlock()
-		return
-	}
 	streamState.mu.Unlock()
 	if selected == viewObservations {
 		return
@@ -849,44 +860,12 @@ func (s *stream) Events() <-chan driver.Event {
 	if s == nil {
 		return nil
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.selected == viewUnselected {
-		s.selected = viewEvents
-		s.viewReadyOnce.Do(func() { close(s.viewReady) })
-		if !s.closed {
-			for _, event := range s.pendingEvents {
-				s.events <- event
-			}
-		}
-		s.pendingEvents = nil
-		if !s.closedObservations {
-			close(s.observations)
-			s.closedObservations = true
-		}
-	}
 	return s.events
 }
 
 func (s *stream) Observations() <-chan driver.Observation {
 	if s == nil {
 		return nil
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.selected == viewUnselected {
-		s.selected = viewObservations
-		s.viewReadyOnce.Do(func() { close(s.viewReady) })
-		if !s.closed {
-			for _, observation := range s.pendingObservations {
-				s.observations <- observation
-			}
-		}
-		s.pendingObservations = nil
-		if !s.closedEvents {
-			close(s.events)
-			s.closedEvents = true
-		}
 	}
 	return s.observations
 }
@@ -911,7 +890,11 @@ func emitObservation(streamState *stream, observation driver.Observation) {
 	}
 	streamState.mu.Lock()
 	selected := streamState.selected
-	if observation.Sequence() == 0 {
+	rawSequence := observation.Sequence()
+	if rawSequence > streamState.nextOrder {
+		streamState.nextOrder = rawSequence
+	}
+	if rawSequence == 0 {
 		streamState.nextOrder++
 		switch typed := observation.(type) {
 		case driver.PromptObservation:
@@ -921,26 +904,9 @@ func emitObservation(streamState *stream, observation driver.Observation) {
 			typed.OrderSequence = streamState.nextOrder
 			observation = typed
 		case driver.SteerObservation:
-			typed.OrderSequence = streamState.nextOrder
+			typed.SteerResult.OrderSequence = streamState.nextOrder
 			observation = typed
 		}
-	}
-	if selected == viewUnselected {
-		if len(streamState.pendingObservations) >= 2048 {
-			streamState.mu.Unlock()
-			select {
-			case <-streamState.viewReady:
-			case <-streamState.ctx.Done():
-			}
-			if streamState.ctx.Err() != nil {
-				return
-			}
-			emitObservation(streamState, observation)
-			return
-		}
-		streamState.pendingObservations = append(streamState.pendingObservations, observation)
-		streamState.mu.Unlock()
-		return
 	}
 	streamState.mu.Unlock()
 	if selected != viewObservations {

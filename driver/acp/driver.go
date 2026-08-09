@@ -354,10 +354,11 @@ func (d *Driver) Steer(ctx context.Context, request driver.SteerRequest) (driver
 	}
 
 	d.steeringMu.Lock()
-	defer d.steeringMu.Unlock()
+	steeringOn, steeringOff := d.steeringOn, d.steeringOff
+	d.steeringMu.Unlock()
 	active := d.activeStream()
 	unsupported := driver.SteerResult{Outcome: driver.SteerOutcomeUnsupported}
-	if !d.steeringOn || d.steeringOff || active == nil {
+	if !steeringOn || steeringOff || active == nil {
 		if active != nil {
 			d.admitSteer(ctx, active, driver.SteerObservation{SteerResult: unsupported})
 		}
@@ -386,10 +387,18 @@ func (d *Driver) Steer(ctx context.Context, request driver.SteerRequest) (driver
 	})
 	normalized, normalizedErr := normalizeSteering(result, callErr)
 	if normalized.Outcome == driver.SteerOutcomeDeliveryUnknown || normalized.Outcome == driver.SteerOutcomeDeliveredUntrackable || steeringErrorGuaranteesNoDelivery(callErr) {
+		d.steeringMu.Lock()
 		d.steeringOff = true
+		d.steeringMu.Unlock()
 	}
 	if active.completeSteer(call) {
 		d.admitSteer(ctx, active, driver.SteerObservation{SteerResult: normalized, Err: normalizedErr})
+	} else if active.terminalSteer() {
+		normalized = driver.SteerResult{Outcome: driver.SteerOutcomeDeliveryUnknown}
+		normalizedErr = errors.New("acp: steer completed after terminal resolution")
+		d.steeringMu.Lock()
+		d.steeringOff = true
+		d.steeringMu.Unlock()
 	}
 	return normalized, normalizedErr
 }
