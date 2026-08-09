@@ -31,6 +31,11 @@ type steerSession interface {
 	Steer(context.Context, client.SteerParams) (client.SteerResult, error)
 }
 
+type asyncSteerSession interface {
+	session
+	StartSteer(context.Context, client.SteerParams) *client.SteerHandle
+}
+
 // acpClient is the minimum client capability needed to create a driver
 // session. LoadSession is deliberately optional: a caller cannot resume
 // against a client that does not provide that capability.
@@ -380,11 +385,29 @@ func (d *Driver) Steer(ctx context.Context, request driver.SteerRequest) (driver
 		emitObservation(active, driver.SteerObservation{SteerResult: unsupported})
 		return unsupported, nil
 	}
-	result, callErr := sess.Steer(ctx, client.SteerParams{
+	params := client.SteerParams{
 		SessionID: sess.ID(),
 		Prompt:    prompt,
 		Meta:      json.RawMessage(steeringIdleMeta),
-	})
+	}
+	var result client.SteerResult
+	var callErr error
+	if async, ok := d.session.(asyncSteerSession); ok {
+		d.steeringMu.Lock()
+		call.setHandle(async.StartSteer(ctx, params))
+		admittedValue, admissionOK := <-call.handle.Admission()
+		call.setAdmission(true, admissionOK && admittedValue)
+		d.steeringMu.Unlock()
+		completion, resultOK := <-call.handle.Result()
+		if resultOK {
+			result, callErr = completion.Result, completion.Err
+		} else {
+			callErr = errors.New("acp: steering completion unavailable")
+		}
+	} else {
+		result, callErr = sess.Steer(ctx, params)
+		call.setAdmission(true, result.WriteAdmitted)
+	}
 	normalized, normalizedErr := normalizeSteering(result, callErr)
 	if normalized.Outcome == driver.SteerOutcomeDeliveryUnknown || normalized.Outcome == driver.SteerOutcomeDeliveredUntrackable || steeringErrorGuaranteesNoDelivery(callErr) {
 		d.steeringMu.Lock()
@@ -394,7 +417,11 @@ func (d *Driver) Steer(ctx context.Context, request driver.SteerRequest) (driver
 	if active.completeSteer(call) {
 		d.admitSteer(ctx, active, driver.SteerObservation{SteerResult: normalized, Err: normalizedErr})
 	} else if active.terminalSteer() {
-		normalized = driver.SteerResult{Outcome: driver.SteerOutcomeFallbackRequired, WriteAdmitted: false}
+		known, admitted := call.admission()
+		normalized = driver.SteerResult{Outcome: driver.SteerOutcomeDeliveryUnknown, WriteAdmitted: admitted}
+		if known && !admitted {
+			normalized.Outcome = driver.SteerOutcomeFallbackRequired
+		}
 		normalizedErr = errors.New("acp: steer completed after terminal resolution")
 		d.steeringMu.Lock()
 		d.steeringOff = true

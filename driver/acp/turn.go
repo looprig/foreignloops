@@ -125,8 +125,29 @@ type steerInput struct {
 }
 
 type steerCall struct {
-	admitted  chan struct{}
-	finalized bool
+	mu             sync.Mutex
+	admitted       chan struct{}
+	finalized      bool
+	writeAdmitted  bool
+	admissionKnown bool
+	handle         *client.SteerHandle
+}
+
+func (c *steerCall) setAdmission(known, admitted bool) {
+	c.mu.Lock()
+	c.admissionKnown, c.writeAdmitted = known, admitted
+	c.mu.Unlock()
+}
+func (c *steerCall) setHandle(h *client.SteerHandle) { c.mu.Lock(); c.handle = h; c.mu.Unlock() }
+func (c *steerCall) getHandle() *client.SteerHandle {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.handle
+}
+func (c *steerCall) admission() (bool, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.admissionKnown, c.writeAdmitted
 }
 
 // Spawn starts one prompt on the session created by New. The prompt itself is
@@ -235,6 +256,14 @@ func (s *stream) holdTerminalSteers() []*steerCall {
 	}
 	s.mu.Unlock()
 	return calls
+}
+
+func (s *stream) cancelPendingSteers(calls []*steerCall) {
+	for _, call := range calls {
+		if call.handle != nil {
+			call.handle.Cancel()
+		}
+	}
 }
 
 func (s *stream) finalizeSteer(call *steerCall) bool {
@@ -388,8 +417,16 @@ func (d *Driver) runTurn(
 						timer := time.NewTimer(100 * time.Millisecond)
 						<-timer.C
 						for _, call := range pendingCalls {
+							callOutcome := driver.SteerOutcomeDeliveryUnknown
+							known, admitted := call.admission()
+							if known && !admitted {
+								callOutcome = driver.SteerOutcomeFallbackRequired
+							}
+							if handle := call.getHandle(); handle != nil {
+								handle.Cancel()
+							}
 							if streamState.finalizeSteer(call) {
-								emitObservation(streamState, driver.SteerObservation{SteerResult: driver.SteerResult{Outcome: driver.SteerOutcomeFallbackRequired, WriteAdmitted: false}, Err: errors.New("acp: steer response unavailable")})
+								emitObservation(streamState, driver.SteerObservation{SteerResult: driver.SteerResult{Outcome: callOutcome, WriteAdmitted: admitted}, Err: errors.New("acp: steer response unavailable")})
 								close(call.admitted)
 							}
 						}
