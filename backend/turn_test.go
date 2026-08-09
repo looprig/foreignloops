@@ -496,6 +496,48 @@ func TestManagedQueueFIFOAndExactCapacity(t *testing.T) {
 	shutdown(t, state)
 }
 
+func TestManagedQueueFullPublicationFailureDoesNotAcknowledgeRejection(t *testing.T) {
+	t.Parallel()
+	sentinel := errors.New("queue rejection journal unavailable")
+	pub := &terminalFailurePublisher{failOn: "event.TurnRejected", err: sentinel}
+	agent := &queueAgent{spawned: make(chan queueSpawn, loop.ManagedInputQueueCapacity+1)}
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	state, _, err := New(ctx, mustID(t), mustID(t), loop.Provenance{}, pub, validBoundDefinition(), Config{Agent: agent, Cwd: t.TempDir(), SIDMode: SIDPrebound}, seqIDGen(), workingFac())
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	submit(t, state, "active")
+	_ = nextSpawn(t, agent)
+	for i := 0; i < loop.ManagedInputQueueCapacity; i++ {
+		if _, err := sendManaged(t, state, fmt.Sprintf("queued-%02d", i)); err != nil {
+			t.Fatalf("queue %d: %v", i, err)
+		}
+	}
+	overflowID := mustID(t)
+	accepted := make(chan error, 1)
+	state.Commands <- command.UserInput{
+		Header:       command.Header{CommandID: overflowID},
+		Blocks:       []content.Block{&content.TextBlock{Text: "overflow"}},
+		NoFold:       true,
+		TargetLoopID: state.loopID,
+		Accepted:     accepted,
+	}
+	if got := <-accepted; !errors.Is(got, sentinel) {
+		t.Fatalf("overflow acceptance = %v, want publication error %v", got, sentinel)
+	}
+	select {
+	case <-state.Done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("loop remained active after queue rejection publication failure")
+	}
+	for _, input := range pub.snapshot() {
+		if _, ok := input.(event.TurnRejected); ok {
+			t.Fatal("TurnRejected was published after checked publication failure")
+		}
+	}
+}
+
 func TestManagedQueueRunsAllAcceptedInputsFIFO(t *testing.T) {
 	t.Parallel()
 	agent := &queueAgent{spawned: make(chan queueSpawn, 3)}
@@ -655,6 +697,76 @@ func TestLateBoundLockLifecycleAndResume(t *testing.T) {
 		t.Fatalf("resume turn = %+v", turn)
 	}
 	shutdown(t, state)
+}
+
+func TestLateBoundSIDPersistsWhenInterruptDrainTimesOut(t *testing.T) {
+	agent := &fakeAgent{events: []driver.Event{{Kind: driver.KindTerminalOK}}}
+	hook := &recordingDeliveryHook{}
+	l, machine, _, cancel := newSteeringUnit(t, agent, hook)
+	t.Cleanup(cancel)
+	l.backendCfg.Cwd = t.TempDir()
+	l.cfg = validBoundDefinition()
+	factory := &manualSteeringTimerFactory{}
+	timerCreated := make(chan struct{}, 1)
+	machine.timerFactory = func(timeout time.Duration) steeringTimer {
+		timer := factory.new(timeout)
+		timerCreated <- struct{}{}
+		return timer
+	}
+	mailbox := make(chan turnObservation, 1)
+	mailbox <- turnObservation{event: event.ForeignSessionBound{ForeignSID: "learned"}}
+	result := make(chan turnOutcome)
+	ack := make(chan bool, 1)
+	activeID, turnID, stepID := mustID(t), mustID(t), mustID(t)
+	commandDone := make(chan struct {
+		done bool
+		exit bool
+	}, 1)
+	go func() {
+		done, exit := l.handleTurnCommand(
+			context.Background(), command.Interrupt{Ack: ack}, 1, activeID, turnID, stepID,
+			cancel, l.publisher(context.Background(), turnID, stepID), mailbox, result, machine,
+		)
+		commandDone <- struct {
+			done bool
+			exit bool
+		}{done: done, exit: exit}
+	}()
+	select {
+	case <-timerCreated:
+	case <-time.After(time.Second):
+		t.Fatal("interrupt drain did not arm bounded provider wait")
+	}
+	timers, _ := factory.snapshot()
+	if len(timers) != 1 {
+		t.Fatalf("interrupt drain timers = %d, want one", len(timers))
+	}
+	timers[0].fire()
+	select {
+	case outcome := <-commandDone:
+		if !outcome.done || outcome.exit {
+			t.Fatalf("interrupt result = done:%t exit:%t, want done/continue", outcome.done, outcome.exit)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("interrupt did not finish after bounded provider wait")
+	}
+	if !<-ack {
+		t.Fatal("interrupt ack = false, want true")
+	}
+	if l.sid != "learned" || !l.sidBound {
+		t.Fatalf("bound SID after timed drain = %q bound:%t, want learned/true", l.sid, l.sidBound)
+	}
+	prepared := preparedInput{command: command.UserInput{
+		Header: command.Header{CommandID: mustID(t)},
+		Blocks: []content.Block{&content.TextBlock{Text: "resume"}},
+	}, turnID: mustID(t), stepID: mustID(t)}
+	if exited := l.runTurn(context.Background(), prepared); exited {
+		t.Fatal("resumed turn exited actor, want successful turn")
+	}
+	turn := agent.lastForeignTurn()
+	if turn.StartNew || turn.ForeignSID != "learned" {
+		t.Fatalf("resumed turn = {StartNew:%v ForeignSID:%q}, want false/learned", turn.StartNew, turn.ForeignSID)
+	}
 }
 
 type orderedLock struct {

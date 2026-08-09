@@ -247,7 +247,15 @@ func (l *Loop) handleTurnCommand(loopCtx context.Context, input command.Command,
 	switch typed := input.(type) {
 	case command.UserInput:
 		if len(l.pending)+machine.pendingCount() >= loop.ManagedInputQueueCapacity {
-			pub(event.TurnRejected{Header: event.Header{Cause: identity.Cause{CommandID: typed.CommandID}}, Reason: event.RejectQueueFull})
+			rejected := event.TurnRejected{Header: event.Header{Cause: identity.Cause{CommandID: typed.CommandID}}, Reason: event.RejectQueueFull}
+			if err := l.publishActor(loopCtx, turnID, stepID, rejected); err != nil {
+				slog.Error("foreignloop: queue rejection publication failed", "error", err)
+				if typed.Accepted != nil {
+					typed.Accepted <- err
+				}
+				cancel()
+				return true, true
+			}
 			if typed.Accepted != nil {
 				typed.Accepted <- &loop.InputRejectedError{Reason: event.RejectQueueFull}
 			}
@@ -743,7 +751,16 @@ func (l *Loop) publishTurnObservation(ctx context.Context, _ event.TurnIndex, tu
 	if err := l.publishActor(ctx, turnID, stepID, observation.event); err != nil {
 		return &ForeignPublicationError{Event: fmt.Sprintf("%T", observation.event), Cause: err}
 	}
+	l.applyBoundObservation(observation.event)
 	return nil
+}
+
+func (l *Loop) applyBoundObservation(input event.Event) {
+	bound, ok := input.(event.ForeignSessionBound)
+	if !ok || bound.ForeignSID == "" {
+		return
+	}
+	l.applyBoundSID(bound.ForeignSID)
 }
 
 func (l *Loop) processTurnObservation(ctx context.Context, cur event.TurnIndex, turnID, stepID uuid.UUID,
@@ -782,6 +799,10 @@ func (l *Loop) processTurnOutcomeObservation(ctx context.Context, cur event.Turn
 		}
 	}
 	if !publish {
+		// Cancellation may consume the authoritative binding after the normal
+		// checked publication path has stopped. Retain it for the next turn even
+		// when no late lifecycle event is emitted.
+		l.applyBoundObservation(observation.event)
 		return nil
 	}
 	return l.publishTurnObservation(ctx, cur, turnID, stepID, observation)
