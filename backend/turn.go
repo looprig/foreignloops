@@ -118,7 +118,10 @@ func (l *Loop) awaitTurn(loopCtx context.Context, cur event.TurnIndex, activeCom
 				return true
 			}
 			if !outcome.success && !outcome.interrupted {
-				l.cancelPending(pub, event.CancelTurnFailed)
+				if err := l.cancelPending(loopCtx, turnID, stepID, event.CancelTurnFailed); err != nil {
+					slog.Error("foreignloop: queued cancellation publication failed", "error", err)
+					return true
+				}
 			}
 			return false
 		}
@@ -237,13 +240,17 @@ func (l *Loop) handleTurnCommand(loopCtx context.Context, input command.Command,
 			if pending.command.CommandID != typed.TargetCommandID {
 				continue
 			}
-			l.pending = append(l.pending[:i], l.pending[i+1:]...)
 			queued := pending.command
-			pub(event.InputCancelled{
+			if err := l.publishActor(loopCtx, uuid.UUID{}, uuid.UUID{}, event.InputCancelled{
 				Header:  event.Header{Cause: identity.Cause{CommandID: queued.CommandID, Agency: queued.Agency}},
 				Reason:  event.CancelClientRetracted,
 				Message: &content.UserMessage{Message: content.Message{Role: content.RoleUser, Blocks: queued.Blocks}},
-			})
+			}); err != nil {
+				slog.Error("foreignloop: queued cancellation publication failed", "error", err)
+				typed.Ack <- command.DelegateCancelNoop
+				return true, true
+			}
+			l.pending = append(l.pending[:i], l.pending[i+1:]...)
 			typed.Ack <- command.DelegateCancelQueued
 			return false, false
 		}
@@ -265,7 +272,11 @@ func (l *Loop) handleTurnCommand(loopCtx context.Context, input command.Command,
 				return true, true
 			}
 			if !outcome.success && !outcome.interrupted {
-				l.cancelPending(pub, event.CancelTurnFailed)
+				if err := l.cancelPending(loopCtx, turnID, stepID, event.CancelTurnFailed); err != nil {
+					slog.Error("foreignloop: queued cancellation publication failed", "error", err)
+					typed.Ack <- command.DelegateCancelNoop
+					return true, true
+				}
 			}
 			typed.Ack <- command.DelegateCancelNoop
 			return true, false
@@ -290,13 +301,22 @@ func (l *Loop) handleTurnCommand(loopCtx context.Context, input command.Command,
 		if err := l.applyOutcome(loopCtx, cur, turnID, stepID, outcome); err != nil {
 			return true, true
 		}
-		l.cancelPending(pub, event.CancelTurnInterrupted)
+		if err := l.cancelPending(loopCtx, turnID, stepID, event.CancelTurnInterrupted); err != nil {
+			slog.Error("foreignloop: queued cancellation publication failed", "error", err)
+			typed.Ack <- true
+			return true, true
+		}
 		typed.Ack <- true
 		return true, false
 	case command.Shutdown:
 		cancel()
 		_, _ = l.receiveTurnOutcome(loopCtx, cur, turnID, stepID, mailbox, result, machine, false)
-		l.cancelPending(pub, event.CancelTurnInterrupted)
+		if err := l.cancelPending(loopCtx, turnID, stepID, event.CancelTurnInterrupted); err != nil {
+			slog.Error("foreignloop: queued cancellation publication failed", "error", err)
+			l.closeAgent()
+			typed.Ack <- err
+			return true, true
+		}
 		l.closeAgent()
 		typed.Ack <- nil
 		return true, true
@@ -306,16 +326,20 @@ func (l *Loop) handleTurnCommand(loopCtx context.Context, input command.Command,
 	}
 }
 
-func (l *Loop) cancelPending(pub func(event.Event), reason event.CancelReason) {
-	for _, pending := range l.pending {
+func (l *Loop) cancelPending(ctx context.Context, turnID, stepID uuid.UUID, reason event.CancelReason) error {
+	for len(l.pending) > 0 {
+		pending := l.pending[0]
 		input := pending.command
-		pub(event.InputCancelled{
+		if err := l.publishActor(ctx, turnID, stepID, event.InputCancelled{
 			Header:  event.Header{Cause: identity.Cause{CommandID: input.CommandID, Agency: input.Agency}},
 			Reason:  reason,
 			Message: &content.UserMessage{Message: content.Message{Role: content.RoleUser, Blocks: input.Blocks}},
-		})
+		}); err != nil {
+			return err
+		}
+		l.pending = l.pending[1:]
 	}
-	l.pending = nil
+	return nil
 }
 
 func (l *Loop) applyOutcome(ctx context.Context, cur event.TurnIndex, turnID, stepID uuid.UUID, outcome turnOutcome) error {

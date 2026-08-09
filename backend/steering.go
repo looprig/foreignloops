@@ -238,10 +238,11 @@ func (m *steeringMachine) pump() error {
 
 func (m *steeringMachine) callSteerer(ctx context.Context, attempt *steeringAttempt) {
 	result, err := m.steerer.Steer(ctx, attempt.request)
-	select {
-	case m.completions <- steeringCompletion{attempt: attempt, result: result, err: err}:
-	case <-m.ctx.Done():
-	}
+	// Cancellation of the turn is precisely when the actor needs this final
+	// provider fact to distinguish proven fallback from ambiguity. The fixed,
+	// bounded completion mailbox is drained by the actor's cancellation path;
+	// never race its send against m.ctx.Done or discard the decisive result.
+	m.completions <- steeringCompletion{attempt: attempt, result: result, err: err}
 }
 
 // observe consumes one ordered stream fact. Steer observations are the

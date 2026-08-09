@@ -2,8 +2,10 @@ package backend
 
 import (
 	"context"
+	"errors"
 	"reflect"
 	"testing"
+	"time"
 
 	"github.com/looprig/core/uuid"
 	"github.com/looprig/foreignloops/driver"
@@ -11,7 +13,206 @@ import (
 	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/harness/pkg/foreign"
 	"github.com/looprig/harness/pkg/identity"
+	"github.com/looprig/harness/pkg/loop"
 )
+
+type cancelReturningSteerer struct {
+	started  chan struct{}
+	returned chan struct{}
+	result   driver.SteerResult
+}
+
+func (s *cancelReturningSteerer) Steer(ctx context.Context, _ driver.SteerRequest) (driver.SteerResult, error) {
+	select {
+	case s.started <- struct{}{}:
+	default:
+	}
+	<-ctx.Done()
+	select {
+	case s.returned <- struct{}{}:
+	default:
+	}
+	return s.result, ctx.Err()
+}
+
+func (s *cancelReturningSteerer) Spawn(context.Context, driver.Turn) (driver.Stream, error) {
+	return nil, errors.New("cancel-returning steerer does not spawn turns")
+}
+
+func TestTurnCancellationDeliversConcurrentSteerCompletion(t *testing.T) {
+	tests := []struct {
+		name       string
+		make       func(*testing.T, *Loop, uuid.UUID) (command.Command, func(*testing.T))
+		wantDone   bool
+		wantExit   bool
+		wantEvents []string
+	}{
+		{name: "interrupt", make: funcCommandInterrupt, wantDone: true, wantEvents: []string{"event.TurnInterrupted", "event.InputCancelled"}},
+		{name: "active cancel", make: funcCommandCancel, wantDone: true, wantEvents: []string{"event.TurnInterrupted"}},
+		{name: "shutdown", make: funcCommandShutdown, wantDone: true, wantExit: true, wantEvents: []string{"event.InputCancelled"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			steerer := &cancelReturningSteerer{
+				started:  make(chan struct{}, 1),
+				returned: make(chan struct{}, 1),
+				result:   fallbackSteerResult(),
+			}
+			hook := &recordingDeliveryHook{}
+			l, machine, pub, cancel := newSteeringUnit(t, steerer, hook)
+			t.Cleanup(cancel)
+			if err := machine.setStream(orderedUnitStream()); err != nil {
+				t.Fatalf("set stream: %v", err)
+			}
+			input := unitPreparedInput(t, l, "cancel during steer")
+			input.command.CommandID = input.command.Cause.CommandID
+			if handled, err := machine.offer(input); !handled || err != nil {
+				t.Fatalf("offer = handled %t err %v", handled, err)
+			}
+			awaitStarted(t, steerer.started)
+
+			activeCommandID := mustID(t)
+			inputCommand, verifyAck := tt.make(t, l, activeCommandID)
+			mailbox := make(chan turnObservation)
+			close(mailbox)
+			result := make(chan turnOutcome)
+			cancelStarted := make(chan struct{})
+			cancelForCommand := func() {
+				close(cancelStarted)
+				cancel()
+			}
+			commandResult := make(chan struct {
+				done bool
+				exit bool
+			}, 1)
+			go func() {
+				done, exit := l.handleTurnCommand(
+					context.Background(), inputCommand, 1, activeCommandID, input.turnID, input.stepID,
+					cancelForCommand, l.publisher(context.Background(), input.turnID, input.stepID), mailbox, result, machine,
+				)
+				commandResult <- struct {
+					done bool
+					exit bool
+				}{done: done, exit: exit}
+			}()
+			<-cancelStarted
+			result <- turnOutcome{interrupted: true}
+			outcome := <-commandResult
+			done, exit := outcome.done, outcome.exit
+			verifyAck(t)
+			select {
+			case <-steerer.returned:
+			case <-time.After(time.Second):
+				t.Fatal("steerer did not return after cancellation")
+			}
+
+			if done != tt.wantDone || exit != tt.wantExit {
+				t.Fatalf("turn cancellation result = done:%t exit:%t, want done:%t exit:%t", done, exit, tt.wantDone, tt.wantExit)
+			}
+			if got, want := hook.snapshot(), []string{"reserve", "fallback"}; !reflect.DeepEqual(got, want) {
+				t.Fatalf("cancellation delivery calls = %v, want proven fallback", got)
+			}
+			if machine.active != nil || !machine.terminalReady() {
+				t.Fatalf("machine after cancellation = active:%p terminalReady:%t, want released", machine.active, machine.terminalReady())
+			}
+			if got, want := eventKinds(pub.snapshot()), tt.wantEvents; !reflect.DeepEqual(got, want) {
+				t.Fatalf("cancellation lifecycle events = %v, want %v", got, want)
+			}
+		})
+	}
+}
+
+func TestCancelPendingPublicationFailureClosesAndPreservesQueue(t *testing.T) {
+	sentinel := errors.New("input cancellation commit failed")
+	pub := &terminalFailurePublisher{failOn: "event.InputCancelled", err: sentinel}
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	agent := &queueAgent{spawned: make(chan queueSpawn, 2)}
+	state, _, err := New(ctx, mustID(t), mustID(t), loop.Provenance{}, pub, validBoundDefinition(), Config{Agent: agent, Cwd: t.TempDir(), SIDMode: SIDPrebound}, seqIDGen(), workingFac())
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	submit(t, state, "active")
+	active := nextSpawn(t, agent)
+	queued, err := sendManaged(t, state, "preserve me")
+	if err != nil {
+		t.Fatalf("queue input: %v", err)
+	}
+	active.stream.finish(driver.Event{Kind: driver.KindTerminalError, ErrText: "active turn failed"})
+
+	select {
+	case <-state.Done:
+	case <-time.After(time.Second):
+		t.Fatal("publication failure did not close the actor")
+	}
+	if len(state.pending) != 1 || state.pending[0].command.CommandID != queued {
+		t.Fatalf("pending after failed InputCancelled = %#v, want queued command %v preserved", state.pending, queued)
+	}
+	for _, input := range pub.snapshot() {
+		if _, ok := input.(event.InputCancelled); ok {
+			t.Fatal("failed InputCancelled appeared in the durable publisher")
+		}
+	}
+}
+
+func TestQueuedCancelPublicationFailurePreservesFallbackState(t *testing.T) {
+	sentinel := errors.New("queued cancellation commit failed")
+	l, _, _, cancel := newSteeringUnit(t, &scriptedSteerer{started: make(chan struct{}, 1), results: make(chan scriptedSteerResult, 1)}, &recordingDeliveryHook{})
+	t.Cleanup(cancel)
+	l.pub = &terminalFailurePublisher{failOn: "event.InputCancelled", err: sentinel}
+	input := unitPreparedInput(t, l, "preserve fallback")
+	input.command.CommandID = input.command.Cause.CommandID
+	l.pending = []preparedInput{input}
+	ack := make(chan command.DelegateCancelResult, 1)
+	request := command.CancelDelegateRequest{
+		Header:          command.Header{CommandID: mustID(t)},
+		Coordinates:     identity.Coordinates{SessionID: l.sessionID, LoopID: l.loopID},
+		TargetCommandID: input.command.CommandID,
+		Ack:             ack,
+	}
+	done, exit := l.handleTurnCommand(
+		context.Background(), request, 1, mustID(t), input.turnID, input.stepID,
+		cancel, l.publisher(context.Background(), input.turnID, input.stepID), nil, nil, nil,
+	)
+	if got := <-ack; got != command.DelegateCancelNoop {
+		t.Fatalf("failed queued cancel ack = %v, want DelegateCancelNoop", got)
+	}
+	if !done || !exit {
+		t.Fatalf("failed queued cancel result = done:%t exit:%t, want actor close", done, exit)
+	}
+	if len(l.pending) != 1 || l.pending[0].command.CommandID != input.command.CommandID {
+		t.Fatalf("pending after failed queued cancellation = %#v, want command %v preserved", l.pending, input.command.CommandID)
+	}
+}
+
+func TestShutdownCancellationPublicationFailureReportsError(t *testing.T) {
+	sentinel := errors.New("shutdown cancellation commit failed")
+	l, _, _, cancel := newSteeringUnit(t, &scriptedSteerer{started: make(chan struct{}, 1), results: make(chan scriptedSteerResult, 1)}, &recordingDeliveryHook{})
+	t.Cleanup(cancel)
+	l.pub = &terminalFailurePublisher{failOn: "event.InputCancelled", err: sentinel}
+	input := unitPreparedInput(t, l, "preserve on shutdown")
+	input.command.CommandID = input.command.Cause.CommandID
+	l.pending = []preparedInput{input}
+	ack := make(chan error, 1)
+	request := command.Shutdown{Header: command.Header{CommandID: mustID(t)}, Ack: ack}
+	mailbox := make(chan turnObservation)
+	close(mailbox)
+	result := make(chan turnOutcome, 1)
+	result <- turnOutcome{interrupted: true}
+	done, exit := l.handleTurnCommand(
+		context.Background(), request, 1, mustID(t), input.turnID, input.stepID,
+		cancel, l.publisher(context.Background(), input.turnID, input.stepID), mailbox, result, nil,
+	)
+	if got := <-ack; !errors.Is(got, sentinel) {
+		t.Fatalf("shutdown ack error = %v, want %v", got, sentinel)
+	}
+	if !done || !exit {
+		t.Fatalf("failed shutdown result = done:%t exit:%t, want actor close", done, exit)
+	}
+	if len(l.pending) != 1 || l.pending[0].command.CommandID != input.command.CommandID {
+		t.Fatalf("pending after failed shutdown cancellation = %#v, want command %v preserved", l.pending, input.command.CommandID)
+	}
+}
 
 func TestTurnCancellationAdjudicatesReservedSteerBeforeLifecycle(t *testing.T) {
 	tests := []struct {
