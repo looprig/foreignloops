@@ -234,6 +234,10 @@ func (r SteerResult) Validate() error {
 		if r.ResponseSequence == 0 {
 			return errors.New("driver: steering outcome has no response sequence")
 		}
+	case SteerOutcomeFallbackRequired:
+		if r.WriteAdmitted && r.ResponseSequence == 0 {
+			return errors.New("driver: admitted steering fallback has no response sequence")
+		}
 	case SteerOutcomeDeliveryUnknown:
 		if !r.WriteAdmitted {
 			return errors.New("driver: unknown steering delivery was not writer-admitted")

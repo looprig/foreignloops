@@ -190,7 +190,7 @@ func TestSteerResultValidationEnforcesDeliveryFacts(t *testing.T) {
 		{name: "injected sequence mismatch", got: SteerResult{Outcome: SteerOutcomeInjected, WriteAdmitted: true, ReceiveSequence: 1, ResponseSequence: 2}, want: false},
 
 		{name: "fallback pre-write", got: SteerResult{Outcome: SteerOutcomeFallbackRequired}, want: true},
-		{name: "fallback admitted before response", got: SteerResult{Outcome: SteerOutcomeFallbackRequired, WriteAdmitted: true}, want: true},
+		{name: "fallback admitted before response", got: SteerResult{Outcome: SteerOutcomeFallbackRequired, WriteAdmitted: true}, want: false},
 		{name: "fallback post-write", got: SteerResult{Outcome: SteerOutcomeFallbackRequired, WriteAdmitted: true, ReceiveSequence: 2, ResponseSequence: 2}, want: true},
 		{name: "fallback response without admission", got: SteerResult{Outcome: SteerOutcomeFallbackRequired, ResponseSequence: 2}, want: false},
 		{name: "fallback sequence mismatch", got: SteerResult{Outcome: SteerOutcomeFallbackRequired, WriteAdmitted: true, ReceiveSequence: 1, ResponseSequence: 2}, want: false},
