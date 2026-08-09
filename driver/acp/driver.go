@@ -353,27 +353,39 @@ func (d *Driver) Steer(ctx context.Context, request driver.SteerRequest) (driver
 	}
 	var reservation *steerObservationReservation
 	if h.lane != nil {
-		var ok bool
-		reservation, ok = h.reserveSteer()
-		if !ok {
+		var status steerReservationStatus
+		reservation, status = h.reserveSteer()
+		if status == steerReservationCapacityExhausted {
 			return driver.SteerResult{Outcome: driver.SteerOutcomeFallbackRequired}, &driver.SteerAdmissionError{}
+		}
+		if status == steerReservationClosed {
+			if err := ctx.Err(); err != nil {
+				return driver.SteerResult{Outcome: driver.SteerOutcomeFallbackRequired}, err
+			}
+			return driver.SteerResult{Outcome: driver.SteerOutcomeUnsupported}, nil
 		}
 	}
 	reply := make(chan steerReply, 1)
 	attempt := &steerAttempt{}
-	if ctx.Err() != nil {
+	preCanceled := ctx.Err() != nil
+	if preCanceled {
 		attempt.cancelAndSnapshot()
 	}
-	if !h.send(ctx, steerCommand{ctx: ctx, request: request, reply: reply, attempt: attempt, reservation: reservation}) {
+	sendResult := h.sendResult(ctx, steerCommand{ctx: ctx, request: request, reply: reply, attempt: attempt, reservation: reservation})
+	if sendResult != steerSendAccepted && sendResult != steerSendPending {
 		reservation.release()
 		if err := ctx.Err(); err != nil {
 			attempt.cancelAndSnapshot()
 			return driver.SteerResult{Outcome: driver.SteerOutcomeFallbackRequired}, err
 		}
-		if reservation != nil {
-			return driver.SteerResult{Outcome: driver.SteerOutcomeFallbackRequired}, &driver.SteerAdmissionError{}
-		}
 		return driver.SteerResult{Outcome: driver.SteerOutcomeUnsupported}, nil
+	}
+	if preCanceled {
+		// A caller that was already canceled before mailbox admission has
+		// explicitly sealed the attempt as not admitted. The arbiter still owns
+		// the command and publishes its one fallback observation, but this caller
+		// may safely return the cancellation result immediately.
+		return driver.SteerResult{Outcome: driver.SteerOutcomeFallbackRequired}, ctx.Err()
 	}
 	select {
 	case result := <-reply:
@@ -382,17 +394,27 @@ func (d *Driver) Steer(ctx context.Context, request driver.SteerRequest) (driver
 		// The arbiter still owns the attempt and may later emit its observation.
 		// Return a bounded caller result without allowing this caller to consume
 		// or cancel the arbiter's reply.
-		return callerTimeoutSteerResult(attempt), ctx.Err()
+		return callerTimeoutSteerResult(attempt, sendResult), ctx.Err()
 	}
 }
 
-func callerTimeoutSteerResult(attempt *steerAttempt) driver.SteerResult {
+func callerTimeoutSteerResult(attempt *steerAttempt, mailbox ...steerSendResult) driver.SteerResult {
+	sendState := steerSendRejected
+	if len(mailbox) > 0 {
+		sendState = mailbox[0]
+	}
 	switch attempt.cancelAndSnapshot() {
 	case steerAdmissionAdmitted:
 		return driver.SteerResult{Outcome: driver.SteerOutcomeDeliveryUnknown, WriteAdmitted: true}
 	case steerAdmissionPendingWriter:
 		return driver.SteerResult{Outcome: driver.SteerOutcomeAdmissionUnknown}
 	case steerAdmissionPending, steerAdmissionNotAdmitted:
+		if sendState == steerSendAccepted || sendState == steerSendPending {
+			// The command crossed the turn mailbox. Even if the arbiter has not
+			// reached it yet, a retry-safe fallback would duplicate a possible
+			// later provider call.
+			return driver.SteerResult{Outcome: driver.SteerOutcomeAdmissionUnknown}
+		}
 		return driver.SteerResult{Outcome: driver.SteerOutcomeFallbackRequired}
 	default:
 		return driver.SteerResult{Outcome: driver.SteerOutcomeAdmissionUnknown}

@@ -17,6 +17,29 @@ type steerObservationLane struct {
 	closed   bool
 }
 
+// steerReservationStatus distinguishes the only admission failure that is a
+// capacity signal from a lane that is already retiring.
+type steerReservationStatus uint8
+
+const (
+	steerReservationReserved steerReservationStatus = iota
+	steerReservationCapacityExhausted
+	steerReservationClosed
+)
+
+func (s steerReservationStatus) String() string {
+	switch s {
+	case steerReservationReserved:
+		return "reserved"
+	case steerReservationCapacityExhausted:
+		return "capacity_exhausted"
+	case steerReservationClosed:
+		return "closed"
+	default:
+		return "unknown"
+	}
+}
+
 type steerObservationReservation struct {
 	lane *steerObservationLane
 	once sync.Once
@@ -29,17 +52,20 @@ func newSteerObservationLane(capacity int) *steerObservationLane {
 	return &steerObservationLane{capacity: capacity}
 }
 
-func (l *steerObservationLane) reserve() (*steerObservationReservation, bool) {
+func (l *steerObservationLane) reserve() (*steerObservationReservation, steerReservationStatus) {
 	if l == nil {
-		return nil, false
+		return nil, steerReservationClosed
 	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	if l.closed || l.used >= l.capacity {
-		return nil, false
+	if l.closed {
+		return nil, steerReservationClosed
+	}
+	if l.used >= l.capacity {
+		return nil, steerReservationCapacityExhausted
 	}
 	l.used++
-	return &steerObservationReservation{lane: l}, true
+	return &steerObservationReservation{lane: l}, steerReservationReserved
 }
 
 func (r *steerObservationReservation) release() {

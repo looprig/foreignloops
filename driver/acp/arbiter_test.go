@@ -139,6 +139,81 @@ func TestTurnHandleAlreadyCanceledSendDoesNotEnqueue(t *testing.T) {
 	}
 }
 
+func TestTurnHandleAcceptedAckWinsTerminalWhenBothReady(t *testing.T) {
+	done := make(chan struct{})
+	handle := &turnHandle{commands: make(chan steerCommand, 1), done: done}
+	result := make(chan steerSendResult, 1)
+	go func() {
+		result <- handle.sendResult(context.Background(), steerCommand{reply: make(chan steerReply, 1)})
+	}()
+
+	command := <-handle.commands
+	if command.ack == nil {
+		t.Fatal("turn handle did not attach an explicit acknowledgement state")
+	}
+	if !command.ack.resolve(steerSendAccepted) {
+		t.Fatal("accepted acknowledgement did not win its linearization point")
+	}
+	close(done)
+	if got := <-result; got != steerSendAccepted {
+		t.Fatalf("sendResult() = %s, want accepted after terminal close", got)
+	}
+}
+
+func TestTurnHandleAcceptedAckWinsHighCountTerminalRace(t *testing.T) {
+	for i := 0; i < 10000; i++ {
+		done := make(chan struct{})
+		handle := &turnHandle{commands: make(chan steerCommand, 1), done: done}
+		result := make(chan steerSendResult, 1)
+		go func() {
+			result <- handle.sendResult(context.Background(), steerCommand{reply: make(chan steerReply, 1)})
+		}()
+		command := <-handle.commands
+		if command.ack == nil || !command.ack.resolve(steerSendAccepted) {
+			t.Fatalf("iteration %d: accepted acknowledgement did not resolve exactly once", i)
+		}
+		close(done)
+		if got := <-result; got != steerSendAccepted {
+			t.Fatalf("iteration %d: sendResult() = %s, want accepted", i, got)
+		}
+	}
+}
+
+func TestDriverSteerAcceptedAckWinsDoneWithoutCapacityFallback(t *testing.T) {
+	done := make(chan struct{})
+	handle := &turnHandle{
+		commands: make(chan steerCommand, 1),
+		done:     done,
+		lane:     newSteerObservationLane(1),
+	}
+	d := &Driver{active: handle}
+	request, err := driver.NewSteerRequest([]content.Block{&content.TextBlock{Text: "accepted"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	go func() {
+		command := <-handle.commands
+		if command.ack == nil || !command.ack.resolve(steerSendAccepted) {
+			return
+		}
+		close(done)
+		command.reply <- steerReply{result: driver.SteerResult{
+			Outcome:          driver.SteerOutcomeInjected,
+			WriteAdmitted:    true,
+			ReceiveSequence:  1,
+			ResponseSequence: 1,
+		}}
+	}()
+	result, steerErr := d.Steer(context.Background(), request)
+	var capacityErr *driver.SteerAdmissionError
+	if errors.As(steerErr, &capacityErr) {
+		t.Fatalf("Steer() reported capacity after accepted ack: %v", steerErr)
+	}
+	if steerErr != nil || result.Outcome != driver.SteerOutcomeInjected {
+		t.Fatalf("Steer() = %#v, %v, want injected result after accepted ack", result, steerErr)
+	}
+}
+
 func TestDriverSteerAlreadyCanceledIsProvenFallbackWithoutAdmission(t *testing.T) {
 	handle := &turnHandle{commands: make(chan steerCommand, 1), done: make(chan struct{})}
 	d := &Driver{active: handle}
@@ -193,7 +268,7 @@ func TestTurnArbiterDispatcherRejectionIsFallbackWithoutAdmission(t *testing.T) 
 	}
 }
 
-func TestDriverSteerTimeoutBeforeACPAttemptIsFallbackWithoutAdmission(t *testing.T) {
+func TestDriverSteerTimeoutAfterMailboxAdmissionIsUnknownWithoutWriterFact(t *testing.T) {
 	handle := &turnHandle{commands: make(chan steerCommand, 1), done: make(chan struct{})}
 	d := &Driver{active: handle}
 	request, err := driver.NewSteerRequest([]content.Block{&content.TextBlock{Text: "timeout before attempt"}})
@@ -218,8 +293,8 @@ func TestDriverSteerTimeoutBeforeACPAttemptIsFallbackWithoutAdmission(t *testing
 	case <-time.After(time.Second):
 		t.Fatal("steering command was not acknowledged")
 	}
-	if result.Outcome != driver.SteerOutcomeFallbackRequired || result.WriteAdmitted {
-		t.Fatalf("Steer() result = %#v, want fallback_required with false admission", result)
+	if result.Outcome != driver.SteerOutcomeAdmissionUnknown || result.WriteAdmitted {
+		t.Fatalf("Steer() result = %#v, want admission_unknown with false admission", result)
 	}
 	if err := result.Validate(); err != nil {
 		t.Fatalf("Steer() result validation error = %v", err)
@@ -778,11 +853,11 @@ func TestSteerAdmissionCancelStartRaceAlwaysSealsState(t *testing.T) {
 
 func TestSteerObservationLaneCapacityAndClose(t *testing.T) {
 	lane := newSteerObservationLane(1)
-	first, ok := lane.reserve()
-	if !ok || first == nil {
+	first, status := lane.reserve()
+	if status != steerReservationReserved || first == nil {
 		t.Fatal("first reservation failed")
 	}
-	if _, ok := lane.reserve(); ok {
+	if _, status := lane.reserve(); status != steerReservationCapacityExhausted {
 		t.Fatal("reservation lane accepted beyond fixed capacity")
 	}
 	if got := lane.inUse(); got != 1 {
@@ -793,8 +868,8 @@ func TestSteerObservationLaneCapacityAndClose(t *testing.T) {
 	if got := lane.inUse(); got != 0 {
 		t.Fatalf("lane in-use after idempotent release = %d, want 0", got)
 	}
-	second, ok := lane.reserve()
-	if !ok || second == nil {
+	second, status := lane.reserve()
+	if status != steerReservationReserved || second == nil {
 		t.Fatal("reservation lane did not reuse released slot")
 	}
 	lane.close()
@@ -802,7 +877,7 @@ func TestSteerObservationLaneCapacityAndClose(t *testing.T) {
 	if got := lane.inUse(); got != 0 {
 		t.Fatalf("lane in-use after close = %d, want 0", got)
 	}
-	if _, ok := lane.reserve(); ok {
+	if _, status := lane.reserve(); status != steerReservationClosed {
 		t.Fatal("closed reservation lane accepted a new reservation")
 	}
 }
@@ -907,8 +982,8 @@ func TestSteerReservationExhaustionRejectsBeforeACP(t *testing.T) {
 	lane := d.activeHandle().lane
 	reservations := make([]*steerObservationReservation, 0, steeringObservationCapacity)
 	for i := 0; i < steeringObservationCapacity; i++ {
-		reservation, ok := lane.reserve()
-		if !ok {
+		reservation, status := lane.reserve()
+		if status != steerReservationReserved {
 			t.Fatalf("reservation %d failed before configured capacity", i)
 		}
 		reservations = append(reservations, reservation)
@@ -936,11 +1011,60 @@ func TestSteerReservationExhaustionRejectsBeforeACP(t *testing.T) {
 	}
 }
 
+func TestSteerRetirementNeverLooksLikeCapacityExhaustion(t *testing.T) {
+	request, err := driver.NewSteerRequest([]content.Block{&content.TextBlock{Text: "retire"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 100; i++ {
+		handle := &turnHandle{
+			commands: make(chan steerCommand, 1),
+			done:     make(chan struct{}),
+			lane:     newSteerObservationLane(1),
+		}
+		d := &Driver{active: handle}
+		start := make(chan struct{})
+		result := make(chan error, 1)
+		go func() {
+			<-start
+			_, steerErr := d.Steer(context.Background(), request)
+			result <- steerErr
+		}()
+		go func() {
+			<-start
+			handle.retire()
+		}()
+		close(start)
+		if steerErr := <-result; steerErr != nil {
+			var capacityErr *driver.SteerAdmissionError
+			if errors.As(steerErr, &capacityErr) {
+				t.Fatalf("iteration %d: retirement reported capacity exhaustion: %v", i, steerErr)
+			}
+		}
+	}
+}
+
+func TestSteerObservationLaneReserveDistinguishesCapacityAndClosed(t *testing.T) {
+	lane := newSteerObservationLane(1)
+	first, status := lane.reserve()
+	if status != steerReservationReserved || first == nil {
+		t.Fatalf("first reserve() = (%p, %s), want reserved", first, status)
+	}
+	if second, status := lane.reserve(); second != nil || status != steerReservationCapacityExhausted {
+		t.Fatalf("full reserve() = (%p, %s), want capacity_exhausted", second, status)
+	}
+	lane.close()
+	if third, status := lane.reserve(); third != nil || status != steerReservationClosed {
+		t.Fatalf("closed reserve() = (%p, %s), want closed", third, status)
+	}
+	first.release()
+}
+
 func TestSteerReservationCloseRaceReleasesOutstandingSlots(t *testing.T) {
 	for i := 0; i < 1000; i++ {
 		lane := newSteerObservationLane(1)
-		reservation, ok := lane.reserve()
-		if !ok {
+		reservation, status := lane.reserve()
+		if status != steerReservationReserved {
 			t.Fatalf("iteration %d: initial reservation failed", i)
 		}
 		start := make(chan struct{})
@@ -961,7 +1085,7 @@ func TestSteerReservationCloseRaceReleasesOutstandingSlots(t *testing.T) {
 		if got := lane.inUse(); got != 0 {
 			t.Fatalf("iteration %d: lane in-use = %d after close race, want 0", i, got)
 		}
-		if _, ok := lane.reserve(); ok {
+		if _, status := lane.reserve(); status != steerReservationClosed {
 			t.Fatalf("iteration %d: closed lane accepted reservation", i)
 		}
 	}

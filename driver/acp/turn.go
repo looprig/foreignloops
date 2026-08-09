@@ -88,80 +88,252 @@ const (
 // closed and every send is guarded by done.
 type turnHandle struct {
 	commands chan steerCommand
-	done     <-chan struct{}
+	done     chan struct{}
 	lane     *steerObservationLane
+
+	mu      sync.Mutex
+	retired bool
+	pending map[*steerSendAck]struct{}
 }
 
-func (h *turnHandle) reserveSteer() (*steerObservationReservation, bool) {
+func (h *turnHandle) reserveSteer() (*steerObservationReservation, steerReservationStatus) {
 	if h == nil || h.lane == nil {
-		return nil, false
+		return nil, steerReservationClosed
 	}
 	return h.lane.reserve()
 }
 
-func (h *turnHandle) send(ctx context.Context, command steerCommand) bool {
-	if h == nil {
+// steerSendResult is the linearized result of entering one turn's command
+// mailbox. A pending result means the command entered the mailbox but the
+// arbiter has not acknowledged it yet; callers must not retry from that
+// state because the command may still be consumed.
+type steerSendResult uint8
+
+const (
+	steerSendPending steerSendResult = iota
+	steerSendAccepted
+	steerSendRejected
+	steerSendTerminal
+)
+
+func (r steerSendResult) String() string {
+	switch r {
+	case steerSendPending:
+		return "pending"
+	case steerSendAccepted:
+		return "accepted"
+	case steerSendRejected:
+		return "rejected"
+	case steerSendTerminal:
+		return "terminal"
+	default:
+		return "unknown"
+	}
+}
+
+// steerSendAck is the one-shot acknowledgement for a mailbox command. The
+// state is authoritative; the notification channel is only a wake-up. This
+// avoids a select choosing done after the arbiter has already accepted the
+// command.
+type steerSendAck struct {
+	mu    sync.Mutex
+	state steerSendResult
+	ready chan struct{}
+}
+
+func newSteerSendAck() *steerSendAck {
+	return &steerSendAck{ready: make(chan struct{})}
+}
+
+func (a *steerSendAck) resolve(state steerSendResult) bool {
+	if a == nil || state == steerSendPending {
 		return false
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.state != steerSendPending {
+		return false
+	}
+	a.state = state
+	close(a.ready)
+	return true
+}
+
+func (a *steerSendAck) snapshot() steerSendResult {
+	if a == nil {
+		return steerSendRejected
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.state
+}
+
+func (a *steerSendAck) wait(ctx context.Context) steerSendResult {
+	if a == nil {
+		return steerSendRejected
 	}
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	accepted := make(chan struct{})
-	command.accepted = accepted
+	for {
+		if state := a.snapshot(); state != steerSendPending {
+			return state
+		}
+		select {
+		case <-a.ready:
+			// Read the state after waking. The channel does not itself carry
+			// authority over accepted versus terminal.
+		case <-ctx.Done():
+			return a.snapshot()
+		}
+	}
+}
+
+// sendResult enters the command mailbox and waits for its linearized
+// acknowledgement. Reserved calls use a nonblocking mailbox admission; the
+// reservation lane guarantees that this path cannot be confused with output
+// capacity exhaustion.
+func (h *turnHandle) sendResult(ctx context.Context, command steerCommand) steerSendResult {
+	if h == nil {
+		return steerSendRejected
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	ack := newSteerSendAck()
+	command.ack = ack
+	// accepted remains as a compatibility notification for old narrow tests;
+	// ack is the only authoritative state used by this implementation.
+	command.accepted = make(chan struct{})
+
+	h.mu.Lock()
+	if h.retired || channelClosed(h.done) {
+		h.mu.Unlock()
+		ack.resolve(steerSendTerminal)
+		return steerSendTerminal
+	}
+	if h.pending == nil {
+		h.pending = make(map[*steerSendAck]struct{})
+	}
+	h.pending[ack] = struct{}{}
+	if command.reservation == nil && ctx.Err() != nil {
+		delete(h.pending, ack)
+		h.mu.Unlock()
+		ack.resolve(steerSendRejected)
+		return steerSendRejected
+	}
 	select {
-	case <-h.done:
-		return false
+	case h.commands <- command:
+		h.mu.Unlock()
+		return h.waitAndUntrack(ctx, ack)
 	default:
 	}
-	// Reserved steering calls use a nonblocking mailbox admission. This keeps
-	// the reservation lane a bounded pre-acceptance contract even when the
-	// arbiter is blocked behind a saturated non-steer projection. Cancellation
-	// is represented by the attempt state and is still observed exactly once.
+	// Reservation-backed calls must not wait behind a full mailbox: they have
+	// a bounded pre-admission contract and can safely reject this one command.
 	if command.reservation != nil {
-		select {
-		case h.commands <- command:
-		case <-h.done:
-			return false
-		default:
-			return false
+		delete(h.pending, ack)
+		h.mu.Unlock()
+		ack.resolve(steerSendRejected)
+		return steerSendRejected
+	}
+	h.mu.Unlock()
+
+	// Keep the legacy unreserved path cancellable while waiting for mailbox
+	// space. The handle retirement path resolves the registered ack if it wins
+	// this race, so a stale send cannot strand its caller.
+	select {
+	case h.commands <- command:
+		return h.waitAndUntrack(ctx, ack)
+	case <-h.done:
+		h.untrack(ack)
+		ack.resolve(steerSendTerminal)
+		return steerSendTerminal
+	case <-ctx.Done():
+		h.untrack(ack)
+		ack.resolve(steerSendRejected)
+		return steerSendRejected
+	}
+}
+
+func (h *turnHandle) waitAndUntrack(ctx context.Context, ack *steerSendAck) steerSendResult {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	for {
+		if state := ack.snapshot(); state != steerSendPending {
+			h.untrack(ack)
+			return state
 		}
-	} else {
-		// A canceled caller has no steering attempt to observe for unreserved
-		// compatibility sends. Keep this path for the narrow internal tests and
-		// legacy callers that do not participate in the reservation lane.
-		if ctx.Err() != nil {
-			return false
-		}
 		select {
-		case h.commands <- command:
+		case <-ack.ready:
+			// Read the authoritative state on the next iteration.
 		case <-h.done:
-			return false
+			ack.resolve(steerSendTerminal)
 		case <-ctx.Done():
-			return false
+			state := ack.snapshot()
+			h.untrack(ack)
+			return state
 		}
 	}
-	// Once the command entered the mailbox, caller cancellation only stops
-	// waiting for its reply. The arbiter must either acknowledge ownership or
-	// retire the handle; this prevents a stale buffered command from stranding
-	// a background Steer caller after terminal publication.
-	select {
-	case <-accepted:
-		return true
-	case <-h.done:
+}
+
+func (h *turnHandle) untrack(ack *steerSendAck) {
+	if h == nil || ack == nil {
+		return
+	}
+	h.mu.Lock()
+	delete(h.pending, ack)
+	h.mu.Unlock()
+}
+
+func (h *turnHandle) send(ctx context.Context, command steerCommand) bool {
+	state := h.sendResult(ctx, command)
+	return state == steerSendAccepted || state == steerSendPending
+}
+
+// retire linearizes terminal publication with command sends. Any command
+// whose arbiter acknowledgement has not won yet becomes terminal exactly once;
+// accepted acknowledgements remain accepted when done is closed.
+func (h *turnHandle) retire() {
+	if h == nil {
+		return
+	}
+	h.mu.Lock()
+	if !h.retired {
+		h.retired = true
+		if h.done != nil && !channelClosed(h.done) {
+			close(h.done)
+		}
+		for ack := range h.pending {
+			ack.resolve(steerSendTerminal)
+		}
+	}
+	h.mu.Unlock()
+	if h.lane != nil {
+		h.lane.close()
+	}
+}
+
+func channelClosed(ch <-chan struct{}) bool {
+	if ch == nil {
 		return false
-	case <-ctx.Done():
-		// The command is already in the arbiter mailbox. Return control to the
-		// caller's deadline while leaving the arbiter responsible for the
-		// eventual exactly-once observation.
+	}
+	select {
+	case <-ch:
 		return true
+	default:
+		return false
 	}
 }
 
 type steerCommand struct {
-	ctx         context.Context
-	request     driver.SteerRequest
-	reply       chan steerReply
+	ctx     context.Context
+	request driver.SteerRequest
+	reply   chan steerReply
+	// accepted is retained for compatibility with pre-linearization tests;
+	// steerSendAck is the authoritative acknowledgement state.
 	accepted    chan struct{}
+	ack         *steerSendAck
 	attempt     *steerAttempt
 	reservation *steerObservationReservation
 }
@@ -370,21 +542,24 @@ func (d *Driver) runTurn(
 		steers:     make(map[uint64]steerCommand),
 	}
 	a.run()
+	// Stop discovery as soon as the arbiter retires. A caller that already
+	// captured this handle may still race retirement, but reserve() now
+	// distinguishes a closed lane from true capacity exhaustion.
+	d.activeMu.Lock()
+	if d.active == streamState.handle {
+		d.active = nil
+	}
+	d.activeMu.Unlock()
+	// No command can be admitted after the arbiter returns. Retire the handle
+	// after clearing Driver.active so stale discovery cannot be mistaken for a
+	// fresh active turn, and resolve any command still buffered in the mailbox.
+	streamState.handle.retire()
 	if driverCtx.Err() != nil {
 		// Driver.Close must cancel the protocol operation before closing its
 		// owned client. The arbiter may have exited on cancellation while the
 		// provider is still unwinding Prompt, so retain that lifecycle fence.
 		<-promptReturned
 	}
-	// No command can be admitted after the arbiter returns. Retire the handle
-	// before cleanup so callers racing terminal publication cannot strand on a
-	// mailbox with no consumer.
-	close(handleDone)
-	streamState.handle.lane.close()
-
-	// The arbiter has stopped accepting commands. Close the handle's done
-	// signal before clearing Driver.active, so any stale caller is guaranteed to
-	// select the done case rather than enqueueing into a retired turn.
 	lifecycle.finish()
 	close(turnDone)
 	<-watcherDone
@@ -392,11 +567,6 @@ func (d *Driver) runTurn(
 	barrier.stop()
 	dispatcher.stop()
 	streamState.projection.close()
-	d.activeMu.Lock()
-	if d.active == streamState.handle {
-		d.active = nil
-	}
-	d.activeMu.Unlock()
 	d.turnMu.Unlock()
 }
 
@@ -636,8 +806,8 @@ func (a *turnArbiter) drainQueuedCommands() {
 }
 
 func (a *turnArbiter) acknowledgeCommand(command steerCommand) {
-	if command.accepted != nil {
-		close(command.accepted)
+	if command.ack != nil {
+		command.ack.resolve(steerSendAccepted)
 	}
 }
 
