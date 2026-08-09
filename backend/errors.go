@@ -81,6 +81,31 @@ func (e *ForeignProtocolError) Error() string {
 	return "foreignloop: foreign protocol: " + e.Reason
 }
 
+// ForeignPublicationError reports a checked lifecycle event that the session
+// publisher rejected. The actor must stop rather than continue with a local
+// state transition that is absent from the durable event stream.
+type ForeignPublicationError struct {
+	Event string
+	Cause error
+}
+
+func (e *ForeignPublicationError) Error() string {
+	if e == nil {
+		return "foreignloop: lifecycle publication failed"
+	}
+	if e.Cause == nil {
+		return "foreignloop: lifecycle publication failed: " + e.Event
+	}
+	return "foreignloop: lifecycle publication failed: " + e.Event + ": " + e.Cause.Error()
+}
+
+func (e *ForeignPublicationError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.Cause
+}
+
 // SnapshotErrorReason classifies why a consistent backend snapshot was not
 // available.
 type SnapshotErrorReason string
