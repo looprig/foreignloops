@@ -1,0 +1,186 @@
+package driver
+
+import (
+	"context"
+	"reflect"
+	"testing"
+
+	"github.com/looprig/core/content"
+)
+
+type steeringTestAgent struct{}
+
+func (steeringTestAgent) Spawn(context.Context, Turn) (Stream, error) { return nil, nil }
+
+type steeringTestSteerer struct{}
+
+func (steeringTestSteerer) Steer(context.Context, SteerRequest) (SteerResult, error) {
+	return SteerResult{Outcome: SteerOutcomeInjected}, nil
+}
+
+var (
+	_ Agent   = steeringTestAgent{}
+	_ Steerer = steeringTestSteerer{}
+)
+
+func TestSteererIsOptionalForExistingAgents(t *testing.T) {
+	var agent Agent = steeringTestAgent{}
+	if _, ok := agent.(Steerer); ok {
+		t.Fatal("legacy Agent unexpectedly satisfies optional Steerer")
+	}
+
+	var capable Agent = steeringTestCapableAgent{}
+	if _, ok := capable.(Steerer); !ok {
+		t.Fatal("steering-capable Agent does not expose optional Steerer")
+	}
+}
+
+type steeringTestCapableAgent struct{}
+
+func (steeringTestCapableAgent) Spawn(context.Context, Turn) (Stream, error) { return nil, nil }
+
+func (steeringTestCapableAgent) Steer(context.Context, SteerRequest) (SteerResult, error) {
+	return SteerResult{Outcome: SteerOutcomeUnsupported}, nil
+}
+
+func TestSteerRequestOwnsPromptBlocks(t *testing.T) {
+	providerState := []byte(`{"opaque":"state"}`)
+	toolInput := []byte(`{"path":"before"}`)
+	imageData := []byte("image-before")
+	documentData := []byte("document-before")
+	audioData := []byte("audio-before")
+	blocks := []content.Block{
+		&content.TextBlock{Text: "text-before"},
+		&content.ImageBlock{Source: content.ImageSource{Data: imageData}},
+		&content.AudioBlock{Data: audioData},
+		&content.DocumentBlock{Data: documentData},
+		&content.ThinkingBlock{ProviderState: providerState},
+		&content.ToolUseBlock{Input: toolInput},
+		&content.ToolResultBlock{Content: []content.Block{
+			&content.TextBlock{Text: "nested-before"},
+		}},
+	}
+
+	request, err := NewSteerRequest(blocks)
+	if err != nil {
+		t.Fatalf("NewSteerRequest() error = %v", err)
+	}
+
+	// Mutating both the caller-owned source and a returned snapshot must not
+	// change the request retained by the driver boundary.
+	blocks[0].(*content.TextBlock).Text = "text-after"
+	imageData[0] = 'X'
+	audioData[0] = 'X'
+	documentData[0] = 'X'
+	providerState[0] = 'X'
+	toolInput[0] = 'X'
+
+	snapshot := request.Prompt()
+	snapshot[0].(*content.TextBlock).Text = "snapshot-after"
+	snapshot[1].(*content.ImageBlock).Source.Data[0] = 'Y'
+	snapshot[6].(*content.ToolResultBlock).Content[0].(*content.TextBlock).Text = "nested-after"
+
+	want := []content.Block{
+		&content.TextBlock{Text: "text-before"},
+		&content.ImageBlock{Source: content.ImageSource{Data: []byte("image-before")}},
+		&content.AudioBlock{Data: []byte("audio-before")},
+		&content.DocumentBlock{Data: []byte("document-before")},
+		&content.ThinkingBlock{ProviderState: []byte(`{"opaque":"state"}`)},
+		&content.ToolUseBlock{Input: []byte(`{"path":"before"}`)},
+		&content.ToolResultBlock{Content: []content.Block{
+			&content.TextBlock{Text: "nested-before"},
+		}},
+	}
+	if got := request.Prompt(); !reflect.DeepEqual(got, want) {
+		t.Fatalf("SteerRequest.Prompt() = %#v, want %#v", got, want)
+	}
+}
+
+func TestSteerRequestRejectsMissingPrompt(t *testing.T) {
+	for _, blocks := range [][]content.Block{
+		nil,
+		{},
+		{nil},
+	} {
+		if _, err := NewSteerRequest(blocks); err == nil {
+			t.Fatalf("NewSteerRequest(%#v) error = nil, want missing/invalid prompt error", blocks)
+		}
+	}
+}
+
+func TestSteerOutcomesAreClosedAndExact(t *testing.T) {
+	tests := []struct {
+		outcome SteerOutcome
+		wire    string
+	}{
+		{SteerOutcomeInjected, "injected"},
+		{SteerOutcomeFallbackRequired, "fallback_required"},
+		{SteerOutcomeUnsupported, "unsupported"},
+		{SteerOutcomeDeliveryUnknown, "delivery_unknown"},
+		{SteerOutcomeDeliveredUntrackable, "delivered_untrackable"},
+	}
+	for _, tt := range tests {
+		if string(tt.outcome) != tt.wire {
+			t.Errorf("SteerOutcome %q = %q, want %q", tt.wire, tt.outcome, tt.wire)
+		}
+		if !tt.outcome.Valid() {
+			t.Errorf("SteerOutcome(%q).Valid() = false, want true", tt.wire)
+		}
+	}
+	if SteerOutcome("future").Valid() {
+		t.Fatal("unknown SteerOutcome is valid; want closed enum")
+	}
+	if err := (SteerResult{Outcome: SteerOutcome("future")}).Validate(); err == nil {
+		t.Fatal("SteerResult.Validate() error = nil for unknown outcome")
+	}
+}
+
+func TestSteerResultAndObservationsCarryAdmissionAndOrder(t *testing.T) {
+	result := SteerResult{
+		Outcome:          SteerOutcomeInjected,
+		Reason:           "active turn accepted",
+		WriteAdmitted:    true,
+		ReceiveSequence:  11,
+		ResponseSequence: 11,
+	}
+	if err := result.Validate(); err != nil {
+		t.Fatalf("SteerResult.Validate() error = %v", err)
+	}
+	steer := SteerObservation{SteerResult: result}
+	if steer.ReceiveSequence != 11 || steer.ResponseSequence != 11 || !steer.WriteAdmitted {
+		t.Fatalf("SteerObservation = %#v, want steering facts", steer)
+	}
+
+	prompt := PromptObservation{
+		WriteAdmitted:    true,
+		ReceiveSequence:  7,
+		ResponseSequence: 7,
+	}
+	update := UpdateObservation{
+		Event:           Event{Kind: KindTextDelta, Text: "before completion"},
+		ReceiveSequence: 5,
+	}
+	if prompt.Sequence() != 7 || update.Sequence() != 5 || steer.Sequence() != 11 {
+		t.Fatalf("observation sequences = prompt %d, update %d, steer %d; want 7, 5, 11", prompt.Sequence(), update.Sequence(), steer.Sequence())
+	}
+
+	var observations []Observation = []Observation{update, prompt, steer}
+	if len(observations) != 3 {
+		t.Fatalf("observations length = %d, want 3", len(observations))
+	}
+}
+
+func TestObservationKindValuesAreClosed(t *testing.T) {
+	values := []ObservationKind{ObservationPrompt, ObservationUpdate, ObservationSteer}
+	for want, got := range values {
+		if int(got) != want {
+			t.Errorf("ObservationKind value %d = %d, want %d", want, got, want)
+		}
+		if !got.Valid() {
+			t.Errorf("ObservationKind(%d).Valid() = false, want true", got)
+		}
+	}
+	if ObservationKind(99).Valid() {
+		t.Fatal("unknown ObservationKind is valid; want closed enum")
+	}
+}
