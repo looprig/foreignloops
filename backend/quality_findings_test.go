@@ -188,6 +188,51 @@ func TestQueuedCancelPublicationFailurePreservesFallbackState(t *testing.T) {
 	}
 }
 
+func TestAwaitTurnCancelsProviderAfterQueuedCancelPublicationFailure(t *testing.T) {
+	sentinel := errors.New("queued cancellation commit failed")
+	l, machine, _, machineCancel := newSteeringUnit(t, &scriptedSteerer{started: make(chan struct{}, 1), results: make(chan scriptedSteerResult, 1)}, &recordingDeliveryHook{})
+	t.Cleanup(machineCancel)
+	l.Commands = make(chan command.Command)
+	l.pub = &terminalFailurePublisher{failOn: "event.InputCancelled", err: sentinel}
+	input := unitPreparedInput(t, l, "provider must stop")
+	input.command.CommandID = input.command.Cause.CommandID
+	l.pending = []preparedInput{input}
+
+	turnCtx, turnCancel := context.WithCancel(context.Background())
+	t.Cleanup(turnCancel)
+
+	ack := make(chan command.DelegateCancelResult, 1)
+	request := command.CancelDelegateRequest{
+		Header:          command.Header{CommandID: mustID(t)},
+		Coordinates:     identity.Coordinates{SessionID: l.sessionID, LoopID: l.loopID},
+		TargetCommandID: input.command.CommandID,
+		Ack:             ack,
+	}
+	mailbox := make(chan turnObservation)
+	result := make(chan turnOutcome)
+	streamReady := make(chan driver.Stream)
+	finished := make(chan bool, 1)
+	go func() {
+		finished <- l.awaitTurn(
+			context.Background(), 1, mustID(t), input.turnID, input.stepID, turnCancel,
+			l.publisher(context.Background(), input.turnID, input.stepID), mailbox, result, streamReady, machine,
+		)
+	}()
+
+	l.Commands <- request
+	if got := <-ack; got != command.DelegateCancelNoop {
+		t.Fatalf("failed queued cancel ack = %v, want DelegateCancelNoop", got)
+	}
+	if exited := <-finished; !exited {
+		t.Fatal("queued cancellation publication failure did not stop the turn")
+	}
+	select {
+	case <-turnCtx.Done():
+	default:
+		t.Fatal("awaitTurn returned without canceling the provider turn context")
+	}
+}
+
 func TestShutdownCancellationPublicationFailureReportsError(t *testing.T) {
 	sentinel := errors.New("shutdown cancellation commit failed")
 	l, _, _, cancel := newSteeringUnit(t, &scriptedSteerer{started: make(chan struct{}, 1), results: make(chan scriptedSteerResult, 1)}, &recordingDeliveryHook{})

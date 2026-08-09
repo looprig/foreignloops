@@ -93,6 +93,9 @@ func (l *Loop) awaitTurn(loopCtx context.Context, cur event.TurnIndex, activeCom
 	cancel context.CancelFunc, pub func(event.Event), mailbox <-chan turnObservation, result chan turnOutcome,
 	streamReady <-chan driver.Stream, machine *steeringMachine,
 ) bool {
+	if cancel != nil {
+		defer cancel()
+	}
 	defer func() {
 		if machine != nil {
 			if err := machine.shutdown(); err != nil {
