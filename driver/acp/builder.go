@@ -193,6 +193,10 @@ func (a *initAgent) Spawn(ctx context.Context, turn driver.Turn) (driver.Stream,
 
 func (a *initAgent) Close() error { return a.agent.Close() }
 
+func (a *initAgent) Steer(ctx context.Context, request driver.SteerRequest) (driver.SteerResult, error) {
+	return a.agent.Steer(ctx, request)
+}
+
 type initStream struct {
 	inner  driver.Stream
 	events <-chan driver.Event
@@ -237,6 +241,14 @@ func newInitStream(inner driver.Stream, sessionID string) driver.Stream {
 
 func (s *initStream) Events() <-chan driver.Event { return s.events }
 
+func (s *initStream) Observations() <-chan driver.Observation {
+	ordered, ok := s.inner.(driver.OrderedStream)
+	if !ok {
+		return nil
+	}
+	return ordered.Observations()
+}
+
 func (s *initStream) History() (driver.History, error) { return s.inner.History() }
 
 func (s *initStream) Close() error {
@@ -257,6 +269,8 @@ var (
 	_ foreign.RestoredBuilder         = BuildRestoredWith(Config{})
 	_ foreign.ServicesRestoredBuilder = BuildRestoredWithServices(Config{})
 	_ driver.Agent                    = (*initAgent)(nil)
+	_ driver.Steerer                  = (*initAgent)(nil)
 	_ driver.Closer                   = (*initAgent)(nil)
 	_ driver.Stream                   = (*initStream)(nil)
+	_ driver.OrderedStream            = (*initStream)(nil)
 )

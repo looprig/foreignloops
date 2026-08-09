@@ -29,6 +29,10 @@ type turnSession interface {
 	WaitForUpdates(context.Context) error
 }
 
+type orderedUpdateBarrier interface {
+	WaitForUpdatesThrough(context.Context, uint64) error
+}
+
 // promptSession is the pre-barrier ACP client shape. The checked-out ACP
 // client does not expose WaitForUpdates yet, so Spawn wraps this legacy shape
 // with the compatibility stub below. Once the client-side ordered barrier
@@ -86,12 +90,24 @@ func (l *turnLifecycle) finish() {
 // function only cancels forwarding for this turn; the session and its owned
 // process remain with Driver.
 type stream struct {
-	events <-chan driver.Event
-	done   <-chan struct{}
-	cancel context.CancelFunc
+	events       <-chan driver.Event
+	observations chan driver.Observation
+	done         <-chan struct{}
+	cancel       context.CancelFunc
+	steerIn      chan steerInput
+
+	mu            sync.Mutex
+	closed        bool
+	pendingSteers int
+	steerChanged  chan struct{}
 
 	once     sync.Once
 	closeErr error
+}
+
+type steerInput struct {
+	observation driver.SteerObservation
+	admitted    chan struct{}
 }
 
 // Spawn starts one prompt on the session created by New. The prompt itself is
@@ -131,11 +147,17 @@ func (d *Driver) Spawn(ctx context.Context, turn driver.Turn) (driver.Stream, er
 	events := make(chan driver.Event, 32)
 	done := make(chan struct{})
 	s := &stream{
-		events: events,
-		done:   done,
-		cancel: cancel,
+		events:       events,
+		observations: make(chan driver.Observation, 512),
+		done:         done,
+		cancel:       cancel,
+		steerIn:      make(chan steerInput, 512),
+		steerChanged: make(chan struct{}),
 	}
-	go d.runTurn(turnCtx, cancel, driverCtx, sess, turn, events, done)
+	d.activeMu.Lock()
+	d.active = s
+	d.activeMu.Unlock()
+	go d.runTurn(turnCtx, cancel, driverCtx, sess, turn, s, events, done)
 	return s, nil
 }
 
@@ -145,6 +167,7 @@ func (d *Driver) runTurn(
 	driverCtx context.Context,
 	sess turnSession,
 	turn driver.Turn,
+	streamState *stream,
 	events chan<- driver.Event,
 	done chan<- struct{},
 ) {
@@ -157,8 +180,26 @@ func (d *Driver) runTurn(
 		close(turnDone)
 		<-watcherDone
 		turnCancel()
+		streamState.mu.Lock()
+		streamState.closed = true
+		streamState.mu.Unlock()
+		for {
+			select {
+			case pending := <-streamState.steerIn:
+				close(pending.admitted)
+			default:
+				goto pendingSteersDrained
+			}
+		}
+	pendingSteersDrained:
 		close(done)
 		close(events)
+		close(streamState.observations)
+		d.activeMu.Lock()
+		if d.active == streamState {
+			d.active = nil
+		}
+		d.activeMu.Unlock()
 		d.turnMu.Unlock()
 	}()
 
@@ -177,9 +218,12 @@ func (d *Driver) runTurn(
 				updates = nil
 				continue
 			}
-			for _, event := range translateLiveUpdate(update, state) {
-				sendTurnEvent(turnCtx, events, event)
+			emitTranslatedUpdate(turnCtx, streamState, update, state, events)
+		case steer, ok := <-streamState.steerIn:
+			if !ok {
+				continue
 			}
+			processSteerInput(driverCtx, turnCtx, sess, updates, state, events, streamState, steer)
 		case outcome := <-promptDone:
 			// The prompt response can become visible before the ordered
 			// notification handler has delivered the final session/update.
@@ -197,25 +241,98 @@ func (d *Driver) runTurn(
 						updates = nil
 						continue
 					}
-					for _, event := range translateLiveUpdate(update, state) {
-						sendTurnEvent(turnCtx, events, event)
+					emitTranslatedUpdate(turnCtx, streamState, update, state, events)
+				case steer, ok := <-streamState.steerIn:
+					if !ok {
+						continue
 					}
+					processSteerInput(driverCtx, turnCtx, sess, updates, state, events, streamState, steer)
 				case err := <-barrierDone:
 					if err != nil && driverCtx.Err() == nil {
 						// Keep the diagnostic fixed-category: ACP errors may
 						// contain protocol payloads or credentials.
 						slog.Warn("acp: update delivery barrier failed")
 					}
-					// The barrier covers ordered handler delivery. Drain the
+					// Hold the terminal until any steering call that raced the
+					// prompt has either admitted its ordered observation or
+					// resolved through its bounded runtime context. The barrier
+					// covers ordered handler delivery. Drain the
 					// session channel once more so a final handoff that became
 					// ready with the barrier cannot be consumed by the next turn.
-					drainTurnUpdates(turnCtx, updates, state, events)
+					if err := streamState.waitSteers(driverCtx); err != nil && driverCtx.Err() == nil {
+						slog.Warn("acp: steering acknowledgement wait failed")
+					}
+					for {
+						select {
+						case steer, ok := <-streamState.steerIn:
+							if !ok {
+								continue
+							}
+							processSteerInput(driverCtx, turnCtx, sess, updates, state, events, streamState, steer)
+						default:
+							goto pendingSteerInputsDrained
+						}
+					}
+				pendingSteerInputsDrained:
+					drainTurnUpdatesOrdered(turnCtx, updates, state, events, streamState)
+					emitPromptObservation(streamState, outcome)
 					sendPromptTerminal(turnCtx, events, state, outcome)
 					return
 				}
 			}
 		}
 	}
+}
+
+func processSteerInput(
+	driverCtx, turnCtx context.Context,
+	sess turnSession,
+	updates <-chan client.Update,
+	state *translationState,
+	events chan<- driver.Event,
+	streamState *stream,
+	steer steerInput,
+) {
+	if sequence := steer.observation.Sequence(); sequence != 0 {
+		if err := waitForSteeringUpdates(driverCtx, sess, sequence); err != nil && driverCtx.Err() == nil {
+			slog.Warn("acp: steering update barrier failed")
+		}
+		drainTurnUpdatesOrdered(turnCtx, updates, state, events, streamState)
+	}
+	emitObservation(streamState, steer.observation)
+	close(steer.admitted)
+}
+
+func waitForSteeringUpdates(ctx context.Context, sess turnSession, sequence uint64) error {
+	if ordered, ok := sess.(orderedUpdateBarrier); ok {
+		return ordered.WaitForUpdatesThrough(ctx, sequence)
+	}
+	return sess.WaitForUpdates(ctx)
+}
+
+func emitTranslatedUpdate(ctx context.Context, streamState *stream, update client.Update, state *translationState, events chan<- driver.Event) {
+	for _, event := range translateLiveUpdate(update, state) {
+		emitObservation(streamState, driver.UpdateObservation{Event: event, ReceiveSequence: update.ReceiveSequence})
+		sendTurnEvent(ctx, events, event)
+	}
+}
+
+func emitPromptObservation(streamState *stream, outcome promptOutcome) {
+	if outcome.result == nil {
+		emitObservation(streamState, driver.PromptObservation{Err: outcome.err})
+		return
+	}
+	sequence := outcome.result.ReceiveSequence
+	if sequence == 0 {
+		sequence = outcome.result.ResponseSequence
+	}
+	emitObservation(streamState, driver.PromptObservation{
+		StopReason:       string(outcome.result.StopReason),
+		WriteAdmitted:    outcome.result.WriteAdmitted,
+		ReceiveSequence:  sequence,
+		ResponseSequence: sequence,
+		Err:              outcome.err,
+	})
 }
 
 func watchTurnCancellation(
@@ -253,6 +370,16 @@ func drainTurnUpdates(
 	state *translationState,
 	events chan<- driver.Event,
 ) {
+	drainTurnUpdatesOrdered(turnCtx, updates, state, events, nil)
+}
+
+func drainTurnUpdatesOrdered(
+	turnCtx context.Context,
+	updates <-chan client.Update,
+	state *translationState,
+	events chan<- driver.Event,
+	streamState *stream,
+) {
 	if updates == nil {
 		return
 	}
@@ -262,9 +389,13 @@ func drainTurnUpdates(
 			if !ok {
 				return
 			}
-			for _, event := range translateLiveUpdate(update, state) {
-				sendTurnEvent(turnCtx, events, event)
+			if streamState == nil {
+				for _, event := range translateLiveUpdate(update, state) {
+					sendTurnEvent(turnCtx, events, event)
+				}
+				continue
 			}
+			emitTranslatedUpdate(turnCtx, streamState, update, state, events)
 		default:
 			return
 		}
@@ -549,6 +680,74 @@ func promptBlocks(turn driver.Turn) []protocol.ContentBlock {
 
 func (s *stream) Events() <-chan driver.Event { return s.events }
 
+func (s *stream) Observations() <-chan driver.Observation {
+	if s == nil {
+		return nil
+	}
+	return s.observations
+}
+
+func (s *stream) enqueueSteer(observation driver.SteerObservation) (bool, <-chan struct{}) {
+	admitted := make(chan struct{})
+	if s == nil {
+		return false, admitted
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return false, admitted
+	}
+	s.steerIn <- steerInput{observation: observation, admitted: admitted}
+	return true, admitted
+}
+
+func (s *stream) beginSteer() bool {
+	if s == nil {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return false
+	}
+	s.pendingSteers++
+	return true
+}
+
+func (s *stream) finishSteer() {
+	s.mu.Lock()
+	if s.pendingSteers > 0 {
+		s.pendingSteers--
+	}
+	close(s.steerChanged)
+	s.steerChanged = make(chan struct{})
+	s.mu.Unlock()
+}
+
+func (s *stream) waitSteers(ctx context.Context) error {
+	for {
+		s.mu.Lock()
+		if s.pendingSteers == 0 {
+			s.mu.Unlock()
+			return nil
+		}
+		changed := s.steerChanged
+		s.mu.Unlock()
+		select {
+		case <-changed:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+}
+
+func emitObservation(streamState *stream, observation driver.Observation) {
+	if streamState == nil || observation == nil {
+		return
+	}
+	streamState.observations <- observation
+}
+
 func (s *stream) History() (driver.History, error) {
 	return driver.History{Available: false}, nil
 }
@@ -569,5 +768,7 @@ func (s *stream) Close() error {
 }
 
 var _ driver.Agent = (*Driver)(nil)
+var _ driver.Steerer = (*Driver)(nil)
 var _ driver.Stream = (*stream)(nil)
+var _ driver.OrderedStream = (*stream)(nil)
 var _ turnSession = legacyTurnSession{}
