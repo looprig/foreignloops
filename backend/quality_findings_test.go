@@ -168,6 +168,106 @@ func TestOrderedPromptMessageIsCommittedOnce(t *testing.T) {
 	}
 }
 
+func TestSteeringDeadlineUnknownCompletionResolvesWithoutObservation(t *testing.T) {
+	tests := []struct {
+		name   string
+		result driver.SteerResult
+	}{
+		{
+			name:   "admission unknown",
+			result: driver.SteerResult{Outcome: driver.SteerOutcomeAdmissionUnknown},
+		},
+		{
+			name:   "delivery unknown",
+			result: driver.SteerResult{Outcome: driver.SteerOutcomeDeliveryUnknown, WriteAdmitted: true},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			steerer := &scriptedSteerer{started: make(chan struct{}, 1), results: make(chan scriptedSteerResult, 1)}
+			hook := &recordingDeliveryHook{}
+			l, machine, _, cancel := newSteeringUnit(t, steerer, hook)
+			t.Cleanup(cancel)
+			if err := machine.setStream(orderedUnitStream()); err != nil {
+				t.Fatalf("set stream: %v", err)
+			}
+			input := unitPreparedInput(t, l, "deadline unknown")
+			if handled, err := machine.offer(input); !handled || err != nil {
+				t.Fatalf("offer = handled %t err %v", handled, err)
+			}
+			queued := unitPreparedInput(t, l, "queued after unknown")
+			if handled, err := machine.offer(queued); !handled || err != nil {
+				t.Fatalf("queued offer = handled %t err %v", handled, err)
+			}
+			awaitStarted(t, steerer.started)
+
+			completion := steeringCompletion{
+				attempt: machine.active,
+				result:  tt.result,
+				err:     context.DeadlineExceeded,
+			}
+			if err := machine.complete(completion); err != nil {
+				t.Fatalf("deadline completion: %v", err)
+			}
+			if got, want := hook.snapshot(), []string{"reserve", string(foreign.DeliveryResolutionUnknown), "fallback"}; !reflect.DeepEqual(got, want) {
+				t.Fatalf("deadline delivery calls = %v, want exactly one unknown resolution then FIFO fallback", got)
+			}
+			if machine.active != nil || machine.pendingCount() != 0 {
+				t.Fatalf("deadline state = active %p pending %d, want released FIFO state", machine.active, machine.pendingCount())
+			}
+			if got, want := hook.fallbackIDs(), []uuid.UUID{queued.command.CommandID}; !reflect.DeepEqual(got, want) {
+				t.Fatalf("deadline fallback IDs = %v, want queued request %v only", got, want)
+			}
+
+			late := driver.SteerObservation{SteerResult: injectedSteerResult()}
+			if err := machine.observe(late); err != nil {
+				t.Fatalf("late observation: %v", err)
+			}
+			if err := machine.complete(completion); err != nil {
+				t.Fatalf("late completion: %v", err)
+			}
+			if got, want := hook.snapshot(), []string{"reserve", string(foreign.DeliveryResolutionUnknown), "fallback"}; !reflect.DeepEqual(got, want) {
+				t.Fatalf("late facts changed delivery calls = %v, want %v", got, want)
+			}
+		})
+	}
+}
+
+func TestSteeringValidFallbackCompletionWaitsForOrderedObservation(t *testing.T) {
+	steerer := &scriptedSteerer{started: make(chan struct{}, 1), results: make(chan scriptedSteerResult, 1)}
+	hook := &recordingDeliveryHook{}
+	l, machine, _, cancel := newSteeringUnit(t, steerer, hook)
+	t.Cleanup(cancel)
+	if err := machine.setStream(orderedUnitStream()); err != nil {
+		t.Fatalf("set stream: %v", err)
+	}
+	input := unitPreparedInput(t, l, "delayed fallback")
+	if handled, err := machine.offer(input); !handled || err != nil {
+		t.Fatalf("offer = handled %t err %v", handled, err)
+	}
+	awaitStarted(t, steerer.started)
+	result := fallbackSteerResult()
+	completion := steeringCompletion{attempt: machine.active, result: result}
+	if err := machine.complete(completion); err != nil {
+		t.Fatalf("valid fallback completion: %v", err)
+	}
+	if machine.active == nil || machine.active.resolved {
+		t.Fatal("valid fallback completion resolved before its ordered observation")
+	}
+	if got := hook.snapshot(); !reflect.DeepEqual(got, []string{"reserve"}) {
+		t.Fatalf("early fallback delivery calls = %v, want reservation only", got)
+	}
+	if err := machine.observe(driver.SteerObservation{SteerResult: result}); err != nil {
+		t.Fatalf("delayed fallback observation: %v", err)
+	}
+	if machine.active != nil || machine.pendingCount() != 0 {
+		t.Fatalf("delayed fallback state = active %p pending %d, want released", machine.active, machine.pendingCount())
+	}
+	if got, want := hook.snapshot(), []string{"reserve", "fallback"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("delayed fallback delivery calls = %v, want %v", got, want)
+	}
+}
+
 func funcCommandInterrupt(*testing.T, *Loop, uuid.UUID) (command.Command, func(*testing.T)) {
 	ack := make(chan bool, 1)
 	return command.Interrupt{Ack: ack}, func(t *testing.T) {

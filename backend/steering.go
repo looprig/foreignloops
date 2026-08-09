@@ -308,13 +308,20 @@ func (m *steeringMachine) complete(completion steeringCompletion) error {
 	if completion.result.WriteAdmitted {
 		attempt.writerAdmitted = true
 	}
-	// A completed call with no result is an acknowledgement failure. Do not
-	// wait for an ordered observation that can never identify the outcome.
-	// Valid provider results still wait for their ordered observation so the
-	// actor preserves wire order when the call goroutine wins the scheduler
+	// A completed call with no result is an acknowledgement failure. A valid
+	// admission/delivery-unknown result paired with the call deadline is also
+	// authoritative: the bounded call has exhausted its evidence window, and
+	// no ordered observation may arrive to identify a more specific outcome.
+	// Other valid provider results still wait for their ordered observation so
+	// the actor preserves wire order when the call goroutine wins the scheduler
 	// race.
+	validBoundedUnknown := errors.Is(completion.err, context.DeadlineExceeded) &&
+		completion.result.Validate() == nil &&
+		(completion.result.Outcome == driver.SteerOutcomeAdmissionUnknown ||
+			completion.result.Outcome == driver.SteerOutcomeDeliveryUnknown)
 	if !attempt.seen && (completion.err != nil && completion.result.Outcome == "" ||
-		completion.result.Outcome != "" && completion.result.Validate() != nil) {
+		completion.result.Outcome != "" && completion.result.Validate() != nil ||
+		validBoundedUnknown) {
 		if err := m.resolveAttempt(attempt); err != nil {
 			return err
 		}
