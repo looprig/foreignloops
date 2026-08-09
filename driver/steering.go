@@ -1,6 +1,7 @@
 package driver
 
 import (
+	"errors"
 	"fmt"
 
 	"github.com/looprig/core/content"
@@ -210,7 +211,33 @@ type SteerResult struct {
 // required for every outcome.
 func (r SteerResult) Validate() error {
 	if !r.Outcome.Valid() {
-		return fmt.Errorf("driver: invalid steering outcome %q", r.Outcome)
+		return errors.New("driver: invalid steering outcome")
+	}
+	if r.ReceiveSequence != r.ResponseSequence {
+		return errors.New("driver: invalid steering receive sequence")
+	}
+	if r.ResponseSequence != 0 && !r.WriteAdmitted {
+		return errors.New("driver: steering response was not writer-admitted")
+	}
+	switch r.Outcome {
+	case SteerOutcomeUnsupported:
+		if r.WriteAdmitted {
+			return errors.New("driver: unsupported steering was writer-admitted")
+		}
+		if r.ReceiveSequence != 0 {
+			return errors.New("driver: unsupported steering has a response sequence")
+		}
+	case SteerOutcomeInjected, SteerOutcomeDeliveredUntrackable:
+		if !r.WriteAdmitted {
+			return errors.New("driver: steering outcome was not writer-admitted")
+		}
+		if r.ResponseSequence == 0 {
+			return errors.New("driver: steering outcome has no response sequence")
+		}
+	case SteerOutcomeDeliveryUnknown:
+		if !r.WriteAdmitted {
+			return errors.New("driver: unknown steering delivery was not writer-admitted")
+		}
 	}
 	return nil
 }
@@ -240,10 +267,26 @@ type Observation interface {
 	observation()
 }
 
-// OrderedStream is an optional stream capability. Stream implementations that
-// need to expose ACP prompt/update/steer ordering may implement it without
-// changing the existing Stream interface.
+// OrderedStream is an optional stream capability. It does not replace the
+// existing Stream.Events channel: legacy consumers may continue to consume
+// normalized Event values, while a steering-aware backend type-asserts
+// OrderedStream and consumes one observation channel as its authoritative
+// prompt/update/steer order.
+//
+// The observation channel is owned by the stream implementation. It is read
+// only by consumers and is closed exactly once after the stream has finished
+// producing observations; consumers must not close it. Stream.Close remains
+// the lifecycle operation and remains idempotent. Every Steerer.Steer call
+// produces exactly one SteerObservation, including calls ending in a typed
+// error or a pre-admission result. A producer emits observations in
+// nondecreasing ReceiveSequence order. Multiple translated observations may
+// share one receive sequence; their channel order is the tie-breaker and
+// consumers must not reorder equal-sequence observations.
 type OrderedStream interface {
+	// Observations returns the stream-owned ordered observation channel. A
+	// supported implementation returns the same channel for the stream's
+	// lifetime; a stream without this capability simply does not implement
+	// OrderedStream.
 	Observations() <-chan Observation
 }
 

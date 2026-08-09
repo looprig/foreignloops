@@ -170,6 +170,55 @@ func TestSteerResultAndObservationsCarryAdmissionAndOrder(t *testing.T) {
 	}
 }
 
+func TestSteerResultValidationEnforcesDeliveryFacts(t *testing.T) {
+	tests := []struct {
+		name string
+		got  SteerResult
+		want bool
+	}{
+		// unsupported is a proof that no write occurred and therefore carries
+		// no inbound response fact.
+		{name: "unsupported pre-write", got: SteerResult{Outcome: SteerOutcomeUnsupported}, want: true},
+		{name: "unsupported admitted", got: SteerResult{Outcome: SteerOutcomeUnsupported, WriteAdmitted: true}, want: false},
+		{name: "unsupported response", got: SteerResult{Outcome: SteerOutcomeUnsupported, ResponseSequence: 1}, want: false},
+		{name: "unsupported receive", got: SteerResult{Outcome: SteerOutcomeUnsupported, ReceiveSequence: 1}, want: false},
+		{name: "unsupported sequence mismatch", got: SteerResult{Outcome: SteerOutcomeUnsupported, ReceiveSequence: 1, ResponseSequence: 2}, want: false},
+
+		{name: "injected admitted response", got: SteerResult{Outcome: SteerOutcomeInjected, WriteAdmitted: true, ReceiveSequence: 1, ResponseSequence: 1}, want: true},
+		{name: "injected not admitted", got: SteerResult{Outcome: SteerOutcomeInjected, ReceiveSequence: 1, ResponseSequence: 1}, want: false},
+		{name: "injected no response", got: SteerResult{Outcome: SteerOutcomeInjected, WriteAdmitted: true}, want: false},
+		{name: "injected sequence mismatch", got: SteerResult{Outcome: SteerOutcomeInjected, WriteAdmitted: true, ReceiveSequence: 1, ResponseSequence: 2}, want: false},
+
+		{name: "fallback pre-write", got: SteerResult{Outcome: SteerOutcomeFallbackRequired}, want: true},
+		{name: "fallback admitted before response", got: SteerResult{Outcome: SteerOutcomeFallbackRequired, WriteAdmitted: true}, want: true},
+		{name: "fallback post-write", got: SteerResult{Outcome: SteerOutcomeFallbackRequired, WriteAdmitted: true, ReceiveSequence: 2, ResponseSequence: 2}, want: true},
+		{name: "fallback response without admission", got: SteerResult{Outcome: SteerOutcomeFallbackRequired, ResponseSequence: 2}, want: false},
+		{name: "fallback sequence mismatch", got: SteerResult{Outcome: SteerOutcomeFallbackRequired, WriteAdmitted: true, ReceiveSequence: 1, ResponseSequence: 2}, want: false},
+
+		{name: "unknown admitted before response", got: SteerResult{Outcome: SteerOutcomeDeliveryUnknown, WriteAdmitted: true}, want: true},
+		{name: "unknown admitted response", got: SteerResult{Outcome: SteerOutcomeDeliveryUnknown, WriteAdmitted: true, ReceiveSequence: 3, ResponseSequence: 3}, want: true},
+		{name: "unknown not admitted", got: SteerResult{Outcome: SteerOutcomeDeliveryUnknown}, want: false},
+		{name: "unknown response without admission", got: SteerResult{Outcome: SteerOutcomeDeliveryUnknown, ReceiveSequence: 3, ResponseSequence: 3}, want: false},
+		{name: "unknown sequence mismatch", got: SteerResult{Outcome: SteerOutcomeDeliveryUnknown, WriteAdmitted: true, ReceiveSequence: 1, ResponseSequence: 2}, want: false},
+
+		{name: "untrackable admitted response", got: SteerResult{Outcome: SteerOutcomeDeliveredUntrackable, WriteAdmitted: true, ReceiveSequence: 4, ResponseSequence: 4}, want: true},
+		{name: "untrackable not admitted", got: SteerResult{Outcome: SteerOutcomeDeliveredUntrackable, ReceiveSequence: 4, ResponseSequence: 4}, want: false},
+		{name: "untrackable no response", got: SteerResult{Outcome: SteerOutcomeDeliveredUntrackable, WriteAdmitted: true}, want: false},
+		{name: "untrackable sequence mismatch", got: SteerResult{Outcome: SteerOutcomeDeliveredUntrackable, WriteAdmitted: true, ReceiveSequence: 1, ResponseSequence: 2}, want: false},
+
+		{name: "all outcomes receive alias omitted", got: SteerResult{Outcome: SteerOutcomeFallbackRequired, WriteAdmitted: true, ResponseSequence: 5}, want: false},
+		{name: "all outcomes response alias omitted", got: SteerResult{Outcome: SteerOutcomeFallbackRequired, WriteAdmitted: true, ReceiveSequence: 5}, want: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := tt.got.Validate()
+			if (err == nil) != tt.want {
+				t.Fatalf("SteerResult.Validate() error = %v, want valid = %t for %#v", err, tt.want, tt.got)
+			}
+		})
+	}
+}
+
 func TestObservationKindValuesAreClosed(t *testing.T) {
 	values := []ObservationKind{ObservationPrompt, ObservationUpdate, ObservationSteer}
 	for want, got := range values {
