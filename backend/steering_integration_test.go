@@ -554,6 +554,106 @@ func TestSteeringIntegrationPromptRequiredQueuesExactlyOneFallback(t *testing.T)
 	}
 }
 
+func TestSteeringIntegrationFallbackFIFOAcrossTurnsDoesNotSteerBehindOlderPending(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	t.Cleanup(cancel)
+	script := steertest.DefaultScript()
+	script.Prompts = []steertest.PromptScript{
+		{Actions: []steertest.Action{{Kind: steertest.ActionTerminal, Gate: "active-terminal"}}},
+		{Actions: []steertest.Action{{Kind: steertest.ActionTerminal, Gate: "fallback-one"}}},
+		{Actions: []steertest.Action{{Kind: steertest.ActionTerminal, Gate: "fallback-two"}}},
+		{Actions: []steertest.Action{{Kind: steertest.ActionTerminal, Gate: "fallback-three"}}},
+	}
+	script.Steers = []steertest.SteerScript{{Actions: []steertest.Action{
+		{Kind: steertest.ActionSteerReply, Outcome: steertest.OutcomePromptRequired, Gate: "steer-ack"},
+	}}}
+	base, fixture := newSteeringIntegrationACP(t, ctx, script, acpdriver.HarnessClaudeCode)
+	counting := &steeringIntegrationCountingAgent{Driver: base}
+	hook := &steeringIntegrationDeliveryHook{}
+	pub := newSteeringIntegrationPublisher()
+	state, loopID := buildSteeringIntegrationBackend(t, ctx, counting, hook, pub)
+	activeID, firstID, secondID, thirdID := steeringIntegrationUUID(t), steeringIntegrationUUID(t), steeringIntegrationUUID(t), steeringIntegrationUUID(t)
+
+	if err := sendSteeringIntegrationInput(t, ctx, state, loopID, activeID, "active", false); err != nil {
+		t.Fatalf("active input: %v", err)
+	}
+	pub.wait(ctx, func(input event.Event) bool {
+		started, ok := input.(event.TurnStarted)
+		return ok && started.Cause.CommandID == activeID
+	})
+	waitIntegrationGate(t, ctx, fixture, 0, "active-terminal")
+
+	if err := sendSteeringIntegrationInput(t, ctx, state, loopID, firstID, "first fallback", true); err != nil {
+		t.Fatalf("first fallback input: %v", err)
+	}
+	waitIntegrationGate(t, ctx, fixture, 1, "steer-ack")
+	if err := fixture.Release("steer-ack"); err != nil {
+		t.Fatalf("release steering acknowledgement: %v", err)
+	}
+	waitIntegrationSteerOutcome(t, ctx, fixture, 0, steertest.OutcomePromptRequired)
+
+	// The first fallback is now durably queued. The second request must remain
+	// older than a request arriving while that fallback turn is active.
+	if err := sendSteeringIntegrationInput(t, ctx, state, loopID, secondID, "second fallback", true); err != nil {
+		t.Fatalf("second fallback input: %v", err)
+	}
+	if err := fixture.Release("active-terminal"); err != nil {
+		t.Fatalf("release active terminal: %v", err)
+	}
+	if _, err := fixture.WaitForNth(ctx, steertest.EventTerminal, 0); err != nil {
+		t.Fatalf("active terminal: %v", err)
+	}
+	waitIntegrationGate(t, ctx, fixture, 2, "fallback-one")
+
+	// While #1 is active, #2 remains in Loop.pending. #3 must be queued behind
+	// it instead of being steered into #1.
+	if err := sendSteeringIntegrationInput(t, ctx, state, loopID, thirdID, "third fallback", true); err != nil {
+		t.Fatalf("third fallback input: %v", err)
+	}
+	if err := fixture.Release("fallback-one"); err != nil {
+		t.Fatalf("release first fallback terminal: %v", err)
+	}
+	if _, err := fixture.WaitForNth(ctx, steertest.EventTerminal, 1); err != nil {
+		t.Fatalf("first fallback terminal: %v", err)
+	}
+	waitIntegrationGate(t, ctx, fixture, 3, "fallback-two")
+	if err := fixture.Release("fallback-two"); err != nil {
+		t.Fatalf("release second fallback terminal: %v", err)
+	}
+	if _, err := fixture.WaitForNth(ctx, steertest.EventTerminal, 2); err != nil {
+		t.Fatalf("second fallback terminal: %v", err)
+	}
+	waitIntegrationGate(t, ctx, fixture, 4, "fallback-three")
+	if err := fixture.Release("fallback-three"); err != nil {
+		t.Fatalf("release third fallback terminal: %v", err)
+	}
+	if _, err := fixture.WaitForNth(ctx, steertest.EventTerminal, 3); err != nil {
+		t.Fatalf("third fallback terminal: %v", err)
+	}
+
+	pub.wait(ctx, func(input event.Event) bool { _, ok := input.(event.TurnDone); return ok })
+	pub.wait(ctx, func(input event.Event) bool { _, ok := input.(event.TurnDone); return ok })
+	pub.wait(ctx, func(input event.Event) bool { _, ok := input.(event.TurnDone); return ok })
+	pub.wait(ctx, func(input event.Event) bool { _, ok := input.(event.TurnDone); return ok })
+
+	_, reservations, fallbacks, resolutions := hook.snapshot()
+	if !reflect.DeepEqual(fallbacks, []uuid.UUID{firstID, secondID, thirdID}) {
+		t.Fatalf("fallback order = %v, want [%s %s %s]", fallbacks, firstID, secondID, thirdID)
+	}
+	if !reflect.DeepEqual(reservations, []uuid.UUID{firstID}) {
+		t.Fatalf("reservations = %v, want [%s]", reservations, firstID)
+	}
+	if len(resolutions) != 0 {
+		t.Fatalf("resolutions = %v, want none for fallback delivery", resolutions)
+	}
+	if got := counting.callCount(); got != 1 {
+		t.Fatalf("ACP steering calls = %d, want one call for #1 only", got)
+	}
+	if got := steeringIntegrationCountEvents(fixture, steertest.EventSteer); got != 2 {
+		t.Fatalf("fixture steer records = %d, want one request/response pair", got)
+	}
+}
+
 func TestSteeringIntegrationCurrentCodexQueuesWithoutExtensionFallback(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	t.Cleanup(cancel)

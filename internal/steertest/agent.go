@@ -775,6 +775,7 @@ type rpcError struct {
 type childState struct {
 	script  Script
 	control net.Conn
+	stdout  io.Writer
 
 	controlMu sync.Mutex
 	stdoutMu  sync.Mutex
@@ -802,6 +803,7 @@ func newChildState(script Script, control net.Conn) *childState {
 	return &childState{
 		script:   script,
 		control:  control,
+		stdout:   os.Stdout,
 		gates:    make(map[string]*childGate),
 		stoppedC: make(chan struct{}),
 	}
@@ -916,7 +918,11 @@ func (s *childState) sendRPC(response rpcResponse) error {
 	data = append(data, '\n')
 	s.stdoutMu.Lock()
 	defer s.stdoutMu.Unlock()
-	_, err = os.Stdout.Write(data)
+	writer := s.stdout
+	if writer == nil {
+		writer = os.Stdout
+	}
+	_, err = writer.Write(data)
 	return err
 }
 
@@ -1088,15 +1094,18 @@ func (s *childState) handlePrompt(request rpcRequest) {
 		case ActionSetSessionInfo:
 			s.emit(Event{Kind: EventSessionInfo, Method: "session/update", Name: action.Name, SessionID: params.SessionID, Text: action.Text})
 		case ActionTerminal:
-			s.emit(Event{Kind: EventTerminal, Method: request.Method, Name: action.Name, SessionID: params.SessionID, Text: action.Text})
+			var err error
 			if action.ErrorCode != 0 {
-				_ = s.sendRPCError(request.ID, action.ErrorCode, action.ErrorMessage)
+				err = s.sendRPCError(request.ID, action.ErrorCode, action.ErrorMessage)
 			} else {
 				stop := action.StopReason
 				if stop == "" {
 					stop = "end_turn"
 				}
-				_ = s.sendRPCResponse(request.ID, map[string]any{"stopReason": stop})
+				err = s.sendRPCResponse(request.ID, map[string]any{"stopReason": stop})
+			}
+			if err == nil {
+				s.emit(Event{Kind: EventTerminal, Method: request.Method, Name: action.Name, SessionID: params.SessionID, Text: action.Text})
 			}
 			return
 		case ActionTransportLoss:
@@ -1142,11 +1151,14 @@ func (s *childState) handleSteer(request rpcRequest) {
 			if outcome == "" {
 				outcome = OutcomeInjected
 			}
-			s.emit(Event{Kind: EventSteer, Method: request.Method, Name: action.Name, SessionID: params.SessionID, Outcome: outcome, Reason: action.Reason})
+			var err error
 			if action.ErrorCode != 0 {
-				_ = s.sendRPCError(request.ID, action.ErrorCode, action.ErrorMessage)
+				err = s.sendRPCError(request.ID, action.ErrorCode, action.ErrorMessage)
 			} else {
-				_ = s.sendRPCResponse(request.ID, map[string]any{"outcome": outcome, "reason": action.Reason})
+				err = s.sendRPCResponse(request.ID, map[string]any{"outcome": outcome, "reason": action.Reason})
+			}
+			if err == nil {
+				s.emit(Event{Kind: EventSteer, Method: request.Method, Name: action.Name, SessionID: params.SessionID, Outcome: outcome, Reason: action.Reason})
 			}
 		case ActionTransportLoss:
 			s.transportLoss()
@@ -1183,7 +1195,11 @@ func (s *childState) sendNotification(method string, params any) error {
 	data = append(data, '\n')
 	s.stdoutMu.Lock()
 	defer s.stdoutMu.Unlock()
-	_, err = os.Stdout.Write(data)
+	writer := s.stdout
+	if writer == nil {
+		writer = os.Stdout
+	}
+	_, err = writer.Write(data)
 	return err
 }
 

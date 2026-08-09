@@ -16,10 +16,18 @@ import (
 	"github.com/looprig/harness/pkg/identity"
 )
 
-// steeringAckTimeout is a runtime safety bound for one provider acknowledgement.
-// It is deliberately not part of a model-facing request. A missing acknowledgement
-// is resolved as ambiguous after this bound and is never retried automatically.
+// steeringAckTimeout is the short runtime safety bound for a steering request
+// whose provider write has already been admitted. It is deliberately not part
+// of a model-facing request. A missing acknowledgement is resolved as
+// ambiguous after this bound and is never retried automatically.
 const steeringAckTimeout = 100 * time.Millisecond
+
+// steeringCallTimeout bounds a request whose provider admission is not yet
+// known. The ACP transport has its own terminal grace period, but the backend
+// must retain a separate hard bound for adapters that never produce a
+// completion or ordered acknowledgement. This longer bound avoids adjudicating
+// a valid wire response merely because the actor was scheduled after terminal.
+const steeringCallTimeout = time.Second
 
 type steeringDisposition uint8
 
@@ -162,7 +170,12 @@ func (m *steeringMachine) offer(input preparedInput) (bool, error) {
 	if !m.isCandidate(input) {
 		return false, nil
 	}
-	if m.terminal || m.disabled || m.fallbackBarrier || m.steerer == nil {
+	// A steering machine is recreated for every normal turn. Once an earlier
+	// fallback has crossed into the loop-level queue, that older request is a
+	// FIFO barrier even though this machine has no local fallbackBarrier yet.
+	// Cancellation removes entries from loop.pending on the actor, so a request
+	// can steer again only after all older queued work has been retracted or run.
+	if len(m.loop.pending) > 0 || m.terminal || m.disabled || m.fallbackBarrier || m.steerer == nil {
 		return true, m.queueFallback(input)
 	}
 	request, err := driver.NewSteerRequest(input.command.Blocks)
@@ -194,10 +207,13 @@ func (m *steeringMachine) pump() error {
 		return err
 	}
 	attempt := &next
-	attemptCtx, cancel := context.WithTimeout(m.ctx, steeringAckTimeout)
+	// Do not start the terminal-race clock at admission. The provider response
+	// and its ordered observation may legitimately arrive after this actor has
+	// launched the call; only a terminal boundary needs a bounded ambiguity
+	// decision. The terminal path cancels this context if that bound expires.
+	attemptCtx, cancel := context.WithTimeout(m.ctx, steeringCallTimeout)
 	attempt.cancel = cancel
 	m.active = attempt
-	m.timer = time.NewTimer(steeringAckTimeout)
 	go m.callSteerer(attemptCtx, attempt)
 	return nil
 }
@@ -463,12 +479,15 @@ func (m *steeringMachine) queuePendingFallbacks() error {
 	return nil
 }
 
-// startTerminalTimer preserves the terminal-race seam for state-machine unit
-// tests and for attempts admitted by older callers. Normal pump admission
-// starts the same bounded acknowledgement clock immediately.
+// startTerminalTimer starts the bounded terminal-race clock for an attempt
+// whose provider acknowledgement is still unresolved.
 func (m *steeringMachine) startTerminalTimer() {
 	if m != nil && m.timer == nil {
-		m.timer = time.NewTimer(steeringAckTimeout)
+		timeout := steeringCallTimeout
+		if m.active != nil && m.active.writerAdmitted {
+			timeout = steeringAckTimeout
+		}
+		m.timer = time.NewTimer(timeout)
 	}
 }
 
@@ -476,7 +495,7 @@ func (m *steeringMachine) startTerminalTimer() {
 // releases its held terminal event and closes/continues the actor according to
 // the normal turn outcome; no automatic fallback is attempted.
 func (m *steeringMachine) timeout() error {
-	if m == nil || m.active == nil || m.active.resolved {
+	if m == nil || !m.terminal || m.active == nil || m.active.resolved {
 		return nil
 	}
 	m.timer = nil

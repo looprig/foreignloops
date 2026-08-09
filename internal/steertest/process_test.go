@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"net"
 	"os"
 	"os/exec"
 	"strings"
@@ -172,6 +173,9 @@ func TestFixtureScriptGatesPromptSteerAndTerminalOrdering(t *testing.T) {
 	if err := json.Unmarshal(steerResponse.Result, &steer); err != nil || steer.Outcome != string(OutcomeInjected) {
 		t.Fatalf("steer response = %s, want injected", steerResponse.Result)
 	}
+	if got, err := agent.WaitForNth(context.Background(), EventSteer, 1); err != nil || got.Outcome != OutcomeInjected {
+		t.Fatalf("post-write steer event = %#v, %v; want injected response fact", got, err)
+	}
 	if err := agent.Release("release-terminal"); err != nil {
 		t.Fatalf("release terminal: %v", err)
 	}
@@ -190,6 +194,145 @@ func TestFixtureScriptGatesPromptSteerAndTerminalOrdering(t *testing.T) {
 	if !eventOrder(transcript, EventUpdate, EventSteer, EventTerminal) {
 		t.Fatalf("transcript order = %s, want update before steer response and terminal", agent.Transcript())
 	}
+}
+
+func TestFixtureSteerFactIsPublishedAfterRPCResponseWrite(t *testing.T) {
+	controlPeer, controlChild := net.Pipe()
+	defer controlPeer.Close()
+	defer controlChild.Close()
+	script := DefaultScript()
+	script.Steers = []SteerScript{{Actions: []Action{{Kind: ActionSteerReply, Outcome: OutcomeInjected}}}}
+	state := newChildState(script, controlChild)
+	writer := &blockingFixtureWriter{started: make(chan struct{}), release: make(chan struct{})}
+	state.stdout = writer
+
+	events := make(chan Event, 4)
+	go func() {
+		reader := bufio.NewReader(controlPeer)
+		for {
+			line, err := reader.ReadBytes('\n')
+			if err != nil {
+				return
+			}
+			var event Event
+			if json.Unmarshal(line, &event) == nil {
+				events <- event
+			}
+		}
+	}()
+
+	done := make(chan struct{})
+	go func() {
+		state.handleSteer(rpcRequest{
+			JSONRPC: "2.0",
+			ID:      json.RawMessage(`1`),
+			Method:  "_session/steering",
+			Params:  json.RawMessage(`{"sessionId":"fixture-session"}`),
+		})
+		close(done)
+	}()
+	if first := <-events; first.Kind != EventSteer || first.Outcome != "" {
+		t.Fatalf("initial steer fact = %#v, want request fact without outcome", first)
+	}
+	select {
+	case <-writer.started:
+	case <-time.After(time.Second):
+		t.Fatal("steer response write did not start")
+	}
+	select {
+	case got := <-events:
+		t.Fatalf("steer response fact published before RPC write completed: %#v", got)
+	default:
+	}
+	close(writer.release)
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("steer handler did not finish after RPC write release")
+	}
+	select {
+	case got := <-events:
+		if got.Kind != EventSteer || got.Outcome != OutcomeInjected {
+			t.Fatalf("post-write steer fact = %#v, want injected response", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("post-write steer fact did not arrive")
+	}
+}
+
+func TestFixtureTerminalFactIsPublishedAfterRPCResponseWrite(t *testing.T) {
+	controlPeer, controlChild := net.Pipe()
+	defer controlPeer.Close()
+	defer controlChild.Close()
+	script := DefaultScript()
+	script.Prompts = []PromptScript{{Actions: []Action{{Kind: ActionTerminal, StopReason: "end_turn"}}}}
+	state := newChildState(script, controlChild)
+	writer := &blockingFixtureWriter{started: make(chan struct{}), release: make(chan struct{})}
+	state.stdout = writer
+
+	events := make(chan Event, 4)
+	go func() {
+		reader := bufio.NewReader(controlPeer)
+		for {
+			line, err := reader.ReadBytes('\n')
+			if err != nil {
+				return
+			}
+			var event Event
+			if json.Unmarshal(line, &event) == nil {
+				events <- event
+			}
+		}
+	}()
+
+	done := make(chan struct{})
+	go func() {
+		state.handlePrompt(rpcRequest{
+			JSONRPC: "2.0",
+			ID:      json.RawMessage(`1`),
+			Method:  "session/prompt",
+			Params:  json.RawMessage(`{"sessionId":"fixture-session"}`),
+		})
+		close(done)
+	}()
+	if first := <-events; first.Kind != EventPrompt {
+		t.Fatalf("prompt request fact = %#v, want prompt", first)
+	}
+	select {
+	case <-writer.started:
+	case <-time.After(time.Second):
+		t.Fatal("prompt response write did not start")
+	}
+	select {
+	case got := <-events:
+		t.Fatalf("terminal fact published before RPC write completed: %#v", got)
+	default:
+	}
+	close(writer.release)
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("prompt handler did not finish after RPC write release")
+	}
+	select {
+	case got := <-events:
+		if got.Kind != EventTerminal {
+			t.Fatalf("post-write terminal fact = %#v, want terminal", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("post-write terminal fact did not arrive")
+	}
+}
+
+type blockingFixtureWriter struct {
+	started chan struct{}
+	release chan struct{}
+}
+
+func (w *blockingFixtureWriter) Write(p []byte) (int, error) {
+	close(w.started)
+	<-w.release
+	return len(p), nil
 }
 
 func TestFixtureTransportLossAndStartedNewTurnAreScriptable(t *testing.T) {

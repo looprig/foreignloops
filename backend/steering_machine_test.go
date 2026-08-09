@@ -545,6 +545,43 @@ func TestSteeringPostWriterTimeoutIsUnknownAndDisables(t *testing.T) {
 	}
 }
 
+func TestSteeringTimeoutBeforeTerminalDoesNotAdjudicateDelayedPromptRequired(t *testing.T) {
+	steerer := &scriptedSteerer{started: make(chan struct{}, 1), results: make(chan scriptedSteerResult, 1)}
+	hook := &recordingDeliveryHook{}
+	l, m, _, cancel := newSteeringUnit(t, steerer, hook)
+	t.Cleanup(cancel)
+	if err := m.setStream(orderedUnitStream()); err != nil {
+		t.Fatalf("set stream: %v", err)
+	}
+	input := unitPreparedInput(t, l, "delayed promptRequired")
+	if _, err := m.offer(input); err != nil {
+		t.Fatalf("offer: %v", err)
+	}
+	awaitStarted(t, steerer.started)
+
+	// A provider acknowledgement may be delayed by wire scheduling while the
+	// active prompt is still running. The terminal-race timeout must not resolve
+	// that request as unknown before a terminal boundary exists.
+	if err := m.timeout(); err != nil {
+		t.Fatalf("pre-terminal timeout: %v", err)
+	}
+	if m.active == nil || m.active.resolved {
+		t.Fatal("pre-terminal timeout resolved the active steering attempt")
+	}
+
+	result := fallbackSteerResult()
+	if err := m.observe(driver.SteerObservation{SteerResult: result}); err != nil {
+		t.Fatalf("delayed fallback acknowledgement: %v", err)
+	}
+	steerer.results <- scriptedSteerResult{result: result}
+	if err := m.complete(takeCompletion(t, m)); err != nil {
+		t.Fatalf("complete delayed fallback: %v", err)
+	}
+	if got, want := hook.snapshot(), []string{"reserve", "fallback"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("delayed promptRequired calls = %v, want %v", got, want)
+	}
+}
+
 func TestSteeringAdmissionUnknownIsNonRetryable(t *testing.T) {
 	steerer := &scriptedSteerer{started: make(chan struct{}, 1), results: make(chan scriptedSteerResult, 1)}
 	hook := &recordingDeliveryHook{}
