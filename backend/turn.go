@@ -120,8 +120,13 @@ func (l *Loop) awaitTurn(loopCtx context.Context, cur event.TurnIndex, activeCom
 			if !outcome.success && !outcome.interrupted {
 				if err := l.cancelPending(loopCtx, turnID, stepID, event.CancelTurnFailed); err != nil {
 					slog.Error("foreignloop: queued cancellation publication failed", "error", err)
+					_ = machine.shutdown()
 					return true
 				}
+			}
+			if err := machine.shutdown(); err != nil {
+				machine.logFault()
+				return true
 			}
 			return false
 		}
@@ -188,7 +193,7 @@ func (l *Loop) awaitTurn(loopCtx context.Context, cur event.TurnIndex, activeCom
 			}
 		case <-loopCtx.Done():
 			cancel()
-			if _, err := l.receiveTurnOutcome(loopCtx, cur, turnID, stepID, mailbox, result, machine, false); err != nil {
+			if err := l.drainSteeringShutdown(loopCtx, cur, turnID, stepID, mailbox, result, machine); err != nil {
 				machine.logFault()
 				return true
 			}
@@ -321,10 +326,14 @@ func (l *Loop) handleTurnCommand(loopCtx context.Context, input command.Command,
 		return true, false
 	case command.Shutdown:
 		cancel()
-		if _, err := l.receiveTurnOutcome(loopCtx, cur, turnID, stepID, mailbox, result, machine, false); err != nil {
+		if err := l.drainSteeringShutdown(loopCtx, cur, turnID, stepID, mailbox, result, machine); err != nil {
+			l.closeAgent()
+			typed.Ack <- err
 			return true, true
 		}
 		if err := machine.shutdown(); err != nil {
+			l.closeAgent()
+			typed.Ack <- err
 			return true, true
 		}
 		if err := l.cancelPending(loopCtx, turnID, stepID, event.CancelTurnInterrupted); err != nil {
@@ -731,6 +740,92 @@ func (l *Loop) drainTurnObservations(ctx context.Context, cur event.TurnIndex, t
 		}
 	}
 	return nil
+}
+
+// drainSteeringShutdown adjudicates only the actor-owned steering state during
+// clean shutdown. A turn provider may ignore cancellation and leave both its
+// outcome and observation mailbox open; neither is needed to finalize a
+// reserved delivery. Already-buffered completions/observations are consumed
+// first, while the machine's bounded terminal/deadline timers provide the only
+// wait when no evidence is available.
+func (l *Loop) drainSteeringShutdown(ctx context.Context, cur event.TurnIndex, turnID, stepID uuid.UUID,
+	mailbox <-chan turnObservation, result <-chan turnOutcome, machine *steeringMachine,
+) error {
+	if machine == nil {
+		return nil
+	}
+	if _, err := machine.beforeTerminal(); err != nil {
+		return err
+	}
+	var terminalHold *turnObservation
+	drainReady := func() error {
+		for {
+			select {
+			case _, ok := <-result:
+				if !ok {
+					result = nil
+				}
+			case completion := <-machine.completionsChan():
+				if err := machine.complete(completion); err != nil {
+					return err
+				}
+			case observation, ok := <-mailbox:
+				if !ok {
+					mailbox = nil
+					continue
+				}
+				if err := l.processTurnOutcomeObservation(ctx, cur, turnID, stepID, observation, machine, &terminalHold, false); err != nil {
+					return err
+				}
+			default:
+				return nil
+			}
+		}
+	}
+	for {
+		if err := drainReady(); err != nil {
+			return err
+		}
+		if machine.terminalReady() {
+			return nil
+		}
+		select {
+		case _, ok := <-result:
+			if !ok {
+				result = nil
+			}
+		case completion := <-machine.completionsChan():
+			if err := machine.complete(completion); err != nil {
+				return err
+			}
+		case observation, ok := <-mailbox:
+			if !ok {
+				mailbox = nil
+				continue
+			}
+			if err := l.processTurnOutcomeObservation(ctx, cur, turnID, stepID, observation, machine, &terminalHold, false); err != nil {
+				return err
+			}
+		case <-machine.timerChan():
+			if err := drainReady(); err != nil {
+				return err
+			}
+			if machine.active != nil {
+				if err := machine.timeout(); err != nil {
+					return err
+				}
+			}
+		case <-machine.deadlineTimerChan():
+			if err := drainReady(); err != nil {
+				return err
+			}
+			if machine.active != nil {
+				if err := machine.deadlineTimeout(); err != nil {
+					return err
+				}
+			}
+		}
+	}
 }
 
 func (l *Loop) receiveTurnOutcome(ctx context.Context, cur event.TurnIndex, turnID, stepID uuid.UUID,

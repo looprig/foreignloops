@@ -75,7 +75,10 @@ func TestTurnCancellationDeliversConcurrentSteerCompletion(t *testing.T) {
 			inputCommand, verifyAck := tt.make(t, l, activeCommandID)
 			mailbox := make(chan turnObservation)
 			close(mailbox)
-			result := make(chan turnOutcome)
+			// Shutdown now drains only actor steering evidence and may finish
+			// before a turn outcome is produced. Keep this compatibility seam
+			// buffered so a late cancellation outcome cannot block the test sender.
+			result := make(chan turnOutcome, 1)
 			cancelStarted := make(chan struct{})
 			cancelForCommand := func() {
 				close(cancelStarted)
@@ -266,7 +269,9 @@ func TestTurnCancellationAdjudicatesReservedSteerBeforeLifecycle(t *testing.T) {
 			completion := takeCompletion(t, machine)
 			machine.completions <- completion
 
-			result := make(chan turnOutcome)
+			// Steering evidence may fully adjudicate shutdown before the provider
+			// outcome is produced; keep the late outcome send non-blocking.
+			result := make(chan turnOutcome, 1)
 			mailbox := make(chan turnObservation)
 			close(mailbox)
 			inputCommand, verifyAck := tt.make(t, l, activeCommandID)

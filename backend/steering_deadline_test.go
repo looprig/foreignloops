@@ -10,6 +10,7 @@ import (
 
 	"github.com/looprig/core/uuid"
 	"github.com/looprig/foreignloops/driver"
+	"github.com/looprig/harness/pkg/command"
 	"github.com/looprig/harness/pkg/foreign"
 )
 
@@ -378,5 +379,205 @@ func TestSteeringShutdownFinalizesUnresolvedReservation(t *testing.T) {
 	close(steerer.release)
 	if err := machine.complete(takeCompletion(t, machine)); err != nil {
 		t.Fatalf("late shutdown completion: %v", err)
+	}
+}
+
+func TestShutdownDoesNotWaitForNoncooperativeTurnOutcome(t *testing.T) {
+	steerer := &ignoringSteerer{started: make(chan struct{}, 1), release: make(chan struct{})}
+	hook := &recordingDeliveryHook{}
+	l, machine, _, cancel := newSteeringUnit(t, steerer, hook)
+	factory := &manualSteeringTimerFactory{}
+	machine.timerFactory = factory.new
+	if err := machine.setStream(orderedUnitStream()); err != nil {
+		t.Fatalf("set stream: %v", err)
+	}
+	input := unitPreparedInput(t, l, "shutdown noncooperative")
+	if _, err := machine.offer(input); err != nil {
+		t.Fatalf("offer: %v", err)
+	}
+	awaitStarted(t, steerer.started)
+	timers, _ := factory.snapshot()
+	if len(timers) != 1 {
+		t.Fatalf("reservation timers = %d, want one", len(timers))
+	}
+
+	mailbox := make(chan turnObservation)
+	result := make(chan turnOutcome)
+	ack := make(chan error, 1)
+	commandDone := make(chan struct {
+		done bool
+		exit bool
+	}, 1)
+	cancelCalled := make(chan struct{})
+	var cancelOnce sync.Once
+	var releaseOnce sync.Once
+	finished := false
+	cancelForShutdown := func() {
+		cancelOnce.Do(func() { close(cancelCalled) })
+		cancel()
+	}
+	releaseSteerer := func() { releaseOnce.Do(func() { close(steerer.release) }) }
+	t.Cleanup(func() {
+		releaseSteerer()
+		if finished {
+			return
+		}
+		result <- turnOutcome{}
+		close(mailbox)
+		<-commandDone
+	})
+	shutdown := command.Shutdown{Ack: ack}
+	go func() {
+		done, exit := l.handleTurnCommand(
+			context.Background(), shutdown, 1, mustID(t), input.turnID, input.stepID,
+			cancelForShutdown, l.publisher(context.Background(), input.turnID, input.stepID), mailbox, result, machine,
+		)
+		commandDone <- struct {
+			done bool
+			exit bool
+		}{done: done, exit: exit}
+	}()
+	<-cancelCalled
+	timers[0].fire()
+
+	// The shutdown path must finish after the actor-owned deadline even though
+	// neither the provider turn outcome nor its mailbox ever closes.
+	select {
+	case outcome := <-commandDone:
+		finished = true
+		if !outcome.done || !outcome.exit {
+			t.Fatalf("shutdown result = done:%t exit:%t, want done/exit", outcome.done, outcome.exit)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("shutdown waited for noncooperative turn outcome after deadline")
+	}
+	if err := <-ack; err != nil {
+		t.Fatalf("shutdown ack = %v, want nil", err)
+	}
+	if got, want := hook.snapshot(), []string{"reserve", string(foreign.DeliveryResolutionUnknown)}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("shutdown calls = %v, want %v", got, want)
+	}
+	releaseSteerer()
+}
+
+func TestShutdownAdjudicationFailureAcknowledgesError(t *testing.T) {
+	sentinel := errors.New("shutdown resolution failed")
+	steerer := &ignoringSteerer{started: make(chan struct{}, 1), release: make(chan struct{})}
+	hook := &recordingDeliveryHook{}
+	l, machine, _, cancel := newSteeringUnit(t, steerer, hook)
+	factory := &manualSteeringTimerFactory{}
+	machine.timerFactory = factory.new
+	if err := machine.setStream(orderedUnitStream()); err != nil {
+		t.Fatalf("set stream: %v", err)
+	}
+	input := unitPreparedInput(t, l, "shutdown error")
+	if _, err := machine.offer(input); err != nil {
+		t.Fatalf("offer: %v", err)
+	}
+	awaitStarted(t, steerer.started)
+	timers, _ := factory.snapshot()
+	hook.mu.Lock()
+	hook.err = sentinel
+	hook.mu.Unlock()
+
+	mailbox := make(chan turnObservation)
+	result := make(chan turnOutcome)
+	ack := make(chan error, 1)
+	commandDone := make(chan struct {
+		done bool
+		exit bool
+	}, 1)
+	cancelCalled := make(chan struct{})
+	var cancelOnce sync.Once
+	var releaseOnce sync.Once
+	finished := false
+	cancelForShutdown := func() {
+		cancelOnce.Do(func() { close(cancelCalled) })
+		cancel()
+	}
+	releaseSteerer := func() { releaseOnce.Do(func() { close(steerer.release) }) }
+	t.Cleanup(func() {
+		releaseSteerer()
+		if finished {
+			return
+		}
+		result <- turnOutcome{}
+		close(mailbox)
+		<-commandDone
+	})
+	shutdown := command.Shutdown{Ack: ack}
+	go func() {
+		done, exit := l.handleTurnCommand(
+			context.Background(), shutdown, 1, mustID(t), input.turnID, input.stepID,
+			cancelForShutdown, l.publisher(context.Background(), input.turnID, input.stepID), mailbox, result, machine,
+		)
+		commandDone <- struct {
+			done bool
+			exit bool
+		}{done: done, exit: exit}
+	}()
+	<-cancelCalled
+	timers[0].fire()
+	select {
+	case outcome := <-commandDone:
+		finished = true
+		if !outcome.done || !outcome.exit {
+			t.Fatalf("shutdown result = done:%t exit:%t, want done/exit", outcome.done, outcome.exit)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("shutdown resolution failure did not return")
+	}
+	if err := <-ack; !errors.Is(err, sentinel) {
+		t.Fatalf("shutdown ack = %v, want %v", err, sentinel)
+	}
+	releaseSteerer()
+}
+
+func TestAwaitTurnNormalCompletionRetiresResolvedSteeringAttempt(t *testing.T) {
+	steerer := &ignoringSteerer{started: make(chan struct{}, 1), release: make(chan struct{})}
+	hook := &recordingDeliveryHook{}
+	l, machine, _, cancel := newSteeringUnit(t, steerer, hook)
+	factory := &manualSteeringTimerFactory{}
+	machine.timerFactory = factory.new
+	if err := machine.setStream(orderedUnitStream()); err != nil {
+		t.Fatalf("set stream: %v", err)
+	}
+	input := unitPreparedInput(t, l, "normal completion cleanup")
+	if _, err := machine.offer(input); err != nil {
+		t.Fatalf("offer: %v", err)
+	}
+	awaitStarted(t, steerer.started)
+	timers, _ := factory.snapshot()
+	if len(timers) != 1 {
+		t.Fatalf("reservation timers = %d, want one", len(timers))
+	}
+	if err := machine.observe(driver.SteerObservation{SteerResult: fallbackSteerResult()}); err != nil {
+		t.Fatalf("fallback observation: %v", err)
+	}
+	if machine.active == nil || !machine.active.resolved {
+		t.Fatal("fallback did not resolve before turn outcome")
+	}
+	result := make(chan turnOutcome, 1)
+	result <- turnOutcome{success: true}
+	mailbox := make(chan turnObservation)
+	close(mailbox)
+	streamReady := make(chan driver.Stream)
+	if exited := l.awaitTurn(context.Background(), 1, mustID(t), input.turnID, input.stepID, cancel,
+		l.publisher(context.Background(), input.turnID, input.stepID), mailbox, result, streamReady, machine); exited {
+		t.Fatal("normal completion unexpectedly exited the loop")
+	}
+	if machine.active != nil {
+		t.Fatalf("normal completion active attempt = %p, want retired", machine.active)
+	}
+	if machine.deadlineTimerChan() != nil {
+		t.Fatal("normal completion left reservation deadline armed")
+	}
+	timers[0].fire()
+	if got, want := hook.snapshot(), []string{"reserve", "fallback"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("stale normal-completion deadline changed calls = %v, want %v", got, want)
+	}
+	close(steerer.release)
+	if err := machine.complete(takeCompletion(t, machine)); err != nil {
+		t.Fatalf("late completion: %v", err)
 	}
 }
