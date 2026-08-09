@@ -204,6 +204,7 @@ type SteerResult struct {
 	WriteAdmitted    bool
 	ReceiveSequence  uint64
 	ResponseSequence uint64
+	OrderSequence    uint64
 }
 
 // Validate rejects an unknown outcome. Sequence and admission facts may be
@@ -306,12 +307,18 @@ type PromptObservation struct {
 	WriteAdmitted    bool
 	ReceiveSequence  uint64
 	ResponseSequence uint64
+	OrderSequence    uint64
 	Err              error
 }
 
 func (PromptObservation) Kind() ObservationKind { return ObservationPrompt }
-func (o PromptObservation) Sequence() uint64    { return o.ReceiveSequence }
-func (PromptObservation) observation()          {}
+func (o PromptObservation) Sequence() uint64 {
+	if o.OrderSequence != 0 {
+		return o.OrderSequence
+	}
+	return o.ReceiveSequence
+}
+func (PromptObservation) observation() {}
 
 // UpdateObservation is one normalized update translated from an ACP session
 // notification. One notification may produce multiple observations, each
@@ -320,23 +327,35 @@ func (PromptObservation) observation()          {}
 type UpdateObservation struct {
 	Event           Event
 	ReceiveSequence uint64
+	OrderSequence   uint64
 }
 
 func (UpdateObservation) Kind() ObservationKind { return ObservationUpdate }
-func (o UpdateObservation) Sequence() uint64    { return o.ReceiveSequence }
-func (UpdateObservation) observation()          {}
+func (o UpdateObservation) Sequence() uint64 {
+	if o.OrderSequence != 0 {
+		return o.OrderSequence
+	}
+	return o.ReceiveSequence
+}
+func (UpdateObservation) observation() {}
 
 // SteerObservation is one ordered steering response. Embedding SteerResult
 // keeps admission and receive-order facts available without a second mutable
 // representation.
 type SteerObservation struct {
 	SteerResult
-	Err error
+	Err           error
+	OrderSequence uint64
 }
 
 func (SteerObservation) Kind() ObservationKind { return ObservationSteer }
-func (o SteerObservation) Sequence() uint64    { return o.ReceiveSequence }
-func (SteerObservation) observation()          {}
+func (o SteerObservation) Sequence() uint64 {
+	if o.OrderSequence != 0 {
+		return o.OrderSequence
+	}
+	return o.ReceiveSequence
+}
+func (SteerObservation) observation() {}
 
 var _ Observation = PromptObservation{}
 var _ Observation = UpdateObservation{}

@@ -90,18 +90,32 @@ func (l *turnLifecycle) finish() {
 // function only cancels forwarding for this turn; the session and its owned
 // process remain with Driver.
 type stream struct {
-	events       <-chan driver.Event
+	events       chan driver.Event
 	observations chan driver.Observation
 	done         <-chan struct{}
 	cancel       context.CancelFunc
 	steerIn      chan steerInput
 
-	mu     sync.Mutex
-	closed bool
+	mu                  sync.Mutex
+	closed              bool
+	selected            streamView
+	closedEvents        bool
+	closedObservations  bool
+	pendingEvents       []driver.Event
+	pendingObservations []driver.Observation
+	nextOrder           uint64
 
 	once     sync.Once
 	closeErr error
 }
+
+type streamView uint8
+
+const (
+	viewUnselected streamView = iota
+	viewEvents
+	viewObservations
+)
 
 type steerInput struct {
 	observation driver.SteerObservation
@@ -142,11 +156,11 @@ func (d *Driver) Spawn(ctx context.Context, turn driver.Turn) (driver.Stream, er
 		driverCtx = context.Background()
 	}
 	turnCtx, cancel := context.WithCancel(ctx)
-	events := make(chan driver.Event, 1024)
+	events := make(chan driver.Event, 2048)
 	done := make(chan struct{})
 	s := &stream{
 		events:       events,
-		observations: make(chan driver.Observation, 1024),
+		observations: make(chan driver.Observation, 2048),
 		done:         done,
 		cancel:       cancel,
 		steerIn:      make(chan steerInput, 512),
@@ -192,8 +206,16 @@ func (d *Driver) runTurn(
 		}
 	pendingSteersDrained:
 		close(done)
-		close(events)
-		close(streamState.observations)
+		streamState.mu.Lock()
+		if !streamState.closedEvents {
+			close(streamState.events)
+			streamState.closedEvents = true
+		}
+		if !streamState.closedObservations {
+			close(streamState.observations)
+			streamState.closedObservations = true
+		}
+		streamState.mu.Unlock()
 		d.activeMu.Lock()
 		if d.active == streamState {
 			d.active = nil
@@ -282,7 +304,7 @@ func (d *Driver) runTurn(
 				pendingSteerInputsDrained:
 					drainTurnUpdatesThrough(turnCtx, updates, &pendingUpdates, state, events, streamState, promptSequence(outcome))
 					emitPromptObservation(streamState, outcome)
-					sendPromptTerminal(turnCtx, events, state, outcome)
+					sendPromptTerminal(turnCtx, streamState, events, state, outcome)
 					return
 				}
 			}
@@ -327,7 +349,7 @@ func waitForPromptUpdates(ctx context.Context, sess turnSession, sequence uint64
 func emitTranslatedUpdate(ctx context.Context, streamState *stream, update client.Update, state *translationState, events chan<- driver.Event) {
 	for _, event := range translateLiveUpdate(update, state) {
 		emitObservation(streamState, driver.UpdateObservation{Event: event, ReceiveSequence: update.ReceiveSequence})
-		sendTurnEvent(ctx, events, event)
+		sendTurnEvent(ctx, streamState, events, event)
 	}
 }
 
@@ -422,7 +444,7 @@ func drainTurnUpdatesThrough(
 			}
 			if streamState == nil {
 				for _, event := range translateLiveUpdate(update, state) {
-					sendTurnEvent(turnCtx, events, event)
+					sendTurnEvent(turnCtx, streamState, events, event)
 				}
 				continue
 			}
@@ -451,7 +473,25 @@ func translateLiveUpdate(update client.Update, state *translationState) []driver
 	return translateUpdate(update.SessionUpdate, state)
 }
 
-func sendTurnEvent(ctx context.Context, events chan<- driver.Event, event driver.Event) {
+func sendTurnEvent(ctx context.Context, streamState *stream, events chan<- driver.Event, event driver.Event) {
+	if streamState == nil {
+		select {
+		case events <- event:
+		case <-ctx.Done():
+		}
+		return
+	}
+	streamState.mu.Lock()
+	selected := streamState.selected
+	if selected == viewUnselected {
+		streamState.pendingEvents = append(streamState.pendingEvents, event)
+		streamState.mu.Unlock()
+		return
+	}
+	streamState.mu.Unlock()
+	if selected == viewObservations {
+		return
+	}
 	select {
 	case events <- event:
 	case <-ctx.Done():
@@ -657,18 +697,18 @@ func truncateValidUTF8(input string, maxBytes int) string {
 	return input[:cut]
 }
 
-func sendPromptTerminal(ctx context.Context, events chan<- driver.Event, state *translationState, outcome promptOutcome) {
+func sendPromptTerminal(ctx context.Context, streamState *stream, events chan<- driver.Event, state *translationState, outcome promptOutcome) {
 	if outcome.err != nil || outcome.result == nil {
-		sendTerminalEvent(ctx, events, promptFailureEvent(outcome.err))
+		sendTerminalEvent(ctx, streamState, events, promptFailureEvent(outcome.err))
 		return
 	}
 	if message := state.message(); message != nil {
-		sendTurnEvent(ctx, events, driver.Event{
+		sendTurnEvent(ctx, streamState, events, driver.Event{
 			Kind:    driver.KindStepComplete,
 			Message: message,
 		})
 	}
-	sendTerminalEvent(ctx, events, terminalEvent(outcome.result.StopReason))
+	sendTerminalEvent(ctx, streamState, events, terminalEvent(outcome.result.StopReason))
 }
 
 // sendTerminalEvent preserves the terminal marker when a cancelled turn is
@@ -676,7 +716,13 @@ func sendPromptTerminal(ctx context.Context, events chan<- driver.Event, state *
 // is full, the non-blocking fallback keeps the persistent session from being
 // wedged behind an unobserved stream; the backend already treats the canceled
 // turn context as interrupted.
-func sendTerminalEvent(ctx context.Context, events chan<- driver.Event, event driver.Event) {
+func sendTerminalEvent(ctx context.Context, streamState *stream, events chan<- driver.Event, event driver.Event) {
+	streamState.mu.Lock()
+	selected := streamState.selected
+	streamState.mu.Unlock()
+	if selected == viewObservations {
+		return
+	}
 	select {
 	case events <- event:
 	case <-ctx.Done():
@@ -719,11 +765,42 @@ func promptBlocks(turn driver.Turn) []protocol.ContentBlock {
 	return []protocol.ContentBlock{{Text: &protocol.TextContent{Text: task.String()}}}
 }
 
-func (s *stream) Events() <-chan driver.Event { return s.events }
+func (s *stream) Events() <-chan driver.Event {
+	if s == nil {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.selected == viewUnselected {
+		s.selected = viewEvents
+		for _, event := range s.pendingEvents {
+			s.events <- event
+		}
+		s.pendingEvents = nil
+		if !s.closedObservations {
+			close(s.observations)
+			s.closedObservations = true
+		}
+	}
+	return s.events
+}
 
 func (s *stream) Observations() <-chan driver.Observation {
 	if s == nil {
 		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.selected == viewUnselected {
+		s.selected = viewObservations
+		for _, observation := range s.pendingObservations {
+			s.observations <- observation
+		}
+		s.pendingObservations = nil
+		if !s.closedEvents {
+			close(s.events)
+			s.closedEvents = true
+		}
 	}
 	return s.observations
 }
@@ -746,11 +823,34 @@ func emitObservation(streamState *stream, observation driver.Observation) {
 	if streamState == nil || observation == nil {
 		return
 	}
-	// Ordered observations are best-effort once their bounded consumer queue is
-	// full; a caller that abandons Events must never prevent turn cancellation.
+	streamState.mu.Lock()
+	selected := streamState.selected
+	if observation.Sequence() == 0 {
+		streamState.nextOrder++
+		switch typed := observation.(type) {
+		case driver.PromptObservation:
+			typed.OrderSequence = streamState.nextOrder
+			observation = typed
+		case driver.UpdateObservation:
+			typed.OrderSequence = streamState.nextOrder
+			observation = typed
+		case driver.SteerObservation:
+			typed.OrderSequence = streamState.nextOrder
+			observation = typed
+		}
+	}
+	if selected == viewUnselected {
+		streamState.pendingObservations = append(streamState.pendingObservations, observation)
+		streamState.mu.Unlock()
+		return
+	}
+	streamState.mu.Unlock()
+	if selected != viewObservations {
+		return
+	}
 	select {
 	case streamState.observations <- observation:
-	default:
+	case <-streamState.done:
 	}
 }
 
