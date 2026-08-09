@@ -12,7 +12,7 @@ require (
 	github.com/looprig/acp v0.1.1
 	github.com/looprig/core v0.5.0
 	github.com/looprig/harness v0.20.0
-	github.com/looprig/inference v0.7.0
+	github.com/looprig/inference v0.8.0
 	golang.org/x/sys v0.47.0
 )
 
