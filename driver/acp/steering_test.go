@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"reflect"
+	"sync"
 	"testing"
 	"time"
 
@@ -478,14 +479,25 @@ func TestACPOrderedSteerDoesNotDrainGreaterSequenceUpdates(t *testing.T) {
 		scriptedSession: newScriptedSession("boundary"),
 		steerResult:     client.SteerResult{Outcome: client.SteerOutcomeInjected, WriteAdmitted: true, ReceiveSequence: 2, ResponseSequence: 2},
 	}
+	sess.updates = make(chan client.Update)
+	barrierReached := make(chan struct{})
+	barrierRelease := make(chan struct{})
+	var releaseBarrier sync.Once
 	sess.barrierHook = func(_ context.Context, sequence uint64) error {
 		if sequence == 2 {
 			sess.updates <- client.Update{ReceiveSequence: 1, SessionUpdate: protocol.SessionUpdate{AgentMessageChunk: &protocol.ContentChunk{Content: protocol.ContentBlock{Text: &protocol.TextContent{Text: "before"}}}}}
 			sess.updates <- client.Update{ReceiveSequence: 3, SessionUpdate: protocol.SessionUpdate{AgentMessageChunk: &protocol.ContentChunk{Content: protocol.ContentBlock{Text: &protocol.TextContent{Text: "after"}}}}}
+			close(barrierReached)
+			<-barrierRelease
 		}
 		return nil
 	}
+	promptRelease := make(chan struct{})
+	var releasePrompt sync.Once
+	t.Cleanup(func() { releasePrompt.Do(func() { close(promptRelease) }) })
+	t.Cleanup(func() { releaseBarrier.Do(func() { close(barrierRelease) }) })
 	sess.promptHook = func(int, []protocol.ContentBlock) (*client.PromptResult, error) {
+		<-promptRelease
 		return &client.PromptResult{StopReason: protocol.StopReasonEndTurn, WriteAdmitted: true, ReceiveSequence: 4, ResponseSequence: 4}, nil
 	}
 	d := newTurnTestDriver(sess.scriptedSession)
@@ -494,13 +506,26 @@ func TestACPOrderedSteerDoesNotDrainGreaterSequenceUpdates(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Spawn() error = %v", err)
 	}
+	<-sess.promptStarts
 	request, err := driver.NewSteerRequest([]content.Block{&content.TextBlock{Text: "steer"}})
 	if err != nil {
 		t.Fatalf("NewSteerRequest() error = %v", err)
 	}
-	if _, err := d.Steer(context.Background(), request); err != nil {
+	steerDone := make(chan error, 1)
+	go func() {
+		_, err := d.Steer(context.Background(), request)
+		steerDone <- err
+	}()
+	select {
+	case <-barrierReached:
+	case <-time.After(time.Second):
+		t.Fatal("steer barrier was not reached")
+	}
+	releaseBarrier.Do(func() { close(barrierRelease) })
+	if err := <-steerDone; err != nil {
 		t.Fatalf("Steer() error = %v", err)
 	}
+	releasePrompt.Do(func() { close(promptRelease) })
 	var got []uint64
 	for observation := range stream.(driver.OrderedStream).Observations() {
 		got = append(got, observation.Sequence())
