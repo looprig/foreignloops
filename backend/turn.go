@@ -93,6 +93,14 @@ func (l *Loop) awaitTurn(loopCtx context.Context, cur event.TurnIndex, activeCom
 	cancel context.CancelFunc, pub func(event.Event), mailbox <-chan turnObservation, result chan turnOutcome,
 	streamReady <-chan driver.Stream, machine *steeringMachine,
 ) bool {
+	defer func() {
+		if machine != nil {
+			if err := machine.shutdown(); err != nil {
+				machine.logFault()
+			}
+			machine.cleanup()
+		}
+	}()
 	var (
 		terminalHold *turnObservation
 		outcome      *turnOutcome
@@ -139,6 +147,12 @@ func (l *Loop) awaitTurn(loopCtx context.Context, cur event.TurnIndex, activeCom
 		if outcome != nil {
 			commands = nil
 		}
+		timerAttempt, timerRef := (*steeringAttempt)(nil), (steeringTimer)(nil)
+		deadlineAttempt, deadlineRef := (*steeringAttempt)(nil), (steeringTimer)(nil)
+		if machine != nil {
+			timerAttempt, timerRef = machine.active, machine.timer
+			deadlineAttempt, deadlineRef = machine.active, machine.deadlineTimer
+		}
 		select {
 		case turnOutcomeValue := <-result:
 			outcome = &turnOutcomeValue
@@ -174,12 +188,28 @@ func (l *Loop) awaitTurn(loopCtx context.Context, cur event.TurnIndex, activeCom
 				return true
 			}
 		case <-machine.timerChan():
+			if err := l.drainReadyTurnEvidence(loopCtx, cur, turnID, stepID, &mailbox, &result, &outcome, machine, &terminalHold); err != nil {
+				machine.logFault()
+				cancel()
+				return true
+			}
+			if machine.active != timerAttempt || machine.timer != timerRef {
+				continue
+			}
 			if err := machine.timeout(); err != nil {
 				machine.logFault()
 				cancel()
 				return true
 			}
 		case <-machine.deadlineTimerChan():
+			if err := l.drainReadyTurnEvidence(loopCtx, cur, turnID, stepID, &mailbox, &result, &outcome, machine, &terminalHold); err != nil {
+				machine.logFault()
+				cancel()
+				return true
+			}
+			if machine.active != deadlineAttempt || machine.deadlineTimer != deadlineRef {
+				continue
+			}
 			if err := machine.deadlineTimeout(); err != nil {
 				machine.logFault()
 				cancel()
@@ -278,13 +308,18 @@ func (l *Loop) handleTurnCommand(loopCtx context.Context, input command.Command,
 		case completed := <-result:
 			ready := make(chan turnOutcome, 1)
 			ready <- completed
-			outcome, err := l.receiveTurnOutcome(loopCtx, cur, turnID, stepID, mailbox, ready, machine, true)
+			var captured turnOutcome
+			haveOutcome := false
+			err := l.drainSteeringShutdownWithOutcome(loopCtx, cur, turnID, stepID, mailbox, ready, machine, &captured, &haveOutcome)
 			if err != nil {
 				slog.Error("foreignloop: ordered cancellation adjudication failed", "error", err)
+				typed.Ack <- command.DelegateCancelNoop
 				return true, true
 			}
+			outcome := interruptedTurnOutcome(captured, haveOutcome)
 			if err := l.applyOutcome(loopCtx, cur, turnID, stepID, outcome); err != nil {
 				slog.Error("foreignloop: turn lifecycle publication failed", "error", err)
+				typed.Ack <- command.DelegateCancelNoop
 				return true, true
 			}
 			if !outcome.success && !outcome.interrupted {
@@ -299,22 +334,32 @@ func (l *Loop) handleTurnCommand(loopCtx context.Context, input command.Command,
 		default:
 		}
 		cancel()
-		outcome, err := l.receiveTurnOutcome(loopCtx, cur, turnID, stepID, mailbox, result, machine, true)
+		var captured turnOutcome
+		haveOutcome := false
+		err := l.drainSteeringShutdownWithOutcome(loopCtx, cur, turnID, stepID, mailbox, result, machine, &captured, &haveOutcome)
 		if err != nil {
+			typed.Ack <- command.DelegateCancelNoop
 			return true, true
 		}
+		outcome := interruptedTurnOutcome(captured, haveOutcome)
 		if err := l.applyOutcome(loopCtx, cur, turnID, stepID, outcome); err != nil {
+			typed.Ack <- command.DelegateCancelNoop
 			return true, true
 		}
 		typed.Ack <- command.DelegateCancelActive
 		return true, false
 	case command.Interrupt:
 		cancel()
-		outcome, err := l.receiveTurnOutcome(loopCtx, cur, turnID, stepID, mailbox, result, machine, true)
+		var captured turnOutcome
+		haveOutcome := false
+		err := l.drainSteeringShutdownWithOutcome(loopCtx, cur, turnID, stepID, mailbox, result, machine, &captured, &haveOutcome)
 		if err != nil {
+			typed.Ack <- true
 			return true, true
 		}
+		outcome := interruptedTurnOutcome(captured, haveOutcome)
 		if err := l.applyOutcome(loopCtx, cur, turnID, stepID, outcome); err != nil {
+			typed.Ack <- true
 			return true, true
 		}
 		if err := l.cancelPending(loopCtx, turnID, stepID, event.CancelTurnInterrupted); err != nil {
@@ -380,6 +425,16 @@ func (l *Loop) applyOutcome(ctx context.Context, cur event.TurnIndex, turnID, st
 		l.turnIndex = cur
 	}
 	return nil
+}
+
+func interruptedTurnOutcome(captured turnOutcome, haveOutcome bool) turnOutcome {
+	if !haveOutcome {
+		return turnOutcome{interrupted: true}
+	}
+	// Cancellation is the actor command's lifecycle decision even when a
+	// provider outcome raced into the mailbox. Retain only a bound SID; a
+	// canceled turn must not commit provider messages as a successful turn.
+	return turnOutcome{interrupted: true, boundSID: captured.boundSID}
 }
 
 func (l *Loop) applyBoundSID(sid string) {
@@ -742,6 +797,44 @@ func (l *Loop) drainTurnObservations(ctx context.Context, cur event.TurnIndex, t
 	return nil
 }
 
+// drainReadyTurnEvidence gives buffered provider facts precedence over a timer
+// selected by the actor. It is deliberately nonblocking: only evidence already
+// available at the adjudication boundary is consumed, so a deadline remains a
+// bounded fallback when the provider is silent.
+func (l *Loop) drainReadyTurnEvidence(ctx context.Context, cur event.TurnIndex, turnID, stepID uuid.UUID,
+	mailbox *<-chan turnObservation, result *chan turnOutcome, outcome **turnOutcome,
+	machine *steeringMachine, terminalHold **turnObservation,
+) error {
+	for {
+		select {
+		case value, ok := <-*result:
+			if !ok {
+				*result = nil
+				continue
+			}
+			if *outcome == nil {
+				copyOf := value
+				*outcome = &copyOf
+			}
+			*result = nil
+		case observation, ok := <-*mailbox:
+			if !ok {
+				*mailbox = nil
+				continue
+			}
+			if err := l.processTurnObservation(ctx, cur, turnID, stepID, observation, machine, terminalHold); err != nil {
+				return err
+			}
+		case completion := <-machine.completionsChan():
+			if err := machine.complete(completion); err != nil {
+				return err
+			}
+		default:
+			return nil
+		}
+	}
+}
+
 // drainSteeringShutdown adjudicates only the actor-owned steering state during
 // clean shutdown. A turn provider may ignore cancellation and leave both its
 // outcome and observation mailbox open; neither is needed to finalize a
@@ -750,6 +843,13 @@ func (l *Loop) drainTurnObservations(ctx context.Context, cur event.TurnIndex, t
 // wait when no evidence is available.
 func (l *Loop) drainSteeringShutdown(ctx context.Context, cur event.TurnIndex, turnID, stepID uuid.UUID,
 	mailbox <-chan turnObservation, result <-chan turnOutcome, machine *steeringMachine,
+) error {
+	return l.drainSteeringShutdownWithOutcome(ctx, cur, turnID, stepID, mailbox, result, machine, nil, nil)
+}
+
+func (l *Loop) drainSteeringShutdownWithOutcome(ctx context.Context, cur event.TurnIndex, turnID, stepID uuid.UUID,
+	mailbox <-chan turnObservation, result <-chan turnOutcome, machine *steeringMachine,
+	captured *turnOutcome, haveOutcome *bool,
 ) error {
 	if machine == nil {
 		return nil
@@ -761,8 +861,12 @@ func (l *Loop) drainSteeringShutdown(ctx context.Context, cur event.TurnIndex, t
 	drainReady := func() error {
 		for {
 			select {
-			case _, ok := <-result:
+			case value, ok := <-result:
 				if !ok {
+					result = nil
+				} else if captured != nil && haveOutcome != nil {
+					*captured = value
+					*haveOutcome = true
 					result = nil
 				}
 			case completion := <-machine.completionsChan():
@@ -790,8 +894,12 @@ func (l *Loop) drainSteeringShutdown(ctx context.Context, cur event.TurnIndex, t
 			return nil
 		}
 		select {
-		case _, ok := <-result:
+		case value, ok := <-result:
 			if !ok {
+				result = nil
+			} else if captured != nil && haveOutcome != nil {
+				*captured = value
+				*haveOutcome = true
 				result = nil
 			}
 		case completion := <-machine.completionsChan():

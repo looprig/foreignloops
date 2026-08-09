@@ -634,6 +634,26 @@ func (m *steeringMachine) shutdown() error {
 	return m.fault
 }
 
+// cleanup detaches actor-local provider state after awaitTurn is leaving for
+// any reason, including a checked publication/adjudication failure. The
+// durable resolution path has already run (or faulted); retaining a timer or
+// a context-ignoring adapter pointer after actor exit cannot make that decision
+// safer and can keep the turn lifecycle alive indefinitely.
+func (m *steeringMachine) cleanup() {
+	if m == nil {
+		return
+	}
+	if m.active != nil && m.active.cancel != nil {
+		m.active.cancel()
+	}
+	stopSteeringTimer(m.timer)
+	stopSteeringTimer(m.deadlineTimer)
+	m.timer = nil
+	m.deadlineTimer = nil
+	m.active = nil
+	m.pending = nil
+}
+
 func stopSteeringTimer(timer steeringTimer) {
 	if timer == nil {
 		return

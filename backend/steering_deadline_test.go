@@ -12,6 +12,7 @@ import (
 	"github.com/looprig/foreignloops/driver"
 	"github.com/looprig/harness/pkg/command"
 	"github.com/looprig/harness/pkg/foreign"
+	"github.com/looprig/harness/pkg/identity"
 )
 
 // manualSteeringTimer gives actor tests a deterministic deadline gate without
@@ -279,6 +280,105 @@ func TestSteeringDeadlineQueuesPendingFIFO(t *testing.T) {
 	}
 }
 
+func TestAwaitTurnStaleDeadlineCannotAdjudicatePumpedNextAttempt(t *testing.T) {
+	steerer := &ignoringSteerer{started: make(chan struct{}, 4), release: make(chan struct{})}
+	hook := &recordingDeliveryHook{}
+	l, machine, _, cancelSteerer := newSteeringUnit(t, steerer, hook)
+	factory := &manualSteeringTimerFactory{}
+	machine.timerFactory = factory.new
+	if err := machine.setStream(orderedUnitStream()); err != nil {
+		t.Fatalf("set stream: %v", err)
+	}
+	first := unitPreparedInput(t, l, "stale deadline first")
+	first.command.CommandID = first.command.Cause.CommandID
+	second := unitPreparedInput(t, l, "stale deadline second")
+	second.command.CommandID = second.command.Cause.CommandID
+	if _, err := machine.offer(first); err != nil {
+		t.Fatalf("offer first: %v", err)
+	}
+	if _, err := machine.offer(second); err != nil {
+		t.Fatalf("offer second: %v", err)
+	}
+	awaitStarted(t, steerer.started)
+	timers, _ := factory.snapshot()
+	if len(timers) != 1 {
+		t.Fatalf("initial timers = %d, want one", len(timers))
+	}
+	firstAttempt := machine.active
+	injected := injectedSteerResult()
+	machine.completions <- steeringCompletion{attempt: firstAttempt, result: injected}
+	mailbox := make(chan turnObservation, 1)
+	mailbox <- turnObservation{raw: driver.SteerObservation{SteerResult: injected}}
+	loopCtx, stop := context.WithCancel(context.Background())
+	awaitDone := make(chan bool, 1)
+	go func() {
+		awaitDone <- l.awaitTurn(loopCtx, 1, first.command.CommandID, first.turnID, first.stepID,
+			cancelSteerer, l.publisher(loopCtx, first.turnID, first.stepID), mailbox, make(chan turnOutcome), nil, machine)
+	}()
+	timers[0].fire()
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		calls := hook.snapshot()
+		if len(calls) >= 3 {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if got := hook.snapshot(); !reflect.DeepEqual(got, []string{"reserve", "resolve-injected", "reserve"}) {
+		t.Fatalf("stale deadline calls = %v, want first injection and second reservation only", got)
+	}
+	secondTimers, _ := factory.snapshot()
+	if len(secondTimers) < 2 {
+		t.Fatalf("timers after pump = %d, want second deadline", len(secondTimers))
+	}
+	secondTimers[1].fire()
+	stop()
+	select {
+	case <-awaitDone:
+	case <-time.After(time.Second):
+		t.Fatal("awaitTurn did not finish after second deadline")
+	}
+	close(steerer.release)
+}
+
+func TestAwaitTurnAdjudicationFailureStopsReservationTimer(t *testing.T) {
+	sentinel := errors.New("resolution publication failed")
+	steerer := &ignoringSteerer{started: make(chan struct{}, 1), release: make(chan struct{})}
+	hook := &recordingDeliveryHook{}
+	l, machine, _, cancelSteerer := newSteeringUnit(t, steerer, hook)
+	factory := &manualSteeringTimerFactory{}
+	machine.timerFactory = factory.new
+	if err := machine.setStream(orderedUnitStream()); err != nil {
+		t.Fatalf("set stream: %v", err)
+	}
+	input := unitPreparedInput(t, l, "adjudication failure cleanup")
+	if _, err := machine.offer(input); err != nil {
+		t.Fatalf("offer: %v", err)
+	}
+	awaitStarted(t, steerer.started)
+	timers, _ := factory.snapshot()
+	hook.mu.Lock()
+	hook.err = sentinel
+	hook.mu.Unlock()
+	loopCtx, stop := context.WithCancel(context.Background())
+	awaitDone := make(chan bool, 1)
+	go func() {
+		awaitDone <- l.awaitTurn(loopCtx, 1, input.command.CommandID, input.turnID, input.stepID,
+			cancelSteerer, l.publisher(loopCtx, input.turnID, input.stepID), nil, make(chan turnOutcome), nil, machine)
+	}()
+	timers[0].fire()
+	select {
+	case <-awaitDone:
+	case <-time.After(time.Second):
+		t.Fatal("awaitTurn did not return after adjudication failure")
+	}
+	stop()
+	if machine.active != nil || machine.deadlineTimerChan() != nil || machine.timerChan() != nil {
+		t.Fatalf("failed await cleanup = active:%p deadline:%v terminal:%v, want detached timers", machine.active, machine.deadlineTimerChan(), machine.timerChan())
+	}
+	close(steerer.release)
+}
+
 func TestSteeringAckResolutionStopsReservationDeadline(t *testing.T) {
 	steerer := &scriptedSteerer{started: make(chan struct{}, 1), results: make(chan scriptedSteerResult, 1)}
 	hook := &recordingDeliveryHook{}
@@ -458,6 +558,77 @@ func TestShutdownDoesNotWaitForNoncooperativeTurnOutcome(t *testing.T) {
 		t.Fatalf("shutdown calls = %v, want %v", got, want)
 	}
 	releaseSteerer()
+}
+
+func TestActiveCancellationDoesNotWaitForNoncooperativeTurnOutcome(t *testing.T) {
+	for _, name := range []string{"cancel", "interrupt"} {
+		name := name
+		t.Run(name, func(t *testing.T) {
+			steerer := &ignoringSteerer{started: make(chan struct{}, 1), release: make(chan struct{})}
+			hook := &recordingDeliveryHook{}
+			l, machine, _, cancel := newSteeringUnit(t, steerer, hook)
+			t.Cleanup(func() { close(steerer.release); cancel() })
+			factory := &manualSteeringTimerFactory{}
+			machine.timerFactory = factory.new
+			if err := machine.setStream(orderedUnitStream()); err != nil {
+				t.Fatalf("set stream: %v", err)
+			}
+			input := unitPreparedInput(t, l, "cancel noncooperative")
+			input.command.CommandID = input.command.Cause.CommandID
+			if _, err := machine.offer(input); err != nil {
+				t.Fatalf("offer: %v", err)
+			}
+			awaitStarted(t, steerer.started)
+			timers, _ := factory.snapshot()
+			if len(timers) != 1 {
+				t.Fatalf("reservation timers = %d, want one", len(timers))
+			}
+			mailbox := make(chan turnObservation)
+			result := make(chan turnOutcome)
+			commandDone := make(chan struct{ done, exit bool }, 1)
+			cancelCalled := make(chan struct{})
+			var once sync.Once
+			cancelForCommand := func() {
+				once.Do(func() { close(cancelCalled) })
+				cancel()
+			}
+			var inputCommand command.Command
+			var cancelAck chan command.DelegateCancelResult
+			var interruptAck chan bool
+			if name == "cancel" {
+				cancelAck = make(chan command.DelegateCancelResult, 1)
+				inputCommand = command.CancelDelegateRequest{
+					Header:      command.Header{CommandID: mustID(t)},
+					Coordinates: identity.Coordinates{SessionID: l.sessionID, LoopID: l.loopID}, TargetCommandID: input.command.CommandID, Ack: cancelAck,
+				}
+			} else {
+				interruptAck = make(chan bool, 1)
+				inputCommand = command.Interrupt{Ack: interruptAck}
+			}
+			go func() {
+				done, exit := l.handleTurnCommand(context.Background(), inputCommand, 1, input.command.CommandID,
+					input.turnID, input.stepID, cancelForCommand, l.publisher(context.Background(), input.turnID, input.stepID), mailbox, result, machine)
+				commandDone <- struct{ done, exit bool }{done: done, exit: exit}
+			}()
+			<-cancelCalled
+			timers[0].fire()
+			select {
+			case outcome := <-commandDone:
+				if !outcome.done || outcome.exit {
+					t.Fatalf("%s result = done:%t exit:%t, want done/continue", name, outcome.done, outcome.exit)
+				}
+			case <-time.After(time.Second):
+				t.Fatalf("%s waited for noncooperative turn outcome", name)
+			}
+			if name == "cancel" {
+				if got := <-cancelAck; got != command.DelegateCancelActive {
+					t.Fatalf("cancel ack = %v, want active", got)
+				}
+			} else if !<-interruptAck {
+				t.Fatal("interrupt ack = false, want true")
+			}
+		})
+	}
 }
 
 func TestShutdownAdjudicationFailureAcknowledgesError(t *testing.T) {
