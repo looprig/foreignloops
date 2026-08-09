@@ -83,21 +83,37 @@ func (l *Loop) runTurn(loopCtx context.Context, prepared preparedInput) bool {
 	turnCtx, cancel := context.WithCancel(loopCtx)
 	mailbox := make(chan turnObservation, 64)
 	result := make(chan turnOutcome, 1)
-	go l.driveTurnToMailbox(turnCtx, cancel, turn, cur, l.sidBound, mailbox, result)
-	return l.awaitTurn(loopCtx, cur, input.CommandID, prepared.turnID, prepared.stepID, cancel, pub, mailbox, result)
+	streamReady := make(chan driver.Stream, 1)
+	machine := newSteeringMachine(turnCtx, l, pub, cur, prepared.turnID, prepared.stepID, nil)
+	go l.driveTurnToMailbox(turnCtx, cancel, turn, cur, l.sidBound, mailbox, result, streamReady)
+	return l.awaitTurn(loopCtx, cur, input.CommandID, prepared.turnID, prepared.stepID, cancel, pub, mailbox, result, streamReady, machine)
 }
 
 func (l *Loop) awaitTurn(loopCtx context.Context, cur event.TurnIndex, activeCommandID, turnID, stepID uuid.UUID,
 	cancel context.CancelFunc, pub func(event.Event), mailbox <-chan turnObservation, result chan turnOutcome,
+	streamReady <-chan driver.Stream, machine *steeringMachine,
 ) bool {
+	var (
+		terminalHold *turnObservation
+		outcome      *turnOutcome
+	)
 	for {
-		select {
-		case outcome := <-result:
-			if err := l.drainTurnObservations(loopCtx, cur, turnID, stepID, mailbox); err != nil {
-				slog.Error("foreignloop: ordered observation publication failed", "error", err)
+		if terminalHold != nil && (machine == nil || machine.terminalReady()) {
+			if err := l.publishTurnObservation(loopCtx, cur, turnID, stepID, *terminalHold); err != nil {
+				slog.Error("foreignloop: held terminal publication failed", "error", err)
 				return true
 			}
-			if err := l.applyOutcome(loopCtx, cur, turnID, stepID, outcome); err != nil {
+			terminalHold = nil
+		}
+		if outcome != nil && (machine == nil || machine.terminalReady()) {
+			if terminalHold != nil {
+				if err := l.publishTurnObservation(loopCtx, cur, turnID, stepID, *terminalHold); err != nil {
+					slog.Error("foreignloop: held terminal publication failed", "error", err)
+					return true
+				}
+				terminalHold = nil
+			}
+			if err := l.applyOutcome(loopCtx, cur, turnID, stepID, *outcome); err != nil {
 				slog.Error("foreignloop: turn lifecycle publication failed", "error", err)
 				return true
 			}
@@ -105,25 +121,67 @@ func (l *Loop) awaitTurn(loopCtx context.Context, cur event.TurnIndex, activeCom
 				l.cancelPending(pub, event.CancelTurnFailed)
 			}
 			return false
+		}
+		commands := l.Commands
+		// Once the producer has delivered its outcome, only steering
+		// adjudication and the held terminal remain before this turn can
+		// return to the actor pump. Do not hand a command to the legacy
+		// cancellation path while its result channel has already been
+		// consumed; the unbuffered command sender will be serviced next.
+		if outcome != nil {
+			commands = nil
+		}
+		select {
+		case turnOutcomeValue := <-result:
+			outcome = &turnOutcomeValue
+			result = nil
+			if err := l.drainTurnObservations(loopCtx, cur, turnID, stepID, mailbox, machine, &terminalHold); err != nil {
+				slog.Error("foreignloop: ordered observation publication failed", "error", err)
+				return true
+			}
+			mailbox = nil
+		case stream := <-streamReady:
+			if machine != nil {
+				if err := machine.setStream(stream); err != nil {
+					machine.logFault()
+					cancel()
+					return true
+				}
+			}
+			streamReady = nil
 		case observation, ok := <-mailbox:
 			if !ok {
 				mailbox = nil
 				continue
 			}
-			if err := l.publishTurnObservation(loopCtx, cur, turnID, stepID, observation); err != nil {
+			if err := l.processTurnObservation(loopCtx, cur, turnID, stepID, observation, machine, &terminalHold); err != nil {
 				cancel()
 				slog.Error("foreignloop: ordered observation publication failed", "error", err)
 				return true
 			}
+		case completion := <-machine.completionsChan():
+			if err := machine.complete(completion); err != nil {
+				machine.logFault()
+				cancel()
+				return true
+			}
+		case <-machine.timerChan():
+			if err := machine.timeout(); err != nil {
+				machine.logFault()
+				cancel()
+				return true
+			}
 		case req := <-l.snapshots:
 			req.reply <- snapshotResult{msgs: cloneMessages(l.msgs), turnIndex: l.turnIndex}
-		case input := <-l.Commands:
-			if done, exit := l.handleTurnCommand(loopCtx, input, cur, activeCommandID, turnID, stepID, cancel, pub, mailbox, result); done {
+		case input := <-commands:
+			if done, exit := l.handleTurnCommand(loopCtx, input, cur, activeCommandID, turnID, stepID, cancel, pub, mailbox, result, machine); done {
 				return exit
 			}
 		case <-loopCtx.Done():
 			cancel()
-			_, _ = l.receiveTurnOutcome(loopCtx, cur, turnID, stepID, mailbox, result, false)
+			if result != nil {
+				_, _ = l.receiveTurnOutcome(loopCtx, cur, turnID, stepID, mailbox, result, false)
+			}
 			return true
 		}
 	}
@@ -131,11 +189,11 @@ func (l *Loop) awaitTurn(loopCtx context.Context, cur event.TurnIndex, activeCom
 
 func (l *Loop) handleTurnCommand(loopCtx context.Context, input command.Command, cur event.TurnIndex,
 	activeCommandID, turnID, stepID uuid.UUID, cancel context.CancelFunc, pub func(event.Event),
-	mailbox <-chan turnObservation, result chan turnOutcome,
+	mailbox <-chan turnObservation, result chan turnOutcome, machine *steeringMachine,
 ) (bool, bool) {
 	switch typed := input.(type) {
 	case command.UserInput:
-		if len(l.pending) >= loop.ManagedInputQueueCapacity {
+		if len(l.pending)+machine.pendingCount() >= loop.ManagedInputQueueCapacity {
 			pub(event.TurnRejected{Header: event.Header{Cause: identity.Cause{CommandID: typed.CommandID}}, Reason: event.RejectQueueFull})
 			if typed.Accepted != nil {
 				typed.Accepted <- &loop.InputRejectedError{Reason: event.RejectQueueFull}
@@ -145,6 +203,20 @@ func (l *Loop) handleTurnCommand(loopCtx context.Context, input command.Command,
 		prepared, ok := l.prepareInput(loopCtx, typed)
 		if !ok {
 			return false, false
+		}
+		if machine != nil {
+			handled, err := machine.offer(prepared)
+			if handled {
+				if err != nil {
+					machine.logFault()
+					cancel()
+					return true, true
+				}
+				if typed.Accepted != nil {
+					typed.Accepted <- nil
+				}
+				return false, false
+			}
 		}
 		l.pending = append(l.pending, prepared)
 		pub(event.InputQueued{Header: event.Header{Cause: identity.Cause{CommandID: typed.CommandID}}})
@@ -181,9 +253,15 @@ func (l *Loop) handleTurnCommand(loopCtx context.Context, input command.Command,
 		}
 		select {
 		case outcome := <-result:
-			if err := l.drainTurnObservations(loopCtx, cur, turnID, stepID, mailbox); err != nil {
+			var terminalHold *turnObservation
+			if err := l.drainTurnObservations(loopCtx, cur, turnID, stepID, mailbox, machine, &terminalHold); err != nil {
 				slog.Error("foreignloop: ordered observation publication failed", "error", err)
 				return true, true
+			}
+			if terminalHold != nil {
+				if err := l.publishTurnObservation(loopCtx, cur, turnID, stepID, *terminalHold); err != nil {
+					return true, true
+				}
 			}
 			if err := l.applyOutcome(loopCtx, cur, turnID, stepID, outcome); err != nil {
 				slog.Error("foreignloop: turn lifecycle publication failed", "error", err)
@@ -269,6 +347,7 @@ func (l *Loop) applyBoundSID(sid string) {
 
 func (l *Loop) driveTurnToMailbox(turnCtx context.Context, cancel context.CancelFunc, turn driver.Turn,
 	cur event.TurnIndex, sidBound bool, mailbox chan<- turnObservation, result chan turnOutcome,
+	streamReady chan<- driver.Stream,
 ) {
 	defer close(mailbox)
 	sink := func(observation turnObservation) bool {
@@ -279,7 +358,7 @@ func (l *Loop) driveTurnToMailbox(turnCtx context.Context, cancel context.Cancel
 			return false
 		}
 	}
-	l.driveTurnToSink(turnCtx, cancel, turn, cur, sidBound, sink, result, productionTurnLockOps())
+	l.driveTurnToSink(turnCtx, cancel, turn, cur, sidBound, sink, result, productionTurnLockOps(), streamReady)
 }
 
 // driveTurn keeps the pre-mailbox test seam source-compatible. Production
@@ -306,11 +385,12 @@ func (l *Loop) driveTurnWithLocks(turnCtx context.Context, cancel context.Cancel
 		}
 		return true
 	}
-	l.driveTurnToSink(turnCtx, cancel, turn, cur, sidBound, sink, result, locks)
+	l.driveTurnToSink(turnCtx, cancel, turn, cur, sidBound, sink, result, locks, nil)
 }
 
 func (l *Loop) driveTurnToSink(turnCtx context.Context, cancel context.CancelFunc, turn driver.Turn,
 	cur event.TurnIndex, sidBound bool, sink func(turnObservation) bool, result chan turnOutcome, locks turnLockOps,
+	streamReady chan<- driver.Stream,
 ) {
 	defer cancel()
 	var (
@@ -336,6 +416,12 @@ func (l *Loop) driveTurnToSink(turnCtx context.Context, cancel context.CancelFun
 	if err != nil {
 		sink(turnObservation{event: event.TurnFailed{TurnIndex: cur, Err: &driver.SpawnError{Cause: err}}})
 		return
+	}
+	if streamReady != nil {
+		select {
+		case streamReady <- stream:
+		case <-turnCtx.Done():
+		}
 	}
 	bindSID := func(sid string) error {
 		boundLock, err := locks.acquireDurable(sid, l.backendCfg.Cwd)
@@ -552,9 +638,39 @@ func (l *Loop) publishTurnObservation(ctx context.Context, _ event.TurnIndex, tu
 	return nil
 }
 
-func (l *Loop) drainTurnObservations(ctx context.Context, cur event.TurnIndex, turnID, stepID uuid.UUID, mailbox <-chan turnObservation) error {
+func (l *Loop) processTurnObservation(ctx context.Context, cur event.TurnIndex, turnID, stepID uuid.UUID,
+	observation turnObservation, machine *steeringMachine, terminalHold **turnObservation,
+) error {
+	if machine != nil && observation.raw != nil {
+		if err := machine.observe(observation.raw); err != nil {
+			return err
+		}
+	}
+	if observation.event == nil {
+		return nil
+	}
+	if machine != nil && isTurnTerminal(observation.event) {
+		hold, err := machine.beforeTerminal()
+		if err != nil {
+			return err
+		}
+		if hold {
+			copyOf := observation
+			*terminalHold = &copyOf
+			return nil
+		}
+	}
+	return l.publishTurnObservation(ctx, cur, turnID, stepID, observation)
+}
+
+func (l *Loop) drainTurnObservations(ctx context.Context, cur event.TurnIndex, turnID, stepID uuid.UUID,
+	mailbox <-chan turnObservation, machine *steeringMachine, terminalHold **turnObservation,
+) error {
+	if mailbox == nil {
+		return nil
+	}
 	for observation := range mailbox {
-		if err := l.publishTurnObservation(ctx, cur, turnID, stepID, observation); err != nil {
+		if err := l.processTurnObservation(ctx, cur, turnID, stepID, observation, machine, terminalHold); err != nil {
 			return err
 		}
 	}
