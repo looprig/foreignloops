@@ -191,11 +191,12 @@ func New(ctx context.Context, cfg Config) (*Driver, error) {
 		driverCancel:   driverCancel,
 	}
 
-	// A loaded Claude session owns its existing configuration. ACP does not
-	// populate mutable config/mode capabilities for session/load, so only a
-	// fresh session receives the requested model and permission setup. When
-	// both aliases are empty, native Claude is harness-managed: leave model
-	// selection entirely to the adapter and apply only the posture.
+	// A loaded Claude session owns its existing configuration. ACP may populate
+	// mutable config/mode capabilities in the session/load response, but the
+	// driver preserves that loaded configuration; only a fresh session receives
+	// the requested model and permission setup. When both aliases are empty,
+	// native Claude is harness-managed: leave model selection entirely to the
+	// adapter and apply only the posture.
 	if claude != nil && cfg.AgentSessionID == "" {
 		if cfg.ModelAlias != "" {
 			if err := claude.SelectDefaultModel(driverCtx, sess); err != nil {
