@@ -463,6 +463,47 @@ func TestSteeringExplicitFallbackQueuesExactlyOnce(t *testing.T) {
 	}
 }
 
+func TestSteeringUntrackableResolutionIsNotReclassifiedOnShutdown(t *testing.T) {
+	steerer := &scriptedSteerer{started: make(chan struct{}, 1), results: make(chan scriptedSteerResult, 1)}
+	hook := &recordingDeliveryHook{}
+	l, machine, _, cancel := newSteeringUnit(t, steerer, hook)
+	t.Cleanup(cancel)
+	if err := machine.setStream(orderedUnitStream()); err != nil {
+		t.Fatalf("set stream: %v", err)
+	}
+	input := unitPreparedInput(t, l, "untrackable")
+	if _, err := machine.offer(input); err != nil {
+		t.Fatalf("offer: %v", err)
+	}
+	awaitStarted(t, steerer.started)
+	if err := machine.observe(driver.SteerObservation{SteerResult: driver.SteerResult{
+		Outcome:          driver.SteerOutcomeDeliveredUntrackable,
+		WriteAdmitted:    true,
+		ReceiveSequence:  1,
+		ResponseSequence: 1,
+	}}); err == nil {
+		t.Fatal("untrackable observation error = nil, want terminal state-machine fault")
+	}
+	if err := machine.shutdown(); err == nil {
+		t.Fatal("shutdown error = nil, want preserved untrackable fault")
+	}
+	if got, want := hook.snapshot(), []string{"reserve", string(foreign.DeliveryResolutionUntrackable)}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("untrackable shutdown calls = %v, want %v", got, want)
+	}
+	if machine.active != nil {
+		t.Fatalf("untrackable shutdown active attempt = %p, want retired", machine.active)
+	}
+	steerer.results <- scriptedSteerResult{result: driver.SteerResult{
+		Outcome:          driver.SteerOutcomeDeliveredUntrackable,
+		WriteAdmitted:    true,
+		ReceiveSequence:  1,
+		ResponseSequence: 1,
+	}}
+	if err := machine.complete(takeCompletion(t, machine)); err != nil {
+		t.Fatalf("late untrackable completion: %v", err)
+	}
+}
+
 func TestSteeringTerminalBeforeKnownWriterFallbackWaitsForExplicitNonDelivery(t *testing.T) {
 	steerer := &scriptedSteerer{started: make(chan struct{}, 1), results: make(chan scriptedSteerResult, 1)}
 	hook := &recordingDeliveryHook{}

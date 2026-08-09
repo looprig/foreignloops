@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/looprig/core/content"
 	"github.com/looprig/core/uuid"
@@ -860,6 +861,20 @@ func (l *Loop) drainSteeringShutdownWithOutcome(ctx context.Context, cur event.T
 	if _, err := machine.beforeTerminal(); err != nil {
 		return err
 	}
+	// A turn without an active steering attempt still has to finish its
+	// provider lifecycle before the actor starts another turn: the outcome
+	// carries the learned late-bound SID, and the provider releases its durable
+	// session lock before sending it. Once steering is active, however, the
+	// actor-owned steering deadline is the bounded adjudication point and must
+	// not wait for a context-ignoring provider turn outcome.
+	waitForTurnOutcome := machine.active == nil && !machine.disabled
+	var turnWaitTimer steeringTimer
+	var turnWait <-chan time.Time
+	if waitForTurnOutcome {
+		turnWaitTimer = machine.newTimer(steeringCallTimeout)
+		turnWait = turnWaitTimer.Chan()
+		defer stopSteeringTimer(turnWaitTimer)
+	}
 	var terminalHold *turnObservation
 	drainReady := func() error {
 		for {
@@ -893,7 +908,7 @@ func (l *Loop) drainSteeringShutdownWithOutcome(ctx context.Context, cur event.T
 		if err := drainReady(); err != nil {
 			return err
 		}
-		if machine.terminalReady() {
+		if machine.terminalReady() && (!waitForTurnOutcome || (result == nil && mailbox == nil)) {
 			return nil
 		}
 		select {
@@ -917,6 +932,8 @@ func (l *Loop) drainSteeringShutdownWithOutcome(ctx context.Context, cur event.T
 			if err := l.processTurnOutcomeObservation(ctx, cur, turnID, stepID, observation, machine, &terminalHold, false); err != nil {
 				return err
 			}
+		case <-turnWait:
+			return nil
 		case <-machine.timerChan():
 			if err := drainReady(); err != nil {
 				return err

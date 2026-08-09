@@ -452,6 +452,10 @@ func (m *steeringMachine) resolveDisposition(attempt *steeringAttempt, dispositi
 			m.fault = err
 			return err
 		}
+		// The durable untrackable resolution is terminal even though it faults
+		// the loop. Mark the attempt before returning so actor cleanup cannot
+		// reclassify it as a second Unknown resolution.
+		attempt.resolved = true
 		m.disabled = true
 		m.fault = errors.New("foreignloop: steering delivered an untrackable turn")
 		return m.fault

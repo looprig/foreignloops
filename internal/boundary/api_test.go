@@ -39,7 +39,7 @@ func TestBackendAndDriverPublicTopLevelSymbols(t *testing.T) {
 			dir:  filepath.Join(root, "backend"),
 			want: []string{
 				"BuildRestoredWith", "BuildRestoredWithServices", "BuildWith", "BuildWithServices", "Config", "ConfigError", "ForeignProtocolError",
-				"ForeignResultError", "ForeignSessionBusyError", "LockError", "Loop", "New",
+				"ForeignPublicationError", "ForeignResultError", "ForeignSessionBusyError", "LockError", "Loop", "New",
 				"SIDLateBound", "SIDMode", "SIDPrebound", "SnapshotContextDone", "SnapshotError",
 				"SnapshotErrorReason", "SnapshotLoopExited",
 			},
@@ -68,7 +68,7 @@ func TestPublicErrorOwnershipSets(t *testing.T) {
 		"driver/claude": {"ConfigError", "PathError", "PlatformError", "SpawnConfigError", "WrapError"},
 		"driver/codex":  {"ConfigError", "PlatformError", "SpawnConfigError"},
 		"backend": {
-			"ConfigError", "ForeignProtocolError", "ForeignResultError",
+			"ConfigError", "ForeignProtocolError", "ForeignPublicationError", "ForeignResultError",
 			"ForeignSessionBusyError", "LockError", "SnapshotError",
 		},
 	}
