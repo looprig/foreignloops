@@ -94,6 +94,7 @@ type stream struct {
 	events       chan driver.Event
 	observations chan driver.Observation
 	done         <-chan struct{}
+	ctx          context.Context
 	cancel       context.CancelFunc
 	steerIn      chan steerInput
 
@@ -105,6 +106,8 @@ type stream struct {
 	pendingEvents       []driver.Event
 	pendingObservations []driver.Observation
 	nextOrder           uint64
+	viewReady           chan struct{}
+	viewReadyOnce       sync.Once
 	steers              map[*steerCall]struct{}
 	terminal            bool
 
@@ -170,9 +173,11 @@ func (d *Driver) Spawn(ctx context.Context, turn driver.Turn) (driver.Stream, er
 		events:       events,
 		observations: make(chan driver.Observation, 2048),
 		done:         done,
+		ctx:          turnCtx,
 		cancel:       cancel,
 		steerIn:      make(chan steerInput, 512),
 		steers:       make(map[*steerCall]struct{}),
+		viewReady:    make(chan struct{}),
 	}
 	d.activeMu.Lock()
 	d.active = s
@@ -547,6 +552,18 @@ func sendTurnEvent(ctx context.Context, streamState *stream, events chan<- drive
 	streamState.mu.Lock()
 	selected := streamState.selected
 	if selected == viewUnselected {
+		if len(streamState.pendingEvents) >= 2048 {
+			streamState.mu.Unlock()
+			select {
+			case <-streamState.viewReady:
+			case <-ctx.Done():
+			}
+			if ctx.Err() != nil {
+				return
+			}
+			sendTurnEvent(ctx, streamState, events, event)
+			return
+		}
 		streamState.pendingEvents = append(streamState.pendingEvents, event)
 		streamState.mu.Unlock()
 		return
@@ -836,6 +853,7 @@ func (s *stream) Events() <-chan driver.Event {
 	defer s.mu.Unlock()
 	if s.selected == viewUnselected {
 		s.selected = viewEvents
+		s.viewReadyOnce.Do(func() { close(s.viewReady) })
 		if !s.closed {
 			for _, event := range s.pendingEvents {
 				s.events <- event
@@ -858,6 +876,7 @@ func (s *stream) Observations() <-chan driver.Observation {
 	defer s.mu.Unlock()
 	if s.selected == viewUnselected {
 		s.selected = viewObservations
+		s.viewReadyOnce.Do(func() { close(s.viewReady) })
 		if !s.closed {
 			for _, observation := range s.pendingObservations {
 				s.observations <- observation
@@ -907,6 +926,18 @@ func emitObservation(streamState *stream, observation driver.Observation) {
 		}
 	}
 	if selected == viewUnselected {
+		if len(streamState.pendingObservations) >= 2048 {
+			streamState.mu.Unlock()
+			select {
+			case <-streamState.viewReady:
+			case <-streamState.ctx.Done():
+			}
+			if streamState.ctx.Err() != nil {
+				return
+			}
+			emitObservation(streamState, observation)
+			return
+		}
 		streamState.pendingObservations = append(streamState.pendingObservations, observation)
 		streamState.mu.Unlock()
 		return
