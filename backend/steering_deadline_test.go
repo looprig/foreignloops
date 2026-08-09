@@ -1,0 +1,382 @@
+package backend
+
+import (
+	"context"
+	"errors"
+	"reflect"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/looprig/core/uuid"
+	"github.com/looprig/foreignloops/driver"
+	"github.com/looprig/harness/pkg/foreign"
+)
+
+// manualSteeringTimer gives actor tests a deterministic deadline gate without
+// changing the production timer implementation or sleeping for a duration.
+type manualSteeringTimer struct {
+	mu      sync.Mutex
+	ch      chan time.Time
+	stopped bool
+	fired   bool
+}
+
+func newManualSteeringTimer() *manualSteeringTimer {
+	return &manualSteeringTimer{ch: make(chan time.Time, 1)}
+}
+
+func (t *manualSteeringTimer) Chan() <-chan time.Time { return t.ch }
+
+func (t *manualSteeringTimer) Stop() bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.stopped || t.fired {
+		return false
+	}
+	t.stopped = true
+	return true
+}
+
+func (t *manualSteeringTimer) fire() {
+	t.mu.Lock()
+	if t.stopped || t.fired {
+		t.mu.Unlock()
+		return
+	}
+	t.fired = true
+	t.mu.Unlock()
+	t.ch <- time.Time{}
+}
+
+type manualSteeringTimerFactory struct {
+	mu        sync.Mutex
+	timers    []*manualSteeringTimer
+	durations []time.Duration
+}
+
+func (f *manualSteeringTimerFactory) new(timeout time.Duration) steeringTimer {
+	timer := newManualSteeringTimer()
+	f.mu.Lock()
+	f.timers = append(f.timers, timer)
+	f.durations = append(f.durations, timeout)
+	f.mu.Unlock()
+	return timer
+}
+
+func (f *manualSteeringTimerFactory) snapshot() ([]*manualSteeringTimer, []time.Duration) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]*manualSteeringTimer(nil), f.timers...), append([]time.Duration(nil), f.durations...)
+}
+
+// ignoringSteerer models an adapter that does not honor the cancellation
+// context. The actor deadline must still retire the reservation and resolve it
+// exactly once; releasing the adapter later only exercises the late-completion
+// path.
+type ignoringSteerer struct {
+	started chan struct{}
+	release chan struct{}
+}
+
+func (s *ignoringSteerer) Steer(context.Context, driver.SteerRequest) (driver.SteerResult, error) {
+	select {
+	case s.started <- struct{}{}:
+	default:
+	}
+	<-s.release
+	return fallbackSteerResult(), nil
+}
+
+func (s *ignoringSteerer) Spawn(context.Context, driver.Turn) (driver.Stream, error) {
+	return nil, errors.New("ignoring steerer does not spawn turns")
+}
+
+func TestSteeringDeadlineStartsAtReservation(t *testing.T) {
+	steerer := &scriptedSteerer{started: make(chan struct{}, 1), results: make(chan scriptedSteerResult, 1)}
+	hook := &recordingDeliveryHook{}
+	l, machine, _, cancel := newSteeringUnit(t, steerer, hook)
+	t.Cleanup(cancel)
+	factory := &manualSteeringTimerFactory{}
+	machine.timerFactory = factory.new
+	if err := machine.setStream(orderedUnitStream()); err != nil {
+		t.Fatalf("set stream: %v", err)
+	}
+	input := unitPreparedInput(t, l, "reservation deadline")
+	if handled, err := machine.offer(input); !handled || err != nil {
+		t.Fatalf("offer = handled %t err %v", handled, err)
+	}
+	awaitStarted(t, steerer.started)
+	timers, durations := factory.snapshot()
+	if len(timers) != 1 || len(durations) != 1 {
+		t.Fatalf("reservation timers = %d durations = %d, want one", len(timers), len(durations))
+	}
+	if durations[0] != steeringCallTimeout {
+		t.Fatalf("reservation deadline = %s, want %s", durations[0], steeringCallTimeout)
+	}
+	if machine.terminal {
+		t.Fatal("reservation deadline started after terminal")
+	}
+}
+
+func TestSteeringDeadlineRetiresIgnoredAdapter(t *testing.T) {
+	steerer := &ignoringSteerer{started: make(chan struct{}, 1), release: make(chan struct{})}
+	hook := &recordingDeliveryHook{}
+	l, machine, _, cancel := newSteeringUnit(t, steerer, hook)
+	t.Cleanup(cancel)
+	factory := &manualSteeringTimerFactory{}
+	machine.timerFactory = factory.new
+	if err := machine.setStream(orderedUnitStream()); err != nil {
+		t.Fatalf("set stream: %v", err)
+	}
+	input := unitPreparedInput(t, l, "deadline")
+	if handled, err := machine.offer(input); !handled || err != nil {
+		t.Fatalf("offer = handled %t err %v", handled, err)
+	}
+	awaitStarted(t, steerer.started)
+	timers, _ := factory.snapshot()
+	if len(timers) != 1 {
+		t.Fatalf("reservation timers = %d, want one", len(timers))
+	}
+
+	// Keep terminal false: this is the reservation deadline, not the
+	// post-terminal acknowledgement timer.
+	if machine.terminal {
+		t.Fatal("reservation deadline test unexpectedly entered terminal state")
+	}
+	timers[0].fire()
+	select {
+	case <-machine.deadlineTimerChan():
+	case <-time.After(time.Second):
+		t.Fatal("reservation deadline did not reach the actor")
+	}
+	if err := machine.deadlineTimeout(); err != nil {
+		t.Fatalf("deadline timeout: %v", err)
+	}
+	if machine.active != nil {
+		t.Fatalf("active attempt = %p, want retired after deadline", machine.active)
+	}
+	if !machine.disabled {
+		t.Fatal("steering remained enabled after deadline ambiguity")
+	}
+	if got, want := hook.snapshot(), []string{"reserve", string(foreign.DeliveryResolutionUnknown)}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("delivery calls = %v, want %v", got, want)
+	}
+
+	// The adapter ignored cancellation and only returns now. Its completion
+	// must not revive the retired request or trigger a second decision.
+	close(steerer.release)
+	completion := takeCompletion(t, machine)
+	if err := machine.complete(completion); err != nil {
+		t.Fatalf("late completion: %v", err)
+	}
+	if err := machine.observe(driver.SteerObservation{SteerResult: fallbackSteerResult()}); err != nil {
+		t.Fatalf("late fallback observation: %v", err)
+	}
+	if got, want := hook.snapshot(), []string{"reserve", string(foreign.DeliveryResolutionUnknown)}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("late facts changed delivery calls = %v, want %v", got, want)
+	}
+}
+
+func TestSteeringFallbackWinsDeadlineAndStillRetiresIgnoredAdapter(t *testing.T) {
+	steerer := &ignoringSteerer{started: make(chan struct{}, 1), release: make(chan struct{})}
+	hook := &recordingDeliveryHook{}
+	l, machine, _, cancel := newSteeringUnit(t, steerer, hook)
+	t.Cleanup(cancel)
+	factory := &manualSteeringTimerFactory{}
+	machine.timerFactory = factory.new
+	if err := machine.setStream(orderedUnitStream()); err != nil {
+		t.Fatalf("set stream: %v", err)
+	}
+	input := unitPreparedInput(t, l, "fallback before deadline")
+	if _, err := machine.offer(input); err != nil {
+		t.Fatalf("offer: %v", err)
+	}
+	awaitStarted(t, steerer.started)
+	timers, _ := factory.snapshot()
+	if err := machine.observe(driver.SteerObservation{SteerResult: fallbackSteerResult()}); err != nil {
+		t.Fatalf("fallback observation: %v", err)
+	}
+	if got, want := hook.snapshot(), []string{"reserve", "fallback"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("fallback calls = %v, want %v", got, want)
+	}
+	if machine.active == nil || !machine.active.resolved {
+		t.Fatal("fallback did not win the adjudication CAS")
+	}
+
+	// The deadline may retire the already-resolved attempt, but it must not
+	// publish Unknown or queue a second fallback.
+	timers[0].fire()
+	select {
+	case <-machine.deadlineTimerChan():
+	case <-time.After(time.Second):
+		t.Fatal("fallback deadline did not reach the actor")
+	}
+	if err := machine.deadlineTimeout(); err != nil {
+		t.Fatalf("fallback deadline retirement: %v", err)
+	}
+	if machine.active != nil {
+		t.Fatalf("fallback active attempt = %p, want retired", machine.active)
+	}
+	if got, want := hook.snapshot(), []string{"reserve", "fallback"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("deadline after fallback changed calls = %v, want %v", got, want)
+	}
+	close(steerer.release)
+	if err := machine.complete(takeCompletion(t, machine)); err != nil {
+		t.Fatalf("late fallback completion: %v", err)
+	}
+}
+
+func TestSteeringDeadlineQueuesPendingFIFO(t *testing.T) {
+	steerer := &ignoringSteerer{started: make(chan struct{}, 1), release: make(chan struct{})}
+	hook := &recordingDeliveryHook{}
+	l, machine, _, cancel := newSteeringUnit(t, steerer, hook)
+	t.Cleanup(cancel)
+	factory := &manualSteeringTimerFactory{}
+	machine.timerFactory = factory.new
+	if err := machine.setStream(orderedUnitStream()); err != nil {
+		t.Fatalf("set stream: %v", err)
+	}
+	first := unitPreparedInput(t, l, "deadline first")
+	second := unitPreparedInput(t, l, "queued second")
+	if _, err := machine.offer(first); err != nil {
+		t.Fatalf("offer first: %v", err)
+	}
+	if _, err := machine.offer(second); err != nil {
+		t.Fatalf("offer second: %v", err)
+	}
+	awaitStarted(t, steerer.started)
+	timers, _ := factory.snapshot()
+	if len(timers) != 1 {
+		t.Fatalf("reservation timers = %d, want one active timer", len(timers))
+	}
+
+	timers[0].fire()
+	select {
+	case <-machine.deadlineTimerChan():
+	case <-time.After(time.Second):
+		t.Fatal("deadline did not reach the actor")
+	}
+	if err := machine.deadlineTimeout(); err != nil {
+		t.Fatalf("deadline timeout: %v", err)
+	}
+	if machine.active != nil || len(machine.pending) != 0 {
+		t.Fatalf("machine after deadline = active:%p pending:%d, want no active machine work", machine.active, len(machine.pending))
+	}
+	if got, want := hook.snapshot(), []string{"reserve", string(foreign.DeliveryResolutionUnknown), "fallback"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("deadline FIFO calls = %v, want %v", got, want)
+	}
+	if got, want := hook.fallbackIDs(), []uuid.UUID{second.command.CommandID}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("deadline FIFO fallback IDs = %v, want queued request %v", got, want)
+	}
+	if len(l.pending) != 1 || l.pending[0].command.CommandID != second.command.CommandID {
+		t.Fatalf("loop pending after deadline = %#v, want second request only", l.pending)
+	}
+	close(steerer.release)
+	if err := machine.complete(takeCompletion(t, machine)); err != nil {
+		t.Fatalf("late first completion: %v", err)
+	}
+}
+
+func TestSteeringAckResolutionStopsReservationDeadline(t *testing.T) {
+	steerer := &scriptedSteerer{started: make(chan struct{}, 1), results: make(chan scriptedSteerResult, 1)}
+	hook := &recordingDeliveryHook{}
+	l, machine, _, cancel := newSteeringUnit(t, steerer, hook)
+	t.Cleanup(cancel)
+	factory := &manualSteeringTimerFactory{}
+	machine.timerFactory = factory.new
+	if err := machine.setStream(orderedUnitStream()); err != nil {
+		t.Fatalf("set stream: %v", err)
+	}
+	input := unitPreparedInput(t, l, "ack stops deadline")
+	if _, err := machine.offer(input); err != nil {
+		t.Fatalf("offer: %v", err)
+	}
+	awaitStarted(t, steerer.started)
+	timers, _ := factory.snapshot()
+	if len(timers) != 1 {
+		t.Fatalf("reservation timers = %d, want one", len(timers))
+	}
+	result := injectedSteerResult()
+	if err := machine.observe(driver.SteerObservation{SteerResult: result}); err != nil {
+		t.Fatalf("injected observation: %v", err)
+	}
+	steerer.results <- scriptedSteerResult{result: result}
+	if err := machine.complete(takeCompletion(t, machine)); err != nil {
+		t.Fatalf("injected completion: %v", err)
+	}
+	if machine.active != nil {
+		t.Fatalf("ack-resolved active attempt = %p, want retired", machine.active)
+	}
+	// A stale fire is suppressed by the stopped timer and cannot invoke the
+	// deadline path after the checked acknowledgement resolution.
+	timers[0].fire()
+	if got, want := hook.snapshot(), []string{"reserve", "resolve-injected"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("stale deadline changed calls = %v, want %v", got, want)
+	}
+}
+
+func TestSteeringDeadlineWinsLateFallbackIsIgnored(t *testing.T) {
+	steerer := &ignoringSteerer{started: make(chan struct{}, 1), release: make(chan struct{})}
+	hook := &recordingDeliveryHook{}
+	l, machine, _, cancel := newSteeringUnit(t, steerer, hook)
+	t.Cleanup(cancel)
+	factory := &manualSteeringTimerFactory{}
+	machine.timerFactory = factory.new
+	if err := machine.setStream(orderedUnitStream()); err != nil {
+		t.Fatalf("set stream: %v", err)
+	}
+	input := unitPreparedInput(t, l, "deadline before fallback")
+	if _, err := machine.offer(input); err != nil {
+		t.Fatalf("offer: %v", err)
+	}
+	awaitStarted(t, steerer.started)
+	timers, _ := factory.snapshot()
+	timers[0].fire()
+	select {
+	case <-machine.deadlineTimerChan():
+	case <-time.After(time.Second):
+		t.Fatal("deadline did not reach the actor")
+	}
+	if err := machine.deadlineTimeout(); err != nil {
+		t.Fatalf("deadline timeout: %v", err)
+	}
+	if err := machine.observe(driver.SteerObservation{SteerResult: fallbackSteerResult()}); err != nil {
+		t.Fatalf("late fallback observation: %v", err)
+	}
+	if got, want := hook.snapshot(), []string{"reserve", string(foreign.DeliveryResolutionUnknown)}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("late fallback changed calls = %v, want %v", got, want)
+	}
+	close(steerer.release)
+	if err := machine.complete(takeCompletion(t, machine)); err != nil {
+		t.Fatalf("late completion: %v", err)
+	}
+}
+
+func TestSteeringShutdownFinalizesUnresolvedReservation(t *testing.T) {
+	steerer := &ignoringSteerer{started: make(chan struct{}, 1), release: make(chan struct{})}
+	hook := &recordingDeliveryHook{}
+	l, machine, _, cancel := newSteeringUnit(t, steerer, hook)
+	t.Cleanup(cancel)
+	if err := machine.setStream(orderedUnitStream()); err != nil {
+		t.Fatalf("set stream: %v", err)
+	}
+	input := unitPreparedInput(t, l, "clean shutdown")
+	if _, err := machine.offer(input); err != nil {
+		t.Fatalf("offer: %v", err)
+	}
+	awaitStarted(t, steerer.started)
+	if err := machine.shutdown(); err != nil {
+		t.Fatalf("shutdown: %v", err)
+	}
+	if machine.active != nil {
+		t.Fatalf("shutdown active attempt = %p, want retired", machine.active)
+	}
+	if got, want := hook.snapshot(), []string{"reserve", string(foreign.DeliveryResolutionUnknown)}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("shutdown calls = %v, want %v", got, want)
+	}
+	close(steerer.release)
+	if err := machine.complete(takeCompletion(t, machine)); err != nil {
+		t.Fatalf("late shutdown completion: %v", err)
+	}
+}

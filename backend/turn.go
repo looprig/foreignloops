@@ -174,6 +174,12 @@ func (l *Loop) awaitTurn(loopCtx context.Context, cur event.TurnIndex, activeCom
 				cancel()
 				return true
 			}
+		case <-machine.deadlineTimerChan():
+			if err := machine.deadlineTimeout(); err != nil {
+				machine.logFault()
+				cancel()
+				return true
+			}
 		case req := <-l.snapshots:
 			req.reply <- snapshotResult{msgs: cloneMessages(l.msgs), turnIndex: l.turnIndex}
 		case input := <-commands:
@@ -182,8 +188,13 @@ func (l *Loop) awaitTurn(loopCtx context.Context, cur event.TurnIndex, activeCom
 			}
 		case <-loopCtx.Done():
 			cancel()
-			if result != nil {
-				_, _ = l.receiveTurnOutcome(loopCtx, cur, turnID, stepID, mailbox, result, machine, false)
+			if _, err := l.receiveTurnOutcome(loopCtx, cur, turnID, stepID, mailbox, result, machine, false); err != nil {
+				machine.logFault()
+				return true
+			}
+			if err := machine.shutdown(); err != nil {
+				machine.logFault()
+				return true
 			}
 			return true
 		}
@@ -310,7 +321,12 @@ func (l *Loop) handleTurnCommand(loopCtx context.Context, input command.Command,
 		return true, false
 	case command.Shutdown:
 		cancel()
-		_, _ = l.receiveTurnOutcome(loopCtx, cur, turnID, stepID, mailbox, result, machine, false)
+		if _, err := l.receiveTurnOutcome(loopCtx, cur, turnID, stepID, mailbox, result, machine, false); err != nil {
+			return true, true
+		}
+		if err := machine.shutdown(); err != nil {
+			return true, true
+		}
 		if err := l.cancelPending(loopCtx, turnID, stepID, event.CancelTurnInterrupted); err != nil {
 			slog.Error("foreignloop: queued cancellation publication failed", "error", err)
 			l.closeAgent()
@@ -762,6 +778,10 @@ func (l *Loop) receiveTurnOutcome(ctx context.Context, cur event.TurnIndex, turn
 			}
 		case <-machine.timerChan():
 			if err := machine.timeout(); err != nil {
+				return outcome, err
+			}
+		case <-machine.deadlineTimerChan():
+			if err := machine.deadlineTimeout(); err != nil {
 				return outcome, err
 			}
 		}

@@ -22,12 +22,34 @@ import (
 // ambiguous after this bound and is never retried automatically.
 const steeringAckTimeout = 100 * time.Millisecond
 
-// steeringCallTimeout bounds a request whose provider admission is not yet
-// known. The ACP transport has its own terminal grace period, but the backend
-// must retain a separate hard bound for adapters that never produce a
-// completion or ordered acknowledgement. This longer bound avoids adjudicating
-// a valid wire response merely because the actor was scheduled after terminal.
+// steeringCallTimeout bounds the actor-owned delivery adjudication window for a
+// request whose provider admission is not yet known. It starts after the
+// durable reservation, not when the adapter call context is created. The actor
+// remains the sole owner of the deadline so a provider that ignores cancellation
+// cannot keep a reserved request unresolved or race a later FIFO request.
 const steeringCallTimeout = time.Second
+
+type steeringTimer interface {
+	Chan() <-chan time.Time
+	Stop() bool
+}
+
+type runtimeSteeringTimer struct{ timer *time.Timer }
+
+func (t *runtimeSteeringTimer) Chan() <-chan time.Time {
+	if t == nil || t.timer == nil {
+		return nil
+	}
+	return t.timer.C
+}
+
+func (t *runtimeSteeringTimer) Stop() bool {
+	return t != nil && t.timer != nil && t.timer.Stop()
+}
+
+func newRuntimeSteeringTimer(timeout time.Duration) steeringTimer {
+	return &runtimeSteeringTimer{timer: time.NewTimer(timeout)}
+}
 
 type steeringDisposition uint8
 
@@ -46,6 +68,10 @@ type steeringAttempt struct {
 	done     bool
 	seen     bool
 	resolved bool
+	// deadlineExpired lets the actor retire a request after its checked
+	// ambiguity resolution even when the adapter ignores its context and never
+	// returns a completion. It is only written by the actor goroutine.
+	deadlineExpired bool
 
 	writerAdmitted bool
 	result         driver.SteerResult
@@ -86,7 +112,9 @@ type steeringMachine struct {
 	disabled        bool
 	fallbackBarrier bool
 	fault           error
-	timer           *time.Timer
+	timerFactory    func(time.Duration) steeringTimer
+	timer           steeringTimer
+	deadlineTimer   steeringTimer
 }
 
 func newSteeringMachine(ctx context.Context, l *Loop, pub func(event.Event), cur event.TurnIndex, turnID, stepID uuid.UUID, stream driver.Stream) *steeringMachine {
@@ -99,17 +127,18 @@ func newSteeringMachine(ctx context.Context, l *Loop, pub func(event.Event), cur
 	}
 	_, ordered := stream.(driver.OrderedStream)
 	return &steeringMachine{
-		loop:        l,
-		ctx:         ctx,
-		resolveCtx:  context.WithoutCancel(ctx),
-		pub:         pub,
-		cur:         cur,
-		turnID:      turnID,
-		stepID:      stepID,
-		steerer:     steerer,
-		ordered:     ordered,
-		hook:        l.services.Delivery,
-		completions: make(chan steeringCompletion, 16),
+		loop:         l,
+		ctx:          ctx,
+		resolveCtx:   context.WithoutCancel(ctx),
+		pub:          pub,
+		cur:          cur,
+		turnID:       turnID,
+		stepID:       stepID,
+		steerer:      steerer,
+		ordered:      ordered,
+		hook:         l.services.Delivery,
+		completions:  make(chan steeringCompletion, 16),
+		timerFactory: newRuntimeSteeringTimer,
 	}
 }
 
@@ -168,7 +197,14 @@ func (m *steeringMachine) timerChan() <-chan time.Time {
 	if m == nil || m.timer == nil {
 		return nil
 	}
-	return m.timer.C
+	return m.timer.Chan()
+}
+
+func (m *steeringMachine) deadlineTimerChan() <-chan time.Time {
+	if m == nil || m.deadlineTimer == nil {
+		return nil
+	}
+	return m.deadlineTimer.Chan()
 }
 
 func (m *steeringMachine) isCandidate(input preparedInput) bool {
@@ -225,13 +261,13 @@ func (m *steeringMachine) pump() error {
 		return err
 	}
 	attempt := &next
-	// Do not start the terminal-race clock at admission. The provider response
-	// and its ordered observation may legitimately arrive after this actor has
-	// launched the call; only a terminal boundary needs a bounded ambiguity
-	// decision. The terminal path cancels this context if that bound expires.
-	attemptCtx, cancel := context.WithTimeout(m.ctx, steeringCallTimeout)
+	// The actor-owned deadline starts at the durable reservation. The adapter
+	// receives only a cancellation context; its completion cannot adjudicate or
+	// extend the actor's bounded delivery window.
+	attemptCtx, cancel := context.WithCancel(m.ctx)
 	attempt.cancel = cancel
 	m.active = attempt
+	m.startDeadlineTimer()
 	go m.callSteerer(attemptCtx, attempt)
 	return nil
 }
@@ -513,8 +549,21 @@ func (m *steeringMachine) startTerminalTimer() {
 		if m.active != nil && m.active.writerAdmitted {
 			timeout = steeringAckTimeout
 		}
-		m.timer = time.NewTimer(timeout)
+		m.timer = m.newTimer(timeout)
 	}
+}
+
+func (m *steeringMachine) startDeadlineTimer() {
+	if m != nil && m.active != nil && m.deadlineTimer == nil {
+		m.deadlineTimer = m.newTimer(steeringCallTimeout)
+	}
+}
+
+func (m *steeringMachine) newTimer(timeout time.Duration) steeringTimer {
+	if m != nil && m.timerFactory != nil {
+		return m.timerFactory(timeout)
+	}
+	return newRuntimeSteeringTimer(timeout)
 }
 
 // timeout resolves a post-writer terminal race as unknown. The caller then
@@ -531,22 +580,83 @@ func (m *steeringMachine) timeout() error {
 	return m.retireIfDone(m.active)
 }
 
+// deadlineTimeout resolves an unresolved reservation as unknown and retires it
+// immediately. The provider completion is deliberately not required: the
+// actor owns this deadline and late adapter facts are ignored by identity after
+// retirement.
+func (m *steeringMachine) deadlineTimeout() error {
+	if m == nil || m.active == nil {
+		return nil
+	}
+	m.deadlineTimer = nil
+	attempt := m.active
+	attempt.deadlineExpired = true
+	if attempt.resolved {
+		// A fallback/injected observation may have won the adjudication CAS while
+		// its adapter still ignores cancellation. The deadline cannot publish a
+		// second resolution, but it must still retire that resolved attempt so it
+		// cannot block the next FIFO request forever.
+		return m.retireIfDone(attempt)
+	}
+	if err := m.resolveDisposition(attempt, steeringDispositionUnknown); err != nil {
+		return err
+	}
+	return m.fault
+}
+
+// shutdown finalizes any reserved delivery before the actor exits. Resolution
+// uses the cancellation-independent context so the checked durable transition
+// cannot be lost during clean loop teardown.
+func (m *steeringMachine) shutdown() error {
+	if m == nil {
+		return nil
+	}
+	m.terminal = true
+	if m.active != nil {
+		attempt := m.active
+		if !attempt.resolved {
+			attempt.deadlineExpired = true
+			if err := m.resolveDisposition(attempt, steeringDispositionUnknown); err != nil {
+				return err
+			}
+		} else {
+			attempt.deadlineExpired = true
+			if err := m.retireIfDone(attempt); err != nil {
+				return err
+			}
+		}
+	}
+	if m.active == nil {
+		if err := m.queuePendingFallbacks(); err != nil {
+			return err
+		}
+	}
+	return m.fault
+}
+
+func stopSteeringTimer(timer steeringTimer) {
+	if timer == nil {
+		return
+	}
+	if !timer.Stop() {
+		select {
+		case <-timer.Chan():
+		default:
+		}
+	}
+}
+
 func (m *steeringMachine) retireIfDone(attempt *steeringAttempt) error {
-	if m == nil || attempt == nil || !attempt.resolved || !attempt.done || m.active != attempt {
+	if m == nil || attempt == nil || !attempt.resolved || (!attempt.done && !attempt.deadlineExpired) || m.active != attempt {
 		return m.fault
 	}
 	if attempt.cancel != nil {
 		attempt.cancel()
 	}
-	if m.timer != nil {
-		if !m.timer.Stop() {
-			select {
-			case <-m.timer.C:
-			default:
-			}
-		}
-		m.timer = nil
-	}
+	stopSteeringTimer(m.timer)
+	m.timer = nil
+	stopSteeringTimer(m.deadlineTimer)
+	m.deadlineTimer = nil
 	m.active = nil
 	if !m.terminal {
 		return m.pump()
