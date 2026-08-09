@@ -9,6 +9,7 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"time"
 	"unicode"
 	"unicode/utf8"
 
@@ -104,6 +105,8 @@ type stream struct {
 	pendingEvents       []driver.Event
 	pendingObservations []driver.Observation
 	nextOrder           uint64
+	steers              map[*steerCall]struct{}
+	terminal            bool
 
 	once     sync.Once
 	closeErr error
@@ -120,6 +123,11 @@ const (
 type steerInput struct {
 	observation driver.SteerObservation
 	admitted    chan struct{}
+}
+
+type steerCall struct {
+	admitted  chan struct{}
+	finalized bool
 }
 
 // Spawn starts one prompt on the session created by New. The prompt itself is
@@ -164,12 +172,56 @@ func (d *Driver) Spawn(ctx context.Context, turn driver.Turn) (driver.Stream, er
 		done:         done,
 		cancel:       cancel,
 		steerIn:      make(chan steerInput, 512),
+		steers:       make(map[*steerCall]struct{}),
 	}
 	d.activeMu.Lock()
 	d.active = s
 	d.activeMu.Unlock()
 	go d.runTurn(turnCtx, cancel, driverCtx, sess, turn, s, events, done)
 	return s, nil
+}
+
+func (s *stream) registerSteer() (*steerCall, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed || s.terminal {
+		return nil, false
+	}
+	call := &steerCall{admitted: make(chan struct{})}
+	s.steers[call] = struct{}{}
+	return call, true
+}
+
+func (s *stream) completeSteer(call *steerCall) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.steers[call]; !ok {
+		return false
+	}
+	delete(s.steers, call)
+	return !call.finalized
+}
+
+func (s *stream) holdTerminalSteers() []*steerCall {
+	s.mu.Lock()
+	s.terminal = true
+	calls := make([]*steerCall, 0, len(s.steers))
+	for call := range s.steers {
+		calls = append(calls, call)
+	}
+	s.mu.Unlock()
+	return calls
+}
+
+func (s *stream) finalizeSteer(call *steerCall) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.steers[call]; !ok {
+		return false
+	}
+	call.finalized = true
+	delete(s.steers, call)
+	return true
 }
 
 func (d *Driver) runTurn(
@@ -302,6 +354,17 @@ func (d *Driver) runTurn(
 						}
 					}
 				pendingSteerInputsDrained:
+					pendingCalls := streamState.holdTerminalSteers()
+					if len(pendingCalls) > 0 {
+						timer := time.NewTimer(100 * time.Millisecond)
+						<-timer.C
+						for _, call := range pendingCalls {
+							if streamState.finalizeSteer(call) {
+								emitObservation(streamState, driver.SteerObservation{SteerResult: driver.SteerResult{Outcome: driver.SteerOutcomeDeliveryUnknown}, Err: errors.New("acp: steer response unavailable")})
+								close(call.admitted)
+							}
+						}
+					}
 					drainTurnUpdatesThrough(turnCtx, updates, &pendingUpdates, state, events, streamState, promptSequence(outcome))
 					emitPromptObservation(streamState, outcome)
 					sendPromptTerminal(turnCtx, streamState, events, state, outcome)

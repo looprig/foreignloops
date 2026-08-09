@@ -374,6 +374,11 @@ func (d *Driver) Steer(ctx context.Context, request driver.SteerRequest) (driver
 		d.admitSteer(ctx, active, driver.SteerObservation{SteerResult: result, Err: err})
 		return result, err
 	}
+	call, admitted := active.registerSteer()
+	if !admitted {
+		emitObservation(active, driver.SteerObservation{SteerResult: unsupported})
+		return unsupported, nil
+	}
 	result, callErr := sess.Steer(ctx, client.SteerParams{
 		SessionID: sess.ID(),
 		Prompt:    prompt,
@@ -383,7 +388,9 @@ func (d *Driver) Steer(ctx context.Context, request driver.SteerRequest) (driver
 	if normalized.Outcome == driver.SteerOutcomeDeliveryUnknown || normalized.Outcome == driver.SteerOutcomeDeliveredUntrackable || steeringErrorGuaranteesNoDelivery(callErr) {
 		d.steeringOff = true
 	}
-	d.admitSteer(ctx, active, driver.SteerObservation{SteerResult: normalized, Err: normalizedErr})
+	if active.completeSteer(call) {
+		d.admitSteer(ctx, active, driver.SteerObservation{SteerResult: normalized, Err: normalizedErr})
+	}
 	return normalized, normalizedErr
 }
 
