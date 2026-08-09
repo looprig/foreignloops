@@ -433,7 +433,7 @@ func (m *steeringMachine) resolvePendingBeforeTerminal() error {
 				return err
 			}
 		}
-		if !m.active.resolved {
+		if m.active != nil && !m.active.resolved {
 			m.startTerminalTimer()
 		}
 	}

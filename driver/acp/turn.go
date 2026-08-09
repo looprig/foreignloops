@@ -366,17 +366,6 @@ func (s *stream) Events() <-chan driver.Event {
 	return s.projection.eventsView()
 }
 
-func (s *stream) Observations() <-chan driver.Observation {
-	if s == nil || s.projection == nil {
-		return nil
-	}
-	return s.projection.observationsView()
-}
-
-func (s *stream) orderedProjection() bool {
-	return s != nil && s.ordered
-}
-
 func (s *stream) History() (driver.History, error) {
 	return driver.History{Available: false}, nil
 }
@@ -405,12 +394,11 @@ func (s *orderedStream) Events() <-chan driver.Event {
 	return s.stream.Events()
 }
 func (s *orderedStream) Observations() <-chan driver.Observation {
-	if s == nil {
+	if s == nil || s.stream == nil || s.stream.projection == nil {
 		return nil
 	}
-	return s.stream.Observations()
+	return s.stream.projection.observationsView()
 }
-func (s *orderedStream) orderedProjection() bool { return true }
 func (s *orderedStream) History() (driver.History, error) {
 	if s == nil {
 		return driver.History{Available: false}, nil
@@ -1574,5 +1562,5 @@ var (
 	_ driver.Agent         = (*Driver)(nil)
 	_ driver.Steerer       = (*Driver)(nil)
 	_ driver.Stream        = (*stream)(nil)
-	_ driver.OrderedStream = (*stream)(nil)
+	_ driver.OrderedStream = (*orderedStream)(nil)
 )

@@ -103,7 +103,13 @@ func (l *Loop) publisher(ctx context.Context, turnID, stepID uuid.UUID) func(eve
 // lifecycle state beyond a transition that the session accepted durably.
 func (l *Loop) publishActor(ctx context.Context, turnID, stepID uuid.UUID, input event.Event) error {
 	input = fillForeignHeader(input, l.sessionID, l.loopID, turnID, stepID)
-	if input.Class() == event.Enduring {
+	// TurnFoldedInto is an authoritative handback transition. Keep the
+	// explicit type check alongside the semantic class check so a Harness
+	// event-class refactor cannot silently downgrade the fold to an unchecked
+	// publication: steering resolution must observe the durable fold before it
+	// records injected delivery.
+	_, fold := input.(event.TurnFoldedInto)
+	if input.Class() == event.Enduring || fold {
 		header, err := l.fac.Stamp(input.EventHeader())
 		if err != nil {
 			return err

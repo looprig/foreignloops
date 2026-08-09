@@ -190,7 +190,10 @@ func (a *initAgent) Spawn(ctx context.Context, turn driver.Turn) (driver.Stream,
 	if !first {
 		return stream, nil
 	}
-	return newInitStream(stream, a.sessionID), nil
+	if _, ok := stream.(driver.OrderedStream); ok {
+		return newOrderedInitStream(stream, a.sessionID), nil
+	}
+	return newLegacyInitStream(stream, a.sessionID), nil
 }
 
 func (a *initAgent) Close() error { return a.agent.Close() }
@@ -199,9 +202,9 @@ func (a *initAgent) Steer(ctx context.Context, request driver.SteerRequest) (dri
 	return a.agent.Steer(ctx, request)
 }
 
-// initStream prefixes exactly one synthetic init value and then forwards the
-// wrapped stream's already-selected projection. It has its own projection
-// owner so no wrapper goroutine sends to or closes a public channel directly.
+// initStream prefixes exactly one synthetic init value for a legacy Events
+// stream. It has its own projection owner so no wrapper goroutine sends to or
+// closes a public channel directly.
 type initStream struct {
 	inner      driver.Stream
 	projection *projection
@@ -218,8 +221,29 @@ type initStream struct {
 	closeErr  error
 }
 
+// orderedInitStream exposes the ordered projection of the wrapped first-turn
+// stream. Keeping this as a distinct concrete type is important: an
+// unordered/legacy stream must not satisfy driver.OrderedStream merely because
+// the wrapper has an inactive Observations method.
+type orderedInitStream struct{ inner *initStream }
+
+// legacyInitStream deliberately does not expose Observations. The wrapped
+// helper retains that method for its focused projection tests, but the stream
+// crossing the builder boundary must advertise only the selected legacy view.
+type legacyInitStream struct{ inner *initStream }
+
 func newOrderedInitStream(inner driver.Stream, sessionID string) driver.Stream {
-	return newInitStream(inner, sessionID)
+	if _, ok := inner.(driver.OrderedStream); !ok {
+		return newInitStream(inner, sessionID)
+	}
+	wrapped := newInitStream(inner, sessionID).(*initStream)
+	wrapped.start(viewObservations)
+	return &orderedInitStream{inner: wrapped}
+}
+
+func newLegacyInitStream(inner driver.Stream, sessionID string) driver.Stream {
+	wrapped := newInitStream(inner, sessionID).(*initStream)
+	return &legacyInitStream{inner: wrapped}
 }
 
 func newInitStream(inner driver.Stream, sessionID string) driver.Stream {
@@ -260,6 +284,55 @@ func (s *initStream) start(view streamView) {
 		s.projection.selectView(view)
 		s.startOnce.Do(func() { go s.forward(view) })
 	}
+}
+
+func (s *orderedInitStream) Events() <-chan driver.Event {
+	if s == nil || s.inner == nil {
+		return nil
+	}
+	return s.inner.Events()
+}
+
+func (s *orderedInitStream) Observations() <-chan driver.Observation {
+	if s == nil || s.inner == nil || s.inner.projection == nil {
+		return nil
+	}
+	return s.inner.projection.observationsView()
+}
+
+func (s *orderedInitStream) History() (driver.History, error) {
+	if s == nil || s.inner == nil {
+		return driver.History{Available: false}, nil
+	}
+	return s.inner.History()
+}
+
+func (s *orderedInitStream) Close() error {
+	if s == nil || s.inner == nil {
+		return nil
+	}
+	return s.inner.Close()
+}
+
+func (s *legacyInitStream) Events() <-chan driver.Event {
+	if s == nil || s.inner == nil {
+		return nil
+	}
+	return s.inner.Events()
+}
+
+func (s *legacyInitStream) History() (driver.History, error) {
+	if s == nil || s.inner == nil {
+		return driver.History{Available: false}, nil
+	}
+	return s.inner.History()
+}
+
+func (s *legacyInitStream) Close() error {
+	if s == nil || s.inner == nil {
+		return nil
+	}
+	return s.inner.Close()
 }
 
 func (s *initStream) forward(view streamView) {
@@ -344,5 +417,6 @@ var (
 	_ driver.Steerer                  = (*initAgent)(nil)
 	_ driver.Closer                   = (*initAgent)(nil)
 	_ driver.Stream                   = (*initStream)(nil)
-	_ driver.OrderedStream            = (*initStream)(nil)
+	_ driver.Stream                   = (*legacyInitStream)(nil)
+	_ driver.OrderedStream            = (*orderedInitStream)(nil)
 )
