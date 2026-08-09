@@ -15,9 +15,10 @@ import (
 const steerTerminalGrace = 100 * time.Millisecond
 
 type steerJob struct {
-	id     uint64
-	ctx    context.Context
-	params client.SteerParams
+	id      uint64
+	ctx     context.Context
+	params  client.SteerParams
+	attempt *steerAttempt
 }
 
 type dispatcherInput struct {
@@ -27,13 +28,14 @@ type dispatcherInput struct {
 }
 
 type dispatcherEvent struct {
-	id               uint64
-	result           client.SteerResult
-	err              error
-	admissionKnown   bool
-	writeAdmitted    bool
-	late             bool
-	terminalComplete bool
+	id                uint64
+	result            client.SteerResult
+	err               error
+	admissionKnown    bool
+	writeAdmitted     bool
+	admissionPossible bool
+	late              bool
+	terminalComplete  bool
 }
 
 type legacySteerCompletion struct {
@@ -51,9 +53,50 @@ type activeSteer struct {
 
 	admissionKnown bool
 	writeAdmitted  bool
+	started        bool
 	resolved       bool
 	terminal       bool
 	timer          *time.Timer
+}
+
+// steerAttempt carries the admission state of one command independently of
+// the caller's context. A command may be acknowledged by the turn mailbox
+// before the dispatcher starts ACP transport, so a timeout must distinguish a
+// proven pre-admission rejection from an attempt whose admission is still
+// unresolved and therefore may have crossed Writer.
+type steerAttempt struct {
+	mu             sync.Mutex
+	started        bool
+	admissionKnown bool
+	writeAdmitted  bool
+}
+
+func (a *steerAttempt) markStarted() {
+	if a == nil {
+		return
+	}
+	a.mu.Lock()
+	a.started = true
+	a.mu.Unlock()
+}
+
+func (a *steerAttempt) markAdmission(admitted bool) {
+	if a == nil {
+		return
+	}
+	a.mu.Lock()
+	a.admissionKnown = true
+	a.writeAdmitted = admitted
+	a.mu.Unlock()
+}
+
+func (a *steerAttempt) snapshot() (started, admissionKnown, admitted bool) {
+	if a == nil {
+		return false, false, false
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.started, a.admissionKnown, a.writeAdmitted
 }
 
 // steerDispatcher owns all provider steering calls for one turn. Its input
@@ -153,6 +196,9 @@ func (d *steerDispatcher) run() {
 		for len(queue) > 0 {
 			job := queue[0]
 			queue = queue[1:]
+			if job.attempt != nil {
+				job.attempt.markAdmission(false)
+			}
 			emit(dispatcherEvent{
 				id:             job.id,
 				result:         client.SteerResult{},
@@ -168,6 +214,9 @@ func (d *steerDispatcher) run() {
 			job := queue[0]
 			queue = queue[1:]
 			if job.ctx != nil && job.ctx.Err() != nil {
+				if job.attempt != nil {
+					job.attempt.markAdmission(false)
+				}
 				emit(dispatcherEvent{
 					id:             job.id,
 					result:         client.SteerResult{},
@@ -221,6 +270,9 @@ func (d *steerDispatcher) run() {
 			if input.job != nil {
 				if terminalRequested {
 					job := *input.job
+					if job.attempt != nil {
+						job.attempt.markAdmission(false)
+					}
 					emit(dispatcherEvent{
 						id:             job.id,
 						result:         client.SteerResult{},
@@ -252,6 +304,10 @@ func (d *steerDispatcher) run() {
 			}
 			active.admissionKnown = true
 			active.writeAdmitted = ok && admitted
+			active.admissionCh = nil
+			if active.job.attempt != nil {
+				active.job.attempt.markAdmission(active.writeAdmitted)
+			}
 			if active.terminal && !active.resolved {
 				d.resolveTerminalActive(active, emit)
 			}
@@ -260,6 +316,7 @@ func (d *steerDispatcher) run() {
 			if active == nil {
 				continue
 			}
+			d.resolveAdmission(active)
 			if !ok {
 				completion = client.SteerCompletion{Result: client.SteerResult{WriteAdmitted: active.writeAdmitted}, Err: errors.New("acp: steering completion unavailable")}
 			}
@@ -275,6 +332,7 @@ func (d *steerDispatcher) run() {
 			if !ok {
 				completion = legacySteerCompletion{result: client.SteerResult{WriteAdmitted: active.writeAdmitted}, err: errors.New("acp: steering completion unavailable")}
 			}
+			d.resolveAdmission(active)
 			late := active.resolved || (active.job.ctx != nil && active.job.ctx.Err() != nil)
 			d.finishActive(active, completion.result, completion.err, emit, late)
 			active.legacyCh = nil
@@ -284,21 +342,25 @@ func (d *steerDispatcher) run() {
 			if active == nil || active.resolved {
 				continue
 			}
-			// No admission fact arrived within the lifecycle bound. This is not
-			// proof of non-delivery; resolve fail-closed as unknown and then cancel
-			// response observation. The eventual provider result is late/ignored.
-			active.admissionKnown = true
-			active.writeAdmitted = true
+			// No admission fact arrived within the lifecycle bound. The started
+			// attempt may have crossed Writer, so resolve as possible/unknown;
+			// do not manufacture a WriteAdmitted fact here.
 			d.resolveTerminalActive(active, emit)
 		}
 	}
 }
 
 func (d *steerDispatcher) start(job steerJob) *activeSteer {
-	active := &activeSteer{job: job}
+	active := &activeSteer{job: job, started: true}
+	if job.attempt != nil {
+		job.attempt.markStarted()
+	}
 	if async, ok := d.session.(asyncSteerSession); ok {
 		handle := async.StartSteer(d.ctx, job.params)
 		if handle == nil {
+			if job.attempt != nil {
+				job.attempt.markAdmission(false)
+			}
 			select {
 			case d.events <- dispatcherEvent{id: job.id, err: errors.New("acp: steering handle unavailable"), admissionKnown: true}:
 			case <-d.done:
@@ -323,6 +385,9 @@ func (d *steerDispatcher) start(job steerJob) *activeSteer {
 	case d.events <- dispatcherEvent{id: job.id, err: errors.New("acp: steering capability unavailable"), admissionKnown: true}:
 	case <-d.done:
 	}
+	if job.attempt != nil {
+		job.attempt.markAdmission(false)
+	}
 	return nil
 }
 
@@ -333,23 +398,28 @@ func (d *steerDispatcher) finishActive(active *activeSteer, result client.SteerR
 	if !result.WriteAdmitted && active.admissionKnown {
 		result.WriteAdmitted = active.writeAdmitted
 	}
+	if result.WriteAdmitted && active.job.attempt != nil {
+		active.job.attempt.markAdmission(true)
+	}
 	if late {
 		emit(dispatcherEvent{
-			id:             active.job.id,
-			result:         result,
-			err:            err,
-			admissionKnown: active.admissionKnown,
-			writeAdmitted:  active.writeAdmitted,
-			late:           true,
+			id:                active.job.id,
+			result:            result,
+			err:               err,
+			admissionKnown:    active.admissionKnown,
+			writeAdmitted:     active.writeAdmitted,
+			admissionPossible: active.started,
+			late:              true,
 		})
 		return
 	}
 	emit(dispatcherEvent{
-		id:             active.job.id,
-		result:         result,
-		err:            err,
-		admissionKnown: active.admissionKnown || result.WriteAdmitted,
-		writeAdmitted:  active.writeAdmitted || result.WriteAdmitted,
+		id:                active.job.id,
+		result:            result,
+		err:               err,
+		admissionKnown:    active.admissionKnown || result.WriteAdmitted,
+		writeAdmitted:     active.writeAdmitted || result.WriteAdmitted,
+		admissionPossible: active.started,
 	})
 }
 
@@ -364,14 +434,38 @@ func (d *steerDispatcher) resolveTerminalActive(active *activeSteer, emit func(d
 	if active.handle != nil {
 		active.handle.Cancel()
 	}
+	if active.job.attempt != nil && active.admissionKnown {
+		active.job.attempt.markAdmission(active.writeAdmitted)
+	}
 	err := errors.New("acp: steering response unavailable")
 	emit(dispatcherEvent{
-		id:             active.job.id,
-		result:         client.SteerResult{WriteAdmitted: active.writeAdmitted},
-		err:            err,
-		admissionKnown: active.admissionKnown,
-		writeAdmitted:  active.writeAdmitted,
+		id:                active.job.id,
+		result:            client.SteerResult{WriteAdmitted: active.writeAdmitted},
+		err:               err,
+		admissionKnown:    active.admissionKnown,
+		writeAdmitted:     active.writeAdmitted,
+		admissionPossible: active.started,
 	})
+}
+
+// resolveAdmission drains the ordered Admission signal before consuming a
+// completion. StartSteer publishes admission before Result, but both channels
+// are independently selectable by this dispatcher; draining here prevents a
+// known pre-admission rejection from being misclassified as unresolved.
+func (d *steerDispatcher) resolveAdmission(active *activeSteer) {
+	if active == nil || active.admissionKnown || active.admissionCh == nil {
+		return
+	}
+	select {
+	case admitted, ok := <-active.admissionCh:
+		active.admissionKnown = true
+		active.writeAdmitted = ok && admitted
+		active.admissionCh = nil
+		if active.job.attempt != nil {
+			active.job.attempt.markAdmission(active.writeAdmitted)
+		}
+	default:
+	}
 }
 
 func contextError(ctx context.Context, fallback error) error {

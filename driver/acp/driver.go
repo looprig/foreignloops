@@ -352,9 +352,12 @@ func (d *Driver) Steer(ctx context.Context, request driver.SteerRequest) (driver
 		return driver.SteerResult{Outcome: driver.SteerOutcomeUnsupported}, nil
 	}
 	reply := make(chan steerReply, 1)
-	if !h.send(ctx, steerCommand{ctx: ctx, request: request, reply: reply}) {
+	attempt := &steerAttempt{}
+	if !h.send(ctx, steerCommand{ctx: ctx, request: request, reply: reply, attempt: attempt}) {
 		if err := ctx.Err(); err != nil {
-			return driver.SteerResult{Outcome: driver.SteerOutcomeDeliveryUnknown, WriteAdmitted: true}, err
+			result := driver.SteerResult{Outcome: driver.SteerOutcomeFallbackRequired}
+			h.rejectSteer(result, err)
+			return result, err
 		}
 		return driver.SteerResult{Outcome: driver.SteerOutcomeUnsupported}, nil
 	}
@@ -365,8 +368,26 @@ func (d *Driver) Steer(ctx context.Context, request driver.SteerRequest) (driver
 		// The arbiter still owns the attempt and may later emit its observation.
 		// Return a bounded caller result without allowing this caller to consume
 		// or cancel the arbiter's reply.
-		return driver.SteerResult{Outcome: driver.SteerOutcomeDeliveryUnknown, WriteAdmitted: true}, ctx.Err()
+		return callerTimeoutSteerResult(attempt), ctx.Err()
 	}
+}
+
+func callerTimeoutSteerResult(attempt *steerAttempt) driver.SteerResult {
+	started, admissionKnown, admitted := attempt.snapshot()
+	if admissionKnown {
+		if admitted {
+			return driver.SteerResult{Outcome: driver.SteerOutcomeDeliveryUnknown, WriteAdmitted: true}
+		}
+		return driver.SteerResult{Outcome: driver.SteerOutcomeFallbackRequired}
+	}
+	if started {
+		// An ACP attempt exists but has not published admission yet. Delivery
+		// remains possible, so unknown is the only safe caller projection; the
+		// true bit reflects possibility from a started attempt, not a fabricated
+		// admission fact.
+		return driver.SteerResult{Outcome: driver.SteerOutcomeDeliveryUnknown, WriteAdmitted: true}
+	}
+	return driver.SteerResult{Outcome: driver.SteerOutcomeFallbackRequired}
 }
 
 func (d *Driver) activeHandle() *turnHandle {

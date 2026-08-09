@@ -2,6 +2,7 @@ package acp
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -55,6 +56,56 @@ func TestProjectionOwnerSelectionAndStaleSend(t *testing.T) {
 	}
 }
 
+func TestProjectionBackpressuresStalledConsumerAndCloseUnblocks(t *testing.T) {
+	p := newProjection()
+	observations := p.observationsView()
+
+	// The selected output buffer, the owner's pending queue, and the command
+	// mailbox are the complete bounded in-flight budget. One more producer
+	// must remain blocked while the consumer is deliberately absent.
+	budget := cap(observations)*2 + cap(p.commands)
+	accepted := make(chan struct{}, budget+1)
+	producerDone := make(chan struct{})
+	go func() {
+		defer close(producerDone)
+		for i := 0; i < budget+1; i++ {
+			p.emitObservation(driver.SteerObservation{})
+			accepted <- struct{}{}
+		}
+	}()
+
+	for i := 0; i < budget; i++ {
+		select {
+		case <-accepted:
+		case <-time.After(2 * time.Second):
+			t.Fatalf("only %d/%d projection producers reached the bounded budget", i, budget)
+		}
+	}
+	select {
+	case <-accepted:
+		t.Fatal("projection accepted an emission beyond its bounded pending/mailbox budget")
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	closeDone := make(chan struct{})
+	go func() {
+		p.close()
+		close(closeDone)
+	}()
+	select {
+	case <-closeDone:
+	case <-time.After(2 * time.Second):
+		// Ensure blocked producers are released before reporting the failure.
+		p.abortOwner()
+		t.Fatal("projection Close() remained blocked with a stalled selected consumer")
+	}
+	select {
+	case <-producerDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("blocked projection producer did not release after Close()")
+	}
+}
+
 func TestTurnHandleStaleSendIsGuardedByDone(t *testing.T) {
 	done := make(chan struct{})
 	close(done)
@@ -70,6 +121,153 @@ func TestTurnHandleStaleSendIsGuardedByDone(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("stale turn handle send blocked after retirement")
+	}
+}
+
+func TestTurnHandleAlreadyCanceledSendDoesNotEnqueue(t *testing.T) {
+	handle := &turnHandle{commands: make(chan steerCommand, 1), done: make(chan struct{})}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	if accepted := handle.send(ctx, steerCommand{reply: make(chan steerReply, 1)}); accepted {
+		t.Fatal("already-canceled turn handle accepted a steering command")
+	}
+	select {
+	case <-handle.commands:
+		t.Fatal("already-canceled steering command entered the turn mailbox")
+	default:
+	}
+}
+
+func TestDriverSteerAlreadyCanceledIsProvenFallbackWithoutAdmission(t *testing.T) {
+	handle := &turnHandle{commands: make(chan steerCommand, 1), done: make(chan struct{})}
+	d := &Driver{active: handle}
+	request, err := driver.NewSteerRequest([]content.Block{&content.TextBlock{Text: "already canceled"}})
+	if err != nil {
+		t.Fatalf("NewSteerRequest() error = %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	result, steerErr := d.Steer(ctx, request)
+	if !errors.Is(steerErr, context.Canceled) {
+		t.Fatalf("Steer() error = %v, want context.Canceled", steerErr)
+	}
+	if result.Outcome != driver.SteerOutcomeFallbackRequired || result.WriteAdmitted {
+		t.Fatalf("Steer() result = %#v, want fallback_required with false admission", result)
+	}
+	if err := result.Validate(); err != nil {
+		t.Fatalf("Steer() result validation error = %v", err)
+	}
+}
+
+func TestTurnArbiterDispatcherRejectionIsFallbackWithoutAdmission(t *testing.T) {
+	sess := newScriptedSession("dispatcher-rejected")
+	d := newTurnTestDriver(sess)
+	d.steeringOn = true
+	request, err := driver.NewSteerRequest([]content.Block{&content.TextBlock{Text: "dispatcher unavailable"}})
+	if err != nil {
+		t.Fatalf("NewSteerRequest() error = %v", err)
+	}
+	a := &turnArbiter{
+		driver:     d,
+		session:    sess,
+		steers:     make(map[uint64]steerCommand),
+		pending:    make([]arbObservation, 0, 1),
+		dispatcher: nil,
+	}
+	a.acceptSteer(steerCommand{
+		ctx:     context.Background(),
+		request: request,
+		reply:   make(chan steerReply, 1),
+	})
+	if len(a.pending) != 1 {
+		t.Fatalf("pending local steering observations = %d, want 1", len(a.pending))
+	}
+	result := a.pending[0].result.result
+	if result.Outcome != driver.SteerOutcomeFallbackRequired || result.WriteAdmitted {
+		t.Fatalf("dispatcher rejection result = %#v, want fallback_required with false admission", result)
+	}
+	if err := result.Validate(); err != nil {
+		t.Fatalf("dispatcher rejection result validation error = %v", err)
+	}
+}
+
+func TestDriverSteerTimeoutBeforeACPAttemptIsFallbackWithoutAdmission(t *testing.T) {
+	handle := &turnHandle{commands: make(chan steerCommand, 1), done: make(chan struct{})}
+	d := &Driver{active: handle}
+	request, err := driver.NewSteerRequest([]content.Block{&content.TextBlock{Text: "timeout before attempt"}})
+	if err != nil {
+		t.Fatalf("NewSteerRequest() error = %v", err)
+	}
+	accepted := make(chan struct{})
+	go func() {
+		command := <-handle.commands
+		close(command.accepted)
+		close(accepted)
+	}()
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+
+	result, steerErr := d.Steer(ctx, request)
+	if !errors.Is(steerErr, context.DeadlineExceeded) {
+		t.Fatalf("Steer() error = %v, want context deadline", steerErr)
+	}
+	select {
+	case <-accepted:
+	case <-time.After(time.Second):
+		t.Fatal("steering command was not acknowledged")
+	}
+	if result.Outcome != driver.SteerOutcomeFallbackRequired || result.WriteAdmitted {
+		t.Fatalf("Steer() result = %#v, want fallback_required with false admission", result)
+	}
+	if err := result.Validate(); err != nil {
+		t.Fatalf("Steer() result validation error = %v", err)
+	}
+}
+
+func TestCanceledSteerPublishesOneFallbackObservationWithoutACPAttempt(t *testing.T) {
+	sess := &steeringSession{scriptedSession: newScriptedSession("canceled-observation")}
+	release := make(chan struct{})
+	sess.promptHook = func(int, []protocol.ContentBlock) (*client.PromptResult, error) {
+		<-release
+		return &client.PromptResult{StopReason: protocol.StopReasonEndTurn}, nil
+	}
+	d := newTurnTestDriver(sess.scriptedSession)
+	d.session, d.steeringOn = sess, true
+	stream, err := d.Spawn(context.Background(), driver.Turn{})
+	if err != nil {
+		t.Fatalf("Spawn() error = %v", err)
+	}
+	<-sess.promptStarts
+	request, err := driver.NewSteerRequest([]content.Block{&content.TextBlock{Text: "cancel before send"}})
+	if err != nil {
+		t.Fatalf("NewSteerRequest() error = %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	result, steerErr := d.Steer(ctx, request)
+	if !errors.Is(steerErr, context.Canceled) {
+		t.Fatalf("Steer() error = %v, want context.Canceled", steerErr)
+	}
+	if result.Outcome != driver.SteerOutcomeFallbackRequired || result.WriteAdmitted {
+		t.Fatalf("Steer() result = %#v, want fallback_required with false admission", result)
+	}
+	if len(sess.steerParams) != 0 {
+		t.Fatalf("ACP steer calls = %d, want zero for canceled-before-send", len(sess.steerParams))
+	}
+	ordered := stream.(driver.OrderedStream).Observations()
+	select {
+	case observation := <-ordered:
+		steer, ok := observation.(driver.SteerObservation)
+		if !ok || steer.Outcome != driver.SteerOutcomeFallbackRequired || steer.WriteAdmitted {
+			t.Fatalf("canceled steer observation = %#v, want one fallback without admission", observation)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("canceled steering observation did not arrive")
+	}
+	close(release)
+	for range ordered {
 	}
 }
 

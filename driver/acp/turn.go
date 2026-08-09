@@ -88,6 +88,7 @@ const (
 // closed and every send is guarded by done.
 type turnHandle struct {
 	commands chan steerCommand
+	rejects  chan steerCommand
 	done     <-chan struct{}
 }
 
@@ -105,22 +106,18 @@ func (h *turnHandle) send(ctx context.Context, command steerCommand) bool {
 		return false
 	default:
 	}
+	// A canceled caller has no steering attempt to observe. Check before the
+	// mailbox send so an already-canceled context cannot enqueue work that may
+	// later reach the ACP dispatcher.
 	if ctx.Err() != nil {
-		select {
-		case <-h.done:
-			return false
-		case h.commands <- command:
-		default:
-			return false
-		}
-	} else {
-		select {
-		case h.commands <- command:
-		case <-h.done:
-			return false
-		case <-ctx.Done():
-			return false
-		}
+		return false
+	}
+	select {
+	case h.commands <- command:
+	case <-h.done:
+		return false
+	case <-ctx.Done():
+		return false
 	}
 	// Once the command entered the mailbox, caller cancellation only stops
 	// waiting for its reply. The arbiter must either acknowledge ownership or
@@ -139,11 +136,27 @@ func (h *turnHandle) send(ctx context.Context, command steerCommand) bool {
 	}
 }
 
+// rejectSteer routes a proven pre-admission caller rejection into the arbiter
+// as a local observation. It never enters the ordinary command mailbox and
+// therefore cannot reach ACP transport.
+func (h *turnHandle) rejectSteer(result driver.SteerResult, err error) {
+	if h == nil || h.rejects == nil {
+		return
+	}
+	command := steerCommand{localResult: &steerReply{result: result, err: err}}
+	select {
+	case h.rejects <- command:
+	case <-h.done:
+	}
+}
+
 type steerCommand struct {
-	ctx      context.Context
-	request  driver.SteerRequest
-	reply    chan steerReply
-	accepted chan struct{}
+	ctx         context.Context
+	request     driver.SteerRequest
+	reply       chan steerReply
+	accepted    chan struct{}
+	attempt     *steerAttempt
+	localResult *steerReply
 }
 
 type steerReply struct {
@@ -269,7 +282,11 @@ func (d *Driver) Spawn(ctx context.Context, turn driver.Turn) (driver.Stream, er
 	handleDone := make(chan struct{})
 	// The mailbox is never closed. Each accepted command is acknowledged by
 	// the arbiter, while done retires buffered stale sends at terminal close.
-	handle := &turnHandle{commands: make(chan steerCommand, 512), done: handleDone}
+	handle := &turnHandle{
+		commands: make(chan steerCommand, 512),
+		rejects:  make(chan steerCommand, 64),
+		done:     handleDone,
+	}
 	s := &stream{
 		projection: projectionOwner,
 		handle:     handle,
@@ -341,6 +358,7 @@ func (d *Driver) runTurn(
 		barrier:    barrier,
 		dispatcher: dispatcher,
 		commands:   streamState.handle.commands,
+		rejects:    streamState.handle.rejects,
 		state:      &translationState{},
 		pending:    make([]arbObservation, 0, 32),
 		steers:     make(map[uint64]steerCommand),
@@ -472,6 +490,7 @@ type turnArbiter struct {
 	projection *projection
 	handle     *turnHandle
 	commands   <-chan steerCommand
+	rejects    <-chan steerCommand
 	updates    <-chan client.Update
 	promptDone <-chan promptOutcome
 
@@ -510,6 +529,7 @@ func (a *turnArbiter) run() {
 			return
 		}
 		a.drainQueuedCommands()
+		a.drainRejectedSteers()
 		if a.prompt != nil && !a.terminalAsked {
 			a.beginTerminal()
 		}
@@ -529,7 +549,7 @@ func (a *turnArbiter) run() {
 		if a.tryEmit() {
 			continue
 		}
-		if a.prompt != nil && a.terminalAsked && a.terminalReady && a.updatesDrained && len(a.steers) == 0 && len(a.pending) == 0 && !a.barrierBusy {
+		if a.prompt != nil && a.terminalAsked && a.terminalReady && a.updatesDrained && len(a.steers) == 0 && len(a.pending) == 0 && len(a.rejects) == 0 && !a.barrierBusy {
 			a.emitPromptTerminal(*a.prompt)
 			return
 		}
@@ -557,6 +577,14 @@ func (a *turnArbiter) run() {
 			}
 			a.acknowledgeCommand(command)
 			a.acceptSteer(command)
+		case command, ok := <-a.rejects:
+			if !ok {
+				a.rejects = nil
+				continue
+			}
+			if command.localResult != nil {
+				a.queueLocalSteer(command, command.localResult.result, command.localResult.err)
+			}
 		case outcome := <-a.promptDone:
 			a.promptDone = nil
 			a.prompt = &outcome
@@ -608,6 +636,19 @@ func (a *turnArbiter) drainQueuedCommands() {
 	}
 }
 
+func (a *turnArbiter) drainRejectedSteers() {
+	for a.rejects != nil {
+		select {
+		case command := <-a.rejects:
+			if command.localResult != nil {
+				a.queueLocalSteer(command, command.localResult.result, command.localResult.err)
+			}
+		default:
+			return
+		}
+	}
+}
+
 func (a *turnArbiter) acknowledgeCommand(command steerCommand) {
 	if command.accepted != nil {
 		close(command.accepted)
@@ -634,16 +675,27 @@ func (a *turnArbiter) acceptSteer(command steerCommand) {
 	if command.reply == nil {
 		return
 	}
+	if command.attempt == nil {
+		command.attempt = &steerAttempt{}
+	}
+	if command.ctx != nil && command.ctx.Err() != nil {
+		command.attempt.markAdmission(false)
+		a.queueLocalSteer(command, driver.SteerResult{Outcome: driver.SteerOutcomeFallbackRequired}, command.ctx.Err())
+		return
+	}
 	if err := command.request.Validate(); err != nil {
+		command.attempt.markAdmission(false)
 		a.queueLocalSteer(command, driver.SteerResult{Outcome: driver.SteerOutcomeUnsupported}, err)
 		return
 	}
 	if !a.driver.steeringEnabled() {
+		command.attempt.markAdmission(false)
 		a.queueLocalSteer(command, driver.SteerResult{Outcome: driver.SteerOutcomeUnsupported}, nil)
 		return
 	}
 	prompt, err := steerPromptBlocks(command.request)
 	if err != nil {
+		command.attempt.markAdmission(false)
 		a.queueLocalSteer(command, driver.SteerResult{Outcome: driver.SteerOutcomeUnsupported}, err)
 		return
 	}
@@ -655,9 +707,10 @@ func (a *turnArbiter) acceptSteer(command steerCommand) {
 		Prompt:    prompt,
 		Meta:      jsonRaw(steeringIdleMeta),
 	}
-	if !a.dispatcher.submit(steerJob{id: id, ctx: command.ctx, params: params}) {
+	if !a.dispatcher.submit(steerJob{id: id, ctx: command.ctx, params: params, attempt: command.attempt}) {
 		delete(a.steers, id)
-		a.queueLocalSteer(command, driver.SteerResult{Outcome: driver.SteerOutcomeDeliveryUnknown, WriteAdmitted: true}, errors.New("acp: steering dispatcher unavailable"))
+		command.attempt.markAdmission(false)
+		a.queueLocalSteer(command, driver.SteerResult{Outcome: driver.SteerOutcomeFallbackRequired}, errors.New("acp: steering dispatcher unavailable"))
 	}
 }
 
@@ -686,12 +739,20 @@ func (a *turnArbiter) acceptDispatcherEvent(event dispatcherEvent) {
 	if event.late {
 		delete(a.steers, event.id)
 		a.disableSteering()
-		result := driver.SteerResult{
-			Outcome:       driver.SteerOutcomeDeliveryUnknown,
-			WriteAdmitted: event.writeAdmitted || event.result.WriteAdmitted,
+		admitted := event.writeAdmitted || event.result.WriteAdmitted
+		outcome := driver.SteerOutcomeFallbackRequired
+		if !event.admissionKnown && event.admissionPossible {
+			// A started ACP attempt has not published admission yet. Preserve
+			// the conservative unknown classification, but only when the
+			// attempt state proves delivery was possible.
+			admitted = true
+			outcome = driver.SteerOutcomeDeliveryUnknown
+		} else if event.admissionKnown && admitted {
+			outcome = driver.SteerOutcomeDeliveryUnknown
 		}
-		if !result.WriteAdmitted {
-			result.WriteAdmitted = true
+		result := driver.SteerResult{
+			Outcome:       outcome,
+			WriteAdmitted: admitted,
 		}
 		err := event.err
 		if err == nil {
@@ -710,7 +771,14 @@ func (a *turnArbiter) acceptDispatcherEvent(event dispatcherEvent) {
 	if a.terminalAsked && len(a.steers) == 0 {
 		a.maybeRequestPromptBarrier()
 	}
-	normalized, err := normalizeSteering(event.result, event.err)
+	eventResult := event.result
+	if !event.admissionKnown && event.admissionPossible && !eventResult.WriteAdmitted {
+		// The result/error arrived before the separate Admission signal. The
+		// active attempt makes delivery possible, so do not misclassify an
+		// admitted transport failure as a safe fallback.
+		eventResult.WriteAdmitted = true
+	}
+	normalized, err := normalizeSteering(eventResult, event.err)
 	if normalized.Outcome == driver.SteerOutcomeDeliveryUnknown || normalized.Outcome == driver.SteerOutcomeDeliveredUntrackable || steeringErrorGuaranteesNoDelivery(event.err) {
 		a.disableSteering()
 	}

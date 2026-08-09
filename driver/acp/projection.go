@@ -7,6 +7,12 @@ import (
 	"github.com/looprig/foreignloops/driver"
 )
 
+// projectionBufferDepth is both the selected public channel depth and the
+// maximum number of commands the owner may retain after that channel fills.
+// Once output and pending storage are full, producers block at commands
+// rather than allowing an unbounded pending slice to grow.
+const projectionBufferDepth = 4096
+
 // projection is the sole owner of a stream's public channels. Producers never
 // send to, or close, Events/Observations directly. The command mailbox is
 // intentionally never closed: a stale turn handle can attempt a send after
@@ -17,6 +23,10 @@ type projection struct {
 	commands     chan projectionCommand
 	done         chan struct{}
 	abort        chan struct{}
+	stop         chan struct{}
+	commandMu    sync.Mutex
+	commandSpace chan struct{}
+	closed       bool
 
 	selectOnce sync.Once
 	stopOnce   sync.Once
@@ -33,11 +43,13 @@ type projectionCommand struct {
 
 func newProjection() *projection {
 	p := &projection{
-		events:       make(chan driver.Event, 4096),
-		observations: make(chan driver.Observation, 4096),
+		events:       make(chan driver.Event, projectionBufferDepth),
+		observations: make(chan driver.Observation, projectionBufferDepth),
 		commands:     make(chan projectionCommand, 128),
 		done:         make(chan struct{}),
 		abort:        make(chan struct{}),
+		stop:         make(chan struct{}),
+		commandSpace: make(chan struct{}),
 	}
 	go p.run()
 	return p
@@ -78,15 +90,12 @@ func (p *projection) selectView(view streamView) {
 	}
 	p.selectOnce.Do(func() {
 		ack := make(chan struct{})
-		select {
-		case p.commands <- projectionCommand{selectView: view, ack: ack}:
+		if p.enqueue(projectionCommand{selectView: view, ack: ack}) {
 			select {
 			case <-ack:
 			case <-p.done:
 			case <-p.abort:
 			}
-		case <-p.done:
-		case <-p.abort:
 		}
 	})
 }
@@ -96,7 +105,7 @@ func (p *projection) emitEvent(event driver.Event) {
 		return
 	}
 	copyEvent := event
-	p.send(projectionCommand{event: &copyEvent})
+	p.enqueue(projectionCommand{event: &copyEvent})
 }
 
 func (p *projection) emitObservation(observation driver.Observation) <-chan struct{} {
@@ -105,22 +114,14 @@ func (p *projection) emitObservation(observation driver.Observation) <-chan stru
 		close(ack)
 		return ack
 	}
-	select {
-	case p.commands <- projectionCommand{observation: observation, ack: ack}:
-	case <-p.done:
-		close(ack)
-	case <-p.abort:
+	if !p.enqueue(projectionCommand{observation: observation, ack: ack}) {
 		close(ack)
 	}
 	return ack
 }
 
 func (p *projection) send(command projectionCommand) {
-	select {
-	case p.commands <- command:
-	case <-p.done:
-	case <-p.abort:
-	}
+	p.enqueue(command)
 }
 
 func (p *projection) close() {
@@ -128,12 +129,67 @@ func (p *projection) close() {
 		return
 	}
 	p.stopOnce.Do(func() {
-		select {
-		case p.commands <- projectionCommand{stop: true}:
-		case <-p.done:
-		}
+		// Mark the producer side closed first, then ask the owner to drain
+		// already-admitted commands. If the selected consumer is stalled, the
+		// owner detects a full output/pending bound and exits without waiting
+		// forever; abortOwner remains the hard cancellation path.
+		p.markClosed()
+		close(p.stop)
 	})
 	<-p.done
+}
+
+// enqueue admits one producer command while the projection is live. A full
+// mailbox waits on a generation channel that the owner advances after each
+// receive; Close/abort closes that generation and marks the projection closed
+// under the same mutex, so no producer can enqueue after teardown begins.
+func (p *projection) enqueue(command projectionCommand) bool {
+	if p == nil {
+		return false
+	}
+	for {
+		var space <-chan struct{}
+		p.commandMu.Lock()
+		if p.closed {
+			p.commandMu.Unlock()
+			return false
+		}
+		select {
+		case p.commands <- command:
+			p.commandMu.Unlock()
+			return true
+		default:
+			space = p.commandSpace
+			p.commandMu.Unlock()
+		}
+		select {
+		case <-space:
+		case <-p.done:
+			return false
+		case <-p.abort:
+			return false
+		}
+	}
+}
+
+func (p *projection) commandConsumed() {
+	p.commandMu.Lock()
+	if p.closed {
+		p.commandMu.Unlock()
+		return
+	}
+	close(p.commandSpace)
+	p.commandSpace = make(chan struct{})
+	p.commandMu.Unlock()
+}
+
+func (p *projection) markClosed() {
+	p.commandMu.Lock()
+	if !p.closed {
+		p.closed = true
+		close(p.commandSpace)
+	}
+	p.commandMu.Unlock()
 }
 
 func (p *projection) run() {
@@ -141,8 +197,19 @@ func (p *projection) run() {
 	closedEvents := false
 	closedObservations := false
 	stopping := false
+	var stopCh <-chan struct{} = p.stop
 	pending := make([]projectionCommand, 0, 32)
 	defer func() {
+		p.markClosed()
+		for {
+			select {
+			case command := <-p.commands:
+				closeProjectionAck(command.ack)
+			default:
+				goto drained
+			}
+		}
+	drained:
 		for _, command := range pending {
 			closeProjectionAck(command.ack)
 		}
@@ -159,6 +226,7 @@ func (p *projection) run() {
 	for {
 		var eventOut chan driver.Event
 		var observationOut chan driver.Observation
+		var commands <-chan projectionCommand
 		var eventValue driver.Event
 		var observationValue driver.Observation
 		if len(pending) > 0 && selected != viewUnselected {
@@ -188,12 +256,16 @@ func (p *projection) run() {
 					return
 				}
 			}
-		} else if stopping {
+		} else if stopping && len(p.commands) == 0 {
 			return
+		}
+		if len(pending) < projectionBufferDepth {
+			commands = p.commands
 		}
 
 		select {
-		case command := <-p.commands:
+		case command := <-commands:
+			p.commandConsumed()
 			if command.stop {
 				stopping = true
 				continue
@@ -213,6 +285,9 @@ func (p *projection) run() {
 			if command.event != nil || command.observation != nil {
 				pending = append(pending, command)
 			}
+		case <-stopCh:
+			stopping = true
+			stopCh = nil
 		case eventOut <- eventValue:
 			closeProjectionAck(pending[0].ack)
 			pending = pending[1:]
@@ -229,6 +304,7 @@ func (p *projection) abortOwner() {
 	if p == nil {
 		return
 	}
+	p.markClosed()
 	p.abortOnce.Do(func() { close(p.abort) })
 }
 
