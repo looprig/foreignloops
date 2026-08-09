@@ -27,6 +27,13 @@ func New(loopCtx context.Context, sessionID, loopID uuid.UUID, parent loop.Prove
 	pub foreign.EventPublisher, loopCfg loop.BoundDefinition, backendCfg Config,
 	idGen func() (uuid.UUID, error), fac *event.Factory,
 ) (*Loop, string, error) {
+	return newWithServices(loopCtx, sessionID, loopID, parent, pub, loopCfg, backendCfg, idGen, fac, foreign.Services{})
+}
+
+func newWithServices(loopCtx context.Context, sessionID, loopID uuid.UUID, parent loop.Provenance,
+	pub foreign.EventPublisher, loopCfg loop.BoundDefinition, backendCfg Config,
+	idGen func() (uuid.UUID, error), fac *event.Factory, services foreign.Services,
+) (*Loop, string, error) {
 	if err := validateConfig(backendCfg); err != nil {
 		return nil, "", err
 	}
@@ -55,6 +62,7 @@ func New(loopCtx context.Context, sessionID, loopID uuid.UUID, parent loop.Prove
 		pub:        pub,
 		cfg:        loopCfg,
 		backendCfg: backendCfg,
+		services:   cloneServices(services),
 		idGen:      idGen,
 		fac:        fac,
 	}

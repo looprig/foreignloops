@@ -25,11 +25,25 @@ type session interface {
 	SetMode(context.Context, protocol.SessionModeID) error
 }
 
+type steerSession interface {
+	session
+	Steer(context.Context, client.SteerParams) (client.SteerResult, error)
+}
+
+type asyncSteerSession interface {
+	session
+	StartSteer(context.Context, client.SteerParams) *client.SteerHandle
+}
+
 // acpClient is the minimum client capability needed to create a driver
 // session. LoadSession is deliberately optional: a caller cannot resume
 // against a client that does not provide that capability.
 type acpClient interface {
 	NewSession(context.Context, client.NewSessionParams) (session, error)
+}
+
+type initializeMetadataProvider interface {
+	InitializeMetadata() (client.InitializeMetadata, error)
 }
 
 type sessionLoader interface {
@@ -107,6 +121,11 @@ type Driver struct {
 	driverCancel context.CancelFunc
 	turnMu       sync.Mutex
 	closed       bool
+	steeringMu   sync.Mutex
+	steeringOn   bool
+	steeringOff  bool
+	activeMu     sync.Mutex
+	active       *turnHandle
 
 	closeOnce sync.Once
 	closeErr  error
@@ -117,6 +136,7 @@ type Driver struct {
 // returning. Any failure after dialing closes the owned launch result before
 // returning.
 func New(ctx context.Context, cfg Config) (*Driver, error) {
+	cfg.McpServers = cloneMcpServers(cfg.McpServers)
 	if err := cfg.validate(); err != nil {
 		return nil, err
 	}
@@ -174,6 +194,15 @@ func New(ctx context.Context, cfg Config) (*Driver, error) {
 	if acpClient == nil {
 		return nil, closeAfterConstructionFailure(owned, errors.New("acp: dial returned a nil ACP client"))
 	}
+	metadata := client.InitializeMetadata{}
+	if provider, ok := acpClient.(initializeMetadataProvider); ok {
+		// Metadata is optional for legacy test and client seams. A failed
+		// snapshot is fail-closed to steering, but does not make ordinary ACP
+		// sessions unusable.
+		if snapshot, snapshotErr := provider.InitializeMetadata(); snapshotErr == nil {
+			metadata = snapshot
+		}
+	}
 
 	sess, err := createSession(driverCtx, acpClient, cfg)
 	if err != nil {
@@ -189,6 +218,7 @@ func New(ctx context.Context, cfg Config) (*Driver, error) {
 		agentSessionID: string(sess.ID()),
 		driverCtx:      driverCtx,
 		driverCancel:   driverCancel,
+		steeringOn:     steeringCapability(cfg.Harness, metadata),
 	}
 
 	// A loaded Claude session owns its existing configuration. ACP may populate
@@ -276,7 +306,10 @@ func nativeEffort(effort string) string {
 
 func createSession(ctx context.Context, c acpClient, cfg Config) (session, error) {
 	if cfg.AgentSessionID == "" {
-		sess, err := c.NewSession(ctx, client.NewSessionParams{Cwd: cfg.WorkspaceRoot})
+		sess, err := c.NewSession(ctx, client.NewSessionParams{
+			Cwd:        cfg.WorkspaceRoot,
+			McpServers: cloneMcpServers(cfg.McpServers),
+		})
 		if err != nil {
 			return nil, fmt.Errorf("acp: session/new: %w", err)
 		}
@@ -288,8 +321,9 @@ func createSession(ctx context.Context, c acpClient, cfg Config) (session, error
 		return nil, errors.New("acp: session/load capability unavailable")
 	}
 	sess, err := loader.LoadSession(ctx, client.LoadSessionParams{
-		SessionID: protocol.SessionID(cfg.AgentSessionID),
-		Cwd:       cfg.WorkspaceRoot,
+		SessionID:  protocol.SessionID(cfg.AgentSessionID),
+		Cwd:        cfg.WorkspaceRoot,
+		McpServers: cloneMcpServers(cfg.McpServers),
 	})
 	if err != nil {
 		return nil, fmt.Errorf("acp: session/load: %w", err)
@@ -340,6 +374,100 @@ func (d *Driver) AgentSessionID() string {
 		return ""
 	}
 	return d.agentSessionID
+}
+
+// Steer queues one active-turn injection through the turn arbiter. The arbiter
+// owns provider translation and the dispatcher owns the single in-flight ACP
+// request; this method only waits for the one result paired with its
+// observation.
+func (d *Driver) Steer(ctx context.Context, request driver.SteerRequest) (driver.SteerResult, error) {
+	if d == nil {
+		return driver.SteerResult{Outcome: driver.SteerOutcomeUnsupported}, errors.New("acp: driver unavailable")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	h := d.activeHandle()
+	if h == nil {
+		return driver.SteerResult{Outcome: driver.SteerOutcomeUnsupported}, nil
+	}
+	var reservation *steerObservationReservation
+	if h.lane != nil {
+		var status steerReservationStatus
+		reservation, status = h.reserveSteer()
+		if status == steerReservationCapacityExhausted {
+			return driver.SteerResult{Outcome: driver.SteerOutcomeFallbackRequired}, &driver.SteerAdmissionError{}
+		}
+		if status == steerReservationClosed {
+			if err := ctx.Err(); err != nil {
+				return driver.SteerResult{Outcome: driver.SteerOutcomeFallbackRequired}, err
+			}
+			return driver.SteerResult{Outcome: driver.SteerOutcomeUnsupported}, nil
+		}
+	}
+	reply := make(chan steerReply, 1)
+	attempt := &steerAttempt{}
+	preCanceled := ctx.Err() != nil
+	if preCanceled {
+		attempt.cancelAndSnapshot()
+	}
+	sendResult := h.sendResult(ctx, steerCommand{ctx: ctx, request: request, reply: reply, attempt: attempt, reservation: reservation})
+	if sendResult != steerSendAccepted && sendResult != steerSendPending {
+		reservation.release()
+		if err := ctx.Err(); err != nil {
+			attempt.cancelAndSnapshot()
+			return driver.SteerResult{Outcome: driver.SteerOutcomeFallbackRequired}, err
+		}
+		return driver.SteerResult{Outcome: driver.SteerOutcomeUnsupported}, nil
+	}
+	if preCanceled {
+		// A caller that was already canceled before mailbox admission has
+		// explicitly sealed the attempt as not admitted. The arbiter still owns
+		// the command and publishes its one fallback observation, but this caller
+		// may safely return the cancellation result immediately.
+		return driver.SteerResult{Outcome: driver.SteerOutcomeFallbackRequired}, ctx.Err()
+	}
+	select {
+	case result := <-reply:
+		return result.result, result.err
+	case <-ctx.Done():
+		// The arbiter still owns the attempt and may later emit its observation.
+		// Return a bounded caller result without allowing this caller to consume
+		// or cancel the arbiter's reply.
+		return callerTimeoutSteerResult(attempt, sendResult), ctx.Err()
+	}
+}
+
+func callerTimeoutSteerResult(attempt *steerAttempt, mailbox ...steerSendResult) driver.SteerResult {
+	sendState := steerSendRejected
+	if len(mailbox) > 0 {
+		sendState = mailbox[0]
+	}
+	switch attempt.cancelAndSnapshot() {
+	case steerAdmissionAdmitted:
+		return driver.SteerResult{Outcome: driver.SteerOutcomeDeliveryUnknown, WriteAdmitted: true}
+	case steerAdmissionPendingWriter:
+		return driver.SteerResult{Outcome: driver.SteerOutcomeAdmissionUnknown}
+	case steerAdmissionPending, steerAdmissionNotAdmitted:
+		if sendState == steerSendAccepted || sendState == steerSendPending {
+			// The command crossed the turn mailbox. Even if the arbiter has not
+			// reached it yet, a retry-safe fallback would duplicate a possible
+			// later provider call.
+			return driver.SteerResult{Outcome: driver.SteerOutcomeAdmissionUnknown}
+		}
+		return driver.SteerResult{Outcome: driver.SteerOutcomeFallbackRequired}
+	default:
+		return driver.SteerResult{Outcome: driver.SteerOutcomeAdmissionUnknown}
+	}
+}
+
+func (d *Driver) activeHandle() *turnHandle {
+	if d == nil {
+		return nil
+	}
+	d.activeMu.Lock()
+	defer d.activeMu.Unlock()
+	return d.active
 }
 
 // Close cancels active turns, releases the owned ACP connection/process exactly
@@ -407,6 +535,10 @@ func dialNativeLaunch(ctx context.Context, cfg launch.NativeConfig) (dialedClien
 
 type realClient struct {
 	client *client.Client
+}
+
+func (c *realClient) InitializeMetadata() (client.InitializeMetadata, error) {
+	return c.client.InitializeMetadata()
 }
 
 func (c *realClient) NewSession(ctx context.Context, p client.NewSessionParams) (session, error) {

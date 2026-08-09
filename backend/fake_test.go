@@ -51,9 +51,10 @@ func aiMessage(text string) *content.AIMessage {
 }
 
 type fakePublisher struct {
-	mu         sync.Mutex
-	events     []event.Event
-	checkedErr error
+	mu            sync.Mutex
+	events        []event.Event
+	checkedEvents []event.Event
+	checkedErr    error
 }
 
 func (p *fakePublisher) PublishEvent(_ context.Context, ev event.Event) error {
@@ -66,6 +67,9 @@ func (p *fakePublisher) PublishEvent(_ context.Context, ev event.Event) error {
 func (p *fakePublisher) PublishEventChecked(ctx context.Context, ev event.Event) error {
 	p.mu.Lock()
 	err := p.checkedErr
+	if err == nil {
+		p.checkedEvents = append(p.checkedEvents, ev)
+	}
 	p.mu.Unlock()
 	if err != nil {
 		return err
@@ -83,6 +87,12 @@ func (p *fakePublisher) count() int {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return len(p.events)
+}
+
+func (p *fakePublisher) checkedSnapshot() []event.Event {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return append([]event.Event(nil), p.checkedEvents...)
 }
 
 type fakeStream struct {

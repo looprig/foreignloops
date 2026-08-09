@@ -4,6 +4,7 @@ import (
 	"path/filepath"
 
 	"github.com/looprig/acp/launch"
+	"github.com/looprig/acp/protocol"
 	"github.com/looprig/foreignloops/driver"
 	"github.com/looprig/harness/pkg/loop"
 )
@@ -47,6 +48,10 @@ type Config struct {
 	AgentSessionID string
 	// WorkspaceRoot is the absolute session working directory.
 	WorkspaceRoot string
+	// McpServers is the complete MCP server list supplied to ACP session/new
+	// and session/load. New snapshots this value before retaining it so nested
+	// caller-owned slices and metadata cannot be mutated after construction.
+	McpServers []protocol.McpServer
 }
 
 // ConfigError reports invalid caller-supplied ACP configuration.

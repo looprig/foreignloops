@@ -27,6 +27,9 @@ func fillForeignHeader(input event.Event, sessionID, loopID, turnID, stepID uuid
 	case event.InputCancelled:
 		typed.Header.SessionID, typed.Header.LoopID, typed.Header.TurnID = sessionID, loopID, turnID
 		return typed
+	case event.TurnFoldedInto:
+		typed.Header.SessionID, typed.Header.LoopID, typed.Header.TurnID = sessionID, loopID, turnID
+		return typed
 	case event.TurnDone:
 		typed.Header.SessionID, typed.Header.LoopID, typed.Header.TurnID = sessionID, loopID, turnID
 		return typed
@@ -67,6 +70,9 @@ func withForeignHeader(input event.Event, header event.Header) event.Event {
 	case event.InputCancelled:
 		typed.Header = header
 		return typed
+	case event.TurnFoldedInto:
+		typed.Header = header
+		return typed
 	case event.StepDone:
 		typed.Header = header
 		return typed
@@ -86,26 +92,34 @@ func withForeignHeader(input event.Event, header event.Header) event.Event {
 
 func (l *Loop) publisher(ctx context.Context, turnID, stepID uuid.UUID) func(event.Event) {
 	return func(input event.Event) {
-		input = fillForeignHeader(input, l.sessionID, l.loopID, turnID, stepID)
-		if input.Class() == event.Enduring {
-			header, err := l.fac.Stamp(input.EventHeader())
-			if err != nil {
-				slog.Error("foreignloop: event id mint failed; dropping Enduring event (fail-secure)", "event", fmt.Sprintf("%T", input), "error", err)
-				return
-			}
-			input = withForeignHeader(input, header)
-		}
-		if err := l.pub.PublishEvent(ctx, input); err != nil {
-			slog.Error("foreignloop: event publish to session fan-in failed", "error", err)
+		if err := l.publishActor(ctx, turnID, stepID, input); err != nil {
+			slog.Error("foreignloop: event publish to session fan-in failed", "event", fmt.Sprintf("%T", input), "error", err)
 		}
 	}
 }
 
-func (l *Loop) publishAcceptance(ctx context.Context, commandID uuid.UUID) error {
-	input := fillForeignHeader(event.DelegateRequestAccepted{Header: event.Header{Cause: identity.Cause{CommandID: commandID}}}, l.sessionID, l.loopID, uuid.UUID{}, uuid.UUID{})
-	header, err := l.fac.Stamp(input.EventHeader())
-	if err != nil {
-		return err
+// publishActor is the only backend path that stamps and publishes an event.
+// Enduring events use the checked publisher so the actor never advances local
+// lifecycle state beyond a transition that the session accepted durably.
+func (l *Loop) publishActor(ctx context.Context, turnID, stepID uuid.UUID, input event.Event) error {
+	input = fillForeignHeader(input, l.sessionID, l.loopID, turnID, stepID)
+	// TurnFoldedInto is an authoritative handback transition. Keep the
+	// explicit type check alongside the semantic class check so a Harness
+	// event-class refactor cannot silently downgrade the fold to an unchecked
+	// publication: steering resolution must observe the durable fold before it
+	// records injected delivery.
+	_, fold := input.(event.TurnFoldedInto)
+	if input.Class() == event.Enduring || fold {
+		header, err := l.fac.Stamp(input.EventHeader())
+		if err != nil {
+			return err
+		}
+		input = withForeignHeader(input, header)
+		return l.pub.PublishEventChecked(ctx, input)
 	}
-	return l.pub.PublishEventChecked(ctx, withForeignHeader(input, header))
+	return l.pub.PublishEvent(ctx, input)
+}
+
+func (l *Loop) publishAcceptance(ctx context.Context, commandID uuid.UUID) error {
+	return l.publishActor(ctx, uuid.UUID{}, uuid.UUID{}, event.DelegateRequestAccepted{Header: event.Header{Cause: identity.Cause{CommandID: commandID}}})
 }

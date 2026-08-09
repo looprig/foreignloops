@@ -18,6 +18,19 @@ type Agent interface {
 	Spawn(context.Context, Turn) (Stream, error)
 }
 
+// Steerer is an optional capability for agents that can inject a message into
+// an active turn while retaining a host-owned fallback path. Agent
+// implementations that do not support steering remain valid: callers must
+// discover this interface with a type assertion and queue a normal turn when
+// it is absent.
+//
+// The context is runtime-owned. In particular, any bounded acknowledgement
+// deadline belongs in that context (or the enclosing runtime policy), never in
+// SteerRequest, so model-facing request values cannot control it.
+type Steerer interface {
+	Steer(context.Context, SteerRequest) (SteerResult, error)
+}
+
 // Closer is optionally implemented by agents that own long-lived resources
 // spanning turns. The backend invokes Close exactly once after the command
 // pump exits, whether it exits from command.Shutdown or loop-context

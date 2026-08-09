@@ -26,6 +26,7 @@ type Loop struct {
 	pub        foreign.EventPublisher
 	cfg        loop.BoundDefinition
 	backendCfg Config
+	services   foreign.Services
 	idGen      func() (uuid.UUID, error)
 	fac        *event.Factory
 	closeOnce  sync.Once
@@ -38,6 +39,20 @@ type Loop struct {
 }
 
 func newRestoredState(
+	loopCtx context.Context,
+	sessionID, loopID uuid.UUID,
+	parent loop.Provenance,
+	pub foreign.EventPublisher,
+	loopCfg loop.BoundDefinition,
+	backendCfg Config,
+	idGen func() (uuid.UUID, error),
+	fac *event.Factory,
+	seed foreign.RestoredForeign,
+) (*Loop, error) {
+	return newRestoredStateWithServices(loopCtx, sessionID, loopID, parent, pub, loopCfg, backendCfg, idGen, fac, seed, foreign.Services{})
+}
+
+func newRestoredStateWithServices(
 	_ context.Context,
 	sessionID, loopID uuid.UUID,
 	parent loop.Provenance,
@@ -47,6 +62,7 @@ func newRestoredState(
 	idGen func() (uuid.UUID, error),
 	fac *event.Factory,
 	seed foreign.RestoredForeign,
+	services foreign.Services,
 ) (*Loop, error) {
 	if err := validateConfig(backendCfg); err != nil {
 		return nil, err
@@ -70,6 +86,7 @@ func newRestoredState(
 		backendCfg: backendCfg,
 		idGen:      idGen,
 		fac:        fac,
+		services:   cloneServices(services),
 		msgs:       cloneMessages(seed.Msgs),
 		turnIndex:  seed.TurnIndex,
 		hasSpawned: true,
@@ -77,9 +94,11 @@ func newRestoredState(
 	}, nil
 }
 
-// BuildRestoredWith constructs and starts an actor from Harness-folded state. It
-// preserves true-nil-on-error behavior at the Harness-owned seam.
+// BuildRestoredWith constructs and starts an actor from Harness-folded state
+// through the legacy seam. It withholds all scoped capabilities by invoking
+// the additive builder with zero Services.
 func BuildRestoredWith(backendCfg Config) foreign.RestoredBuilder {
+	build := BuildRestoredWithServices(backendCfg)
 	return func(
 		loopCtx context.Context,
 		sessionID, loopID uuid.UUID,
@@ -90,7 +109,26 @@ func BuildRestoredWith(backendCfg Config) foreign.RestoredBuilder {
 		fac *event.Factory,
 		seed foreign.RestoredForeign,
 	) (loop.Backend, error) {
-		state, err := newRestoredState(loopCtx, sessionID, loopID, parent, pub, loopCfg, backendCfg, idGen, fac, seed)
+		return build(loopCtx, sessionID, loopID, parent, pub, loopCfg, idGen, fac, seed, foreign.Services{})
+	}
+}
+
+// BuildRestoredWithServices constructs and starts an actor from Harness-folded
+// state through the additive services-aware seam. The supplied services are
+// copied into the restored actor before it starts.
+func BuildRestoredWithServices(backendCfg Config) foreign.ServicesRestoredBuilder {
+	return func(
+		loopCtx context.Context,
+		sessionID, loopID uuid.UUID,
+		parent loop.Provenance,
+		pub foreign.EventPublisher,
+		loopCfg loop.BoundDefinition,
+		idGen func() (uuid.UUID, error),
+		fac *event.Factory,
+		seed foreign.RestoredForeign,
+		services foreign.Services,
+	) (loop.Backend, error) {
+		state, err := newRestoredStateWithServices(loopCtx, sessionID, loopID, parent, pub, loopCfg, backendCfg, idGen, fac, seed, services)
 		if err != nil {
 			return nil, err
 		}
