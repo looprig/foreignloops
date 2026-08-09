@@ -190,6 +190,9 @@ func (a *initAgent) Spawn(ctx context.Context, turn driver.Turn) (driver.Stream,
 	if !first {
 		return stream, nil
 	}
+	if a.agent.steeringOn {
+		return newOrderedInitStream(stream, a.sessionID), nil
+	}
 	return newInitStream(stream, a.sessionID), nil
 }
 
@@ -207,6 +210,74 @@ type initStream struct {
 
 	closeOnce sync.Once
 	closeErr  error
+}
+
+// orderedInitStream preserves the legacy Events projection for the backend
+// while exposing the authoritative ordered observation view without probing
+// Events on the wrapped stream.
+type orderedInitStream struct {
+	inner        driver.Stream
+	events       <-chan driver.Event
+	observations <-chan driver.Observation
+	done         <-chan struct{}
+	cancel       context.CancelFunc
+	closeOnce    sync.Once
+	closeErr     error
+}
+
+func newOrderedInitStream(inner driver.Stream, sessionID string) driver.Stream {
+	ordered := inner.(driver.OrderedStream)
+	ctx, cancel := context.WithCancel(context.Background())
+	events := make(chan driver.Event, 2048)
+	observations := make(chan driver.Observation, 2048)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		defer close(events)
+		defer close(observations)
+		init := driver.UpdateObservation{Event: driver.Event{Kind: driver.KindInit, SessionID: sessionID}}
+		select {
+		case observations <- init:
+		case <-ctx.Done():
+			return
+		}
+		select {
+		case events <- init.Event:
+		case <-ctx.Done():
+			return
+		}
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case observation, ok := <-ordered.Observations():
+				if !ok {
+					return
+				}
+				select {
+				case observations <- observation:
+				case <-ctx.Done():
+					return
+				}
+				if update, ok := observation.(driver.UpdateObservation); ok {
+					select {
+					case events <- update.Event:
+					case <-ctx.Done():
+						return
+					}
+				}
+			}
+		}
+	}()
+	return &orderedInitStream{inner: inner, events: events, observations: observations, done: done, cancel: cancel}
+}
+
+func (s *orderedInitStream) Events() <-chan driver.Event             { return s.events }
+func (s *orderedInitStream) Observations() <-chan driver.Observation { return s.observations }
+func (s *orderedInitStream) History() (driver.History, error)        { return s.inner.History() }
+func (s *orderedInitStream) Close() error {
+	s.closeOnce.Do(func() { s.cancel(); s.closeErr = s.inner.Close(); <-s.done })
+	return s.closeErr
 }
 
 func newInitStream(inner driver.Stream, sessionID string) driver.Stream {
