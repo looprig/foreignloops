@@ -281,6 +281,11 @@ func (d *Driver) runTurn(
 			}
 		}
 	pendingSteersDrained:
+		d.activeMu.Lock()
+		if d.active == streamState {
+			d.active = nil
+		}
+		d.activeMu.Unlock()
 		close(done)
 		streamState.mu.Lock()
 		if !streamState.closedEvents {
@@ -292,11 +297,6 @@ func (d *Driver) runTurn(
 			streamState.closedObservations = true
 		}
 		streamState.mu.Unlock()
-		d.activeMu.Lock()
-		if d.active == streamState {
-			d.active = nil
-		}
-		d.activeMu.Unlock()
 		d.turnMu.Unlock()
 	}()
 
@@ -389,7 +389,7 @@ func (d *Driver) runTurn(
 						<-timer.C
 						for _, call := range pendingCalls {
 							if streamState.finalizeSteer(call) {
-								emitObservation(streamState, driver.SteerObservation{SteerResult: driver.SteerResult{Outcome: driver.SteerOutcomeDeliveryUnknown}, Err: errors.New("acp: steer response unavailable")})
+								emitObservation(streamState, driver.SteerObservation{SteerResult: driver.SteerResult{Outcome: driver.SteerOutcomeFallbackRequired, WriteAdmitted: false}, Err: errors.New("acp: steer response unavailable")})
 								close(call.admitted)
 							}
 						}
@@ -894,7 +894,7 @@ func emitObservation(streamState *stream, observation driver.Observation) {
 	if rawSequence > streamState.nextOrder {
 		streamState.nextOrder = rawSequence
 	}
-	if rawSequence == 0 {
+	if rawSequence == 0 || (rawSequence != 0 && rawSequence < streamState.nextOrder) {
 		streamState.nextOrder++
 		switch typed := observation.(type) {
 		case driver.PromptObservation:

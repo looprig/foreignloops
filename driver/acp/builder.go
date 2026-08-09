@@ -5,6 +5,7 @@ import (
 	"errors"
 	"sync"
 
+	"github.com/looprig/acp/protocol"
 	"github.com/looprig/core/uuid"
 	"github.com/looprig/foreignloops/backend"
 	"github.com/looprig/foreignloops/driver"
@@ -216,18 +217,20 @@ type initStream struct {
 // while exposing the authoritative ordered observation view without probing
 // Events on the wrapped stream.
 type orderedInitStream struct {
-	inner            driver.Stream
-	events           chan driver.Event
-	observations     chan driver.Observation
-	done             chan struct{}
-	cancel           context.CancelFunc
-	startOnce        sync.Once
-	viewOnce         sync.Once
-	viewObservations bool
-	closeOnce        sync.Once
-	closeErr         error
-	ctx              context.Context
-	sessionID        string
+	inner              driver.Stream
+	events             chan driver.Event
+	observations       chan driver.Observation
+	done               chan struct{}
+	cancel             context.CancelFunc
+	startOnce          sync.Once
+	mu                 sync.Mutex
+	selected           bool
+	closedEvents       bool
+	closedObservations bool
+	closeOnce          sync.Once
+	closeErr           error
+	ctx                context.Context
+	sessionID          string
 }
 
 func newOrderedInitStream(inner driver.Stream, sessionID string) driver.Stream {
@@ -237,22 +240,43 @@ func newOrderedInitStream(inner driver.Stream, sessionID string) driver.Stream {
 }
 
 func (s *orderedInitStream) Events() <-chan driver.Event {
-	s.viewOnce.Do(func() { close(s.observations) })
 	s.start(false)
 	return s.events
 }
 func (s *orderedInitStream) Observations() <-chan driver.Observation {
-	s.viewOnce.Do(func() { s.viewObservations = true; close(s.events) })
 	s.start(true)
 	return s.observations
 }
 func (s *orderedInitStream) start(observations bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.selected {
+		return
+	}
+	s.selected = true
+	if observations {
+		close(s.events)
+		s.closedEvents = true
+	} else {
+		close(s.observations)
+		s.closedObservations = true
+	}
 	s.startOnce.Do(func() { go s.forward(observations) })
 }
 func (s *orderedInitStream) forward(observations bool) {
 	defer close(s.done)
-	defer close(s.events)
-	defer close(s.observations)
+	defer func() {
+		s.mu.Lock()
+		if !s.closedEvents {
+			close(s.events)
+			s.closedEvents = true
+		}
+		if !s.closedObservations {
+			close(s.observations)
+			s.closedObservations = true
+		}
+		s.mu.Unlock()
+	}()
 	ordered := s.inner.(driver.OrderedStream)
 	if observations {
 		select {
@@ -283,8 +307,16 @@ func (s *orderedInitStream) forward(observations bool) {
 				return
 			}
 		} else if prompt, ok := observation.(driver.PromptObservation); ok {
+			event := driver.Event{Kind: driver.KindTerminalOK}
+			if prompt.Err != nil {
+				event.Kind = driver.KindTerminalError
+				event.ErrText = "acp prompt failed"
+			}
+			if prompt.StopReason == string(protocol.StopReasonRefusal) || prompt.StopReason == string(protocol.StopReasonMaxTokens) || prompt.StopReason == string(protocol.StopReasonMaxTurnRequests) {
+				event.Kind = driver.KindTerminalError
+			}
 			select {
-			case s.events <- driver.Event{Kind: driver.KindTerminalOK, ErrText: prompt.StopReason}:
+			case s.events <- event:
 			case <-s.ctx.Done():
 				return
 			}
@@ -293,7 +325,7 @@ func (s *orderedInitStream) forward(observations bool) {
 }
 func (s *orderedInitStream) History() (driver.History, error) { return s.inner.History() }
 func (s *orderedInitStream) Close() error {
-	s.closeOnce.Do(func() { s.cancel(); s.closeErr = s.inner.Close(); <-s.done })
+	s.closeOnce.Do(func() { s.start(false); s.cancel(); s.closeErr = s.inner.Close(); <-s.done })
 	return s.closeErr
 }
 

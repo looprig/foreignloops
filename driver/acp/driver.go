@@ -394,7 +394,7 @@ func (d *Driver) Steer(ctx context.Context, request driver.SteerRequest) (driver
 	if active.completeSteer(call) {
 		d.admitSteer(ctx, active, driver.SteerObservation{SteerResult: normalized, Err: normalizedErr})
 	} else if active.terminalSteer() {
-		normalized = driver.SteerResult{Outcome: driver.SteerOutcomeDeliveryUnknown}
+		normalized = driver.SteerResult{Outcome: driver.SteerOutcomeFallbackRequired, WriteAdmitted: false}
 		normalizedErr = errors.New("acp: steer completed after terminal resolution")
 		d.steeringMu.Lock()
 		d.steeringOff = true
