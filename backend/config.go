@@ -5,6 +5,7 @@ import (
 	"reflect"
 
 	"github.com/looprig/foreignloops/driver"
+	"github.com/looprig/harness/pkg/foreign"
 )
 
 // SIDMode selects whether the foreign session ID is known when the loop is
@@ -54,4 +55,11 @@ func nilLike(value any) bool {
 	default:
 		return false
 	}
+}
+
+// cloneServices snapshots the opaque capabilities at the actor boundary. The
+// delivery hook remains a narrow interface value; the broker descriptor bytes
+// are copied by foreign.Services.Clone.
+func cloneServices(services foreign.Services) foreign.Services {
+	return services.Clone()
 }

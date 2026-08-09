@@ -38,7 +38,7 @@ func TestBackendAndDriverPublicTopLevelSymbols(t *testing.T) {
 			name: "backend",
 			dir:  filepath.Join(root, "backend"),
 			want: []string{
-				"BuildRestoredWith", "BuildWith", "Config", "ConfigError", "ForeignProtocolError",
+				"BuildRestoredWith", "BuildRestoredWithServices", "BuildWith", "BuildWithServices", "Config", "ConfigError", "ForeignProtocolError",
 				"ForeignResultError", "ForeignSessionBusyError", "LockError", "Loop", "New",
 				"SIDLateBound", "SIDMode", "SIDPrebound", "SnapshotContextDone", "SnapshotError",
 				"SnapshotErrorReason", "SnapshotLoopExited",

@@ -13,11 +13,11 @@ import (
 	"github.com/looprig/harness/pkg/loop"
 )
 
-// BuildWith adapts an ACP configuration to the Harness foreign-loop builder.
-// Each invocation creates one ACP driver and one backend Loop. The returned
-// identity is the agent-assigned ACP session id, which the backend binds on
-// the first live turn through a synthetic KindInit event.
+// BuildWith adapts an ACP configuration to the legacy Harness foreign-loop
+// builder. It withholds all scoped capabilities by invoking the additive
+// builder with zero Services.
 func BuildWith(cfg Config) foreign.Builder {
+	build := BuildWithServices(cfg)
 	return func(
 		loopCtx context.Context,
 		sessionID, loopID uuid.UUID,
@@ -27,28 +27,38 @@ func BuildWith(cfg Config) foreign.Builder {
 		idGen func() (uuid.UUID, error),
 		fac *event.Factory,
 	) (loop.Backend, string, error) {
+		return build(loopCtx, sessionID, loopID, parent, pub, loopCfg, idGen, fac, foreign.Services{})
+	}
+}
+
+// BuildWithServices adapts an ACP configuration to the additive Harness
+// services-aware builder. Each invocation creates one ACP driver and one
+// backend Loop. The returned identity is the agent-assigned ACP session id,
+// which the backend binds on the first live turn through a synthetic KindInit
+// event.
+func BuildWithServices(cfg Config) foreign.ServicesBuilder {
+	return func(
+		loopCtx context.Context,
+		sessionID, loopID uuid.UUID,
+		parent loop.Provenance,
+		pub foreign.EventPublisher,
+		loopCfg loop.BoundDefinition,
+		idGen func() (uuid.UUID, error),
+		fac *event.Factory,
+		services foreign.Services,
+	) (loop.Backend, string, error) {
 		d, err := New(loopCtx, cfg)
 		if err != nil {
 			return nil, "", err
 		}
 
 		agent := &initAgent{agent: d, sessionID: d.AgentSessionID()}
-		state, _, err := backend.New(
-			loopCtx,
-			sessionID,
-			loopID,
-			parent,
-			pub,
-			loopCfg,
-			backend.Config{
-				Agent:   agent,
-				Cwd:     cfg.WorkspaceRoot,
-				Posture: legacyPosture(cfg.Posture),
-				SIDMode: backend.SIDLateBound,
-			},
-			idGen,
-			fac,
-		)
+		state, _, err := backend.BuildWithServices(backend.Config{
+			Agent:   agent,
+			Cwd:     cfg.WorkspaceRoot,
+			Posture: legacyPosture(cfg.Posture),
+			SIDMode: backend.SIDLateBound,
+		})(loopCtx, sessionID, loopID, parent, pub, loopCfg, idGen, fac, services)
 		if err != nil {
 			return nil, "", closeAfterBackendFailure(d, err)
 		}
@@ -56,11 +66,11 @@ func BuildWith(cfg Config) foreign.Builder {
 	}
 }
 
-// BuildRestoredWith adapts ACP resume construction to the Harness restored
-// builder. The journal's AgentSessionID is authoritative for ACP session/load;
-// ForeignSID remains the backend's recovered routing identity. An empty
-// AgentSessionID preserves legacy session/new behavior.
+// BuildRestoredWith adapts ACP resume construction to the legacy Harness
+// restored builder. It withholds all scoped capabilities by invoking the
+// additive builder with zero Services.
 func BuildRestoredWith(cfg Config) foreign.RestoredBuilder {
+	build := BuildRestoredWithServices(cfg)
 	return func(
 		loopCtx context.Context,
 		sessionID, loopID uuid.UUID,
@@ -70,6 +80,26 @@ func BuildRestoredWith(cfg Config) foreign.RestoredBuilder {
 		idGen func() (uuid.UUID, error),
 		fac *event.Factory,
 		seed foreign.RestoredForeign,
+	) (loop.Backend, error) {
+		return build(loopCtx, sessionID, loopID, parent, pub, loopCfg, idGen, fac, seed, foreign.Services{})
+	}
+}
+
+// BuildRestoredWithServices adapts ACP resume construction to the additive
+// Harness restored builder. The journal's AgentSessionID is authoritative for
+// ACP session/load; ForeignSID remains the backend's recovered routing
+// identity. An empty AgentSessionID preserves legacy session/new behavior.
+func BuildRestoredWithServices(cfg Config) foreign.ServicesRestoredBuilder {
+	return func(
+		loopCtx context.Context,
+		sessionID, loopID uuid.UUID,
+		parent loop.Provenance,
+		pub foreign.EventPublisher,
+		loopCfg loop.BoundDefinition,
+		idGen func() (uuid.UUID, error),
+		fac *event.Factory,
+		seed foreign.RestoredForeign,
+		services foreign.Services,
 	) (loop.Backend, error) {
 		if err := validateRestoredSeed(seed); err != nil {
 			return nil, err
@@ -81,7 +111,7 @@ func BuildRestoredWith(cfg Config) foreign.RestoredBuilder {
 			return nil, err
 		}
 
-		state, err := backend.BuildRestoredWith(backend.Config{
+		state, err := backend.BuildRestoredWithServices(backend.Config{
 			Agent:   d,
 			Cwd:     resumeCfg.WorkspaceRoot,
 			Posture: legacyPosture(resumeCfg.Posture),
@@ -96,6 +126,7 @@ func BuildRestoredWith(cfg Config) foreign.RestoredBuilder {
 			idGen,
 			fac,
 			seed,
+			services,
 		)
 		if err != nil {
 			return nil, closeAfterBackendFailure(d, err)
@@ -221,9 +252,11 @@ func (s *initStream) Close() error {
 }
 
 var (
-	_ foreign.Builder         = BuildWith(Config{})
-	_ foreign.RestoredBuilder = BuildRestoredWith(Config{})
-	_ driver.Agent            = (*initAgent)(nil)
-	_ driver.Closer           = (*initAgent)(nil)
-	_ driver.Stream           = (*initStream)(nil)
+	_ foreign.Builder                 = BuildWith(Config{})
+	_ foreign.ServicesBuilder         = BuildWithServices(Config{})
+	_ foreign.RestoredBuilder         = BuildRestoredWith(Config{})
+	_ foreign.ServicesRestoredBuilder = BuildRestoredWithServices(Config{})
+	_ driver.Agent                    = (*initAgent)(nil)
+	_ driver.Closer                   = (*initAgent)(nil)
+	_ driver.Stream                   = (*initStream)(nil)
 )

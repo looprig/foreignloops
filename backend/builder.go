@@ -9,9 +9,11 @@ import (
 	"github.com/looprig/harness/pkg/loop"
 )
 
-// BuildWith adapts actor construction to the narrow Harness-owned seam. On
-// construction failure it returns a true nil loop.Backend interface.
+// BuildWith adapts actor construction to the legacy Harness-owned seam. It
+// withholds all scoped capabilities by invoking the additive builder with
+// zero Services.
 func BuildWith(backendCfg Config) foreign.Builder {
+	build := BuildWithServices(backendCfg)
 	return func(
 		loopCtx context.Context,
 		sessionID, loopID uuid.UUID,
@@ -21,7 +23,24 @@ func BuildWith(backendCfg Config) foreign.Builder {
 		idGen func() (uuid.UUID, error),
 		fac *event.Factory,
 	) (loop.Backend, string, error) {
-		state, sid, err := New(loopCtx, sessionID, loopID, parent, pub, loopCfg, backendCfg, idGen, fac)
+		return build(loopCtx, sessionID, loopID, parent, pub, loopCfg, idGen, fac, foreign.Services{})
+	}
+}
+
+// BuildWithServices adapts actor construction to the additive Harness seam.
+// The supplied services are copied into the actor before it starts.
+func BuildWithServices(backendCfg Config) foreign.ServicesBuilder {
+	return func(
+		loopCtx context.Context,
+		sessionID, loopID uuid.UUID,
+		parent loop.Provenance,
+		pub foreign.EventPublisher,
+		loopCfg loop.BoundDefinition,
+		idGen func() (uuid.UUID, error),
+		fac *event.Factory,
+		services foreign.Services,
+	) (loop.Backend, string, error) {
+		state, sid, err := newWithServices(loopCtx, sessionID, loopID, parent, pub, loopCfg, backendCfg, idGen, fac, services)
 		if err != nil {
 			return nil, "", err
 		}
