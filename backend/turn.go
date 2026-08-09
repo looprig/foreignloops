@@ -180,7 +180,7 @@ func (l *Loop) awaitTurn(loopCtx context.Context, cur event.TurnIndex, activeCom
 		case <-loopCtx.Done():
 			cancel()
 			if result != nil {
-				_, _ = l.receiveTurnOutcome(loopCtx, cur, turnID, stepID, mailbox, result, false)
+				_, _ = l.receiveTurnOutcome(loopCtx, cur, turnID, stepID, mailbox, result, machine, false)
 			}
 			return true
 		}
@@ -252,16 +252,13 @@ func (l *Loop) handleTurnCommand(loopCtx context.Context, input command.Command,
 			return false, false
 		}
 		select {
-		case outcome := <-result:
-			var terminalHold *turnObservation
-			if err := l.drainTurnObservations(loopCtx, cur, turnID, stepID, mailbox, machine, &terminalHold); err != nil {
-				slog.Error("foreignloop: ordered observation publication failed", "error", err)
+		case completed := <-result:
+			ready := make(chan turnOutcome, 1)
+			ready <- completed
+			outcome, err := l.receiveTurnOutcome(loopCtx, cur, turnID, stepID, mailbox, ready, machine, true)
+			if err != nil {
+				slog.Error("foreignloop: ordered cancellation adjudication failed", "error", err)
 				return true, true
-			}
-			if terminalHold != nil {
-				if err := l.publishTurnObservation(loopCtx, cur, turnID, stepID, *terminalHold); err != nil {
-					return true, true
-				}
 			}
 			if err := l.applyOutcome(loopCtx, cur, turnID, stepID, outcome); err != nil {
 				slog.Error("foreignloop: turn lifecycle publication failed", "error", err)
@@ -275,7 +272,7 @@ func (l *Loop) handleTurnCommand(loopCtx context.Context, input command.Command,
 		default:
 		}
 		cancel()
-		outcome, err := l.receiveTurnOutcome(loopCtx, cur, turnID, stepID, mailbox, result, true)
+		outcome, err := l.receiveTurnOutcome(loopCtx, cur, turnID, stepID, mailbox, result, machine, true)
 		if err != nil {
 			return true, true
 		}
@@ -286,7 +283,7 @@ func (l *Loop) handleTurnCommand(loopCtx context.Context, input command.Command,
 		return true, false
 	case command.Interrupt:
 		cancel()
-		outcome, err := l.receiveTurnOutcome(loopCtx, cur, turnID, stepID, mailbox, result, true)
+		outcome, err := l.receiveTurnOutcome(loopCtx, cur, turnID, stepID, mailbox, result, machine, true)
 		if err != nil {
 			return true, true
 		}
@@ -298,7 +295,7 @@ func (l *Loop) handleTurnCommand(loopCtx context.Context, input command.Command,
 		return true, false
 	case command.Shutdown:
 		cancel()
-		_, _ = l.receiveTurnOutcome(loopCtx, cur, turnID, stepID, mailbox, result, false)
+		_, _ = l.receiveTurnOutcome(loopCtx, cur, turnID, stepID, mailbox, result, machine, false)
 		l.cancelPending(pub, event.CancelTurnInterrupted)
 		l.closeAgent()
 		typed.Ack <- nil
@@ -518,6 +515,9 @@ func (l *Loop) drainOrderedStream(inputs <-chan driver.Observation, cur event.Tu
 		case driver.PromptObservation:
 			output.terminal = true
 			output.termErr = orderedPromptError(typed)
+			if typed.Message != nil {
+				output.assistant = append(output.assistant, typed.Message)
+			}
 			if !sink(turnObservation{raw: observation}) {
 				output.stopped = true
 				return output
@@ -641,6 +641,17 @@ func (l *Loop) publishTurnObservation(ctx context.Context, _ event.TurnIndex, tu
 func (l *Loop) processTurnObservation(ctx context.Context, cur event.TurnIndex, turnID, stepID uuid.UUID,
 	observation turnObservation, machine *steeringMachine, terminalHold **turnObservation,
 ) error {
+	return l.processTurnOutcomeObservation(ctx, cur, turnID, stepID, observation, machine, terminalHold, true)
+}
+
+// processTurnOutcomeObservation is the actor-owned path used while a turn is
+// being canceled or interrupted. It keeps consuming raw ordered facts so the
+// steering machine can adjudicate the reserved request before the lifecycle
+// outcome is applied. publish=false is used for shutdown: facts still resolve
+// delivery, while no late turn events are emitted.
+func (l *Loop) processTurnOutcomeObservation(ctx context.Context, cur event.TurnIndex, turnID, stepID uuid.UUID,
+	observation turnObservation, machine *steeringMachine, terminalHold **turnObservation, publish bool,
+) error {
 	if machine != nil && observation.raw != nil {
 		if err := machine.observe(observation.raw); err != nil {
 			return err
@@ -656,9 +667,14 @@ func (l *Loop) processTurnObservation(ctx context.Context, cur event.TurnIndex, 
 		}
 		if hold {
 			copyOf := observation
-			*terminalHold = &copyOf
+			if terminalHold != nil {
+				*terminalHold = &copyOf
+			}
 			return nil
 		}
+	}
+	if !publish {
+		return nil
 	}
 	return l.publishTurnObservation(ctx, cur, turnID, stepID, observation)
 }
@@ -678,18 +694,54 @@ func (l *Loop) drainTurnObservations(ctx context.Context, cur event.TurnIndex, t
 }
 
 func (l *Loop) receiveTurnOutcome(ctx context.Context, cur event.TurnIndex, turnID, stepID uuid.UUID,
-	mailbox <-chan turnObservation, result <-chan turnOutcome, publish bool,
+	mailbox <-chan turnObservation, result <-chan turnOutcome, machine *steeringMachine, publish bool,
 ) (turnOutcome, error) {
-	outcome := <-result
-	for observation := range mailbox {
-		if !publish {
-			continue
-		}
-		if err := l.publishTurnObservation(ctx, cur, turnID, stepID, observation); err != nil {
-			return outcome, err
+	if machine != nil {
+		if _, err := machine.beforeTerminal(); err != nil {
+			return turnOutcome{}, err
 		}
 	}
-	return outcome, nil
+	var (
+		outcome      turnOutcome
+		haveOutcome  bool
+		terminalHold *turnObservation
+	)
+	for {
+		if haveOutcome && mailbox == nil && (machine == nil || machine.terminalReady()) {
+			if terminalHold != nil && publish {
+				if err := l.publishTurnObservation(ctx, cur, turnID, stepID, *terminalHold); err != nil {
+					return outcome, err
+				}
+			}
+			return outcome, nil
+		}
+		select {
+		case value, ok := <-result:
+			if !ok {
+				result = nil
+				continue
+			}
+			outcome = value
+			haveOutcome = true
+			result = nil
+		case observation, ok := <-mailbox:
+			if !ok {
+				mailbox = nil
+				continue
+			}
+			if err := l.processTurnOutcomeObservation(ctx, cur, turnID, stepID, observation, machine, &terminalHold, publish); err != nil {
+				return outcome, err
+			}
+		case completion := <-machine.completionsChan():
+			if err := machine.complete(completion); err != nil {
+				return outcome, err
+			}
+		case <-machine.timerChan():
+			if err := machine.timeout(); err != nil {
+				return outcome, err
+			}
+		}
+	}
 }
 
 // commitTurn asks for provider-neutral authoritative history only after the

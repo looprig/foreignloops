@@ -63,12 +63,16 @@ type steeringCompletion struct {
 // a lifecycle event itself. The actor calls observe/complete and performs all
 // checked event publication through Loop.publishActor.
 type steeringMachine struct {
-	loop   *Loop
-	ctx    context.Context
-	pub    func(event.Event)
-	cur    event.TurnIndex
-	turnID uuid.UUID
-	stepID uuid.UUID
+	loop *Loop
+	ctx  context.Context
+	// resolveCtx remains usable after the turn operation is canceled. Durable
+	// delivery resolution and checked fold publication must not be lost merely
+	// because the caller interrupted the provider operation.
+	resolveCtx context.Context
+	pub        func(event.Event)
+	cur        event.TurnIndex
+	turnID     uuid.UUID
+	stepID     uuid.UUID
 
 	steerer     driver.Steerer
 	ordered     bool
@@ -97,6 +101,7 @@ func newSteeringMachine(ctx context.Context, l *Loop, pub func(event.Event), cur
 	return &steeringMachine{
 		loop:        l,
 		ctx:         ctx,
+		resolveCtx:  context.WithoutCancel(ctx),
 		pub:         pub,
 		cur:         cur,
 		turnID:      turnID,
@@ -106,6 +111,19 @@ func newSteeringMachine(ctx context.Context, l *Loop, pub func(event.Event), cur
 		hook:        l.services.Delivery,
 		completions: make(chan steeringCompletion, 16),
 	}
+}
+
+func (m *steeringMachine) resolutionContext() context.Context {
+	if m == nil {
+		return context.Background()
+	}
+	if m.resolveCtx != nil {
+		return m.resolveCtx
+	}
+	if m.ctx == nil {
+		return context.Background()
+	}
+	return context.WithoutCancel(m.ctx)
 }
 
 func (m *steeringMachine) completionsChan() <-chan steeringCompletion {
@@ -356,11 +374,11 @@ func (m *steeringMachine) resolveDisposition(attempt *steeringAttempt, dispositi
 				Blocks: attempt.input.command.Blocks,
 			}},
 		}
-		if err := m.loop.publishActor(m.ctx, m.turnID, m.stepID, folded); err != nil {
+		if err := m.loop.publishActor(m.resolutionContext(), m.turnID, m.stepID, folded); err != nil {
 			m.fault = &ForeignPublicationError{Event: "event.TurnFoldedInto", Cause: err}
 			return m.fault
 		}
-		if err := m.hook.Resolve(m.ctx, foreign.DeliveryResolution{
+		if err := m.hook.Resolve(m.resolutionContext(), foreign.DeliveryResolution{
 			LoopID: m.loop.loopID, RequestID: attempt.input.command.CommandID,
 			TurnID: m.turnID, State: foreign.DeliveryResolutionInjected,
 		}); err != nil {
@@ -374,7 +392,7 @@ func (m *steeringMachine) resolveDisposition(attempt *steeringAttempt, dispositi
 			return err
 		}
 	case steeringDispositionUnknown:
-		if err := m.hook.Resolve(m.ctx, foreign.DeliveryResolution{
+		if err := m.hook.Resolve(m.resolutionContext(), foreign.DeliveryResolution{
 			LoopID: m.loop.loopID, RequestID: attempt.input.command.CommandID,
 			State: foreign.DeliveryResolutionUnknown,
 		}); err != nil {
@@ -383,7 +401,7 @@ func (m *steeringMachine) resolveDisposition(attempt *steeringAttempt, dispositi
 		}
 		m.disabled = true
 	case steeringDispositionUntrackable:
-		if err := m.hook.Resolve(m.ctx, foreign.DeliveryResolution{
+		if err := m.hook.Resolve(m.resolutionContext(), foreign.DeliveryResolution{
 			LoopID: m.loop.loopID, RequestID: attempt.input.command.CommandID,
 			State: foreign.DeliveryResolutionUntrackable,
 		}); err != nil {
@@ -421,7 +439,7 @@ func (m *steeringMachine) queueFallback(input preparedInput) error {
 	// requests on that same FIFO path for this active turn. Otherwise a later
 	// steer could be delivered before the earlier fallback turn runs.
 	m.fallbackBarrier = true
-	if err := m.hook.QueueFallback(m.ctx, foreign.DeliveryFallback{
+	if err := m.hook.QueueFallback(m.resolutionContext(), foreign.DeliveryFallback{
 		LoopID: m.loop.loopID, RequestID: input.command.CommandID,
 	}); err != nil {
 		return err

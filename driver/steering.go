@@ -325,7 +325,11 @@ type PromptObservation struct {
 	// StopReason is an adapter-normalized stop classification. It remains a
 	// string at this provider-neutral boundary because concrete ACP stop
 	// vocabularies do not belong in driver contracts.
-	StopReason       string
+	StopReason string
+	// Message is the assembled assistant transcript for this prompt, when the
+	// adapter has one. Keeping it on the prompt observation lets ordered
+	// consumers commit the final answer without a second legacy event path.
+	Message          *content.AIMessage
 	WriteAdmitted    bool
 	ReceiveSequence  uint64
 	ResponseSequence uint64

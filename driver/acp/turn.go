@@ -1043,6 +1043,7 @@ func (a *turnArbiter) promptObservation(outcome promptOutcome) arbObservation {
 	return arbObservation{
 		observation: driver.PromptObservation{
 			StopReason:       string(outcome.result.StopReason),
+			Message:          a.state.message(),
 			WriteAdmitted:    outcome.result.WriteAdmitted,
 			ReceiveSequence:  outcome.result.ReceiveSequence,
 			ResponseSequence: outcome.result.ResponseSequence,
@@ -1211,8 +1212,10 @@ func (a *turnArbiter) emitPromptEvents(observation driver.PromptObservation) {
 		a.projection.emitEvent(promptFailureEvent(observation.Err))
 		return
 	}
-	if message := a.state.message(); message != nil {
-		a.projection.emitEvent(driver.Event{Kind: driver.KindStepComplete, Message: message})
+	if a.stream == nil || !a.stream.ordered {
+		if message := a.state.message(); message != nil {
+			a.projection.emitEvent(driver.Event{Kind: driver.KindStepComplete, Message: message})
+		}
 	}
 	a.projection.emitEvent(terminalEvent(protocol.StopReason(observation.StopReason)))
 }
