@@ -80,9 +80,26 @@ func executeAgentCall(ctx context.Context, controller tool.DelegateController, o
 }
 
 func formatForeground(result tool.DelegateResult) string {
+	if result.DeliveryStatus != "" {
+		responseStatus := wireResponseStatus(result.ResponseStatus)
+		var response *string
+		if result.DeliveryStatus == tool.DelegateDeliveryUnknown || result.DeliveryStatus == tool.DelegateDeliveryUntrackable {
+			responseStatus = ""
+		} else if result.ResponseStatus == tool.DelegateResponseCompleted || (responseStatus != "" && result.Response != "") {
+			response = &result.Response
+		}
+		return marshalForegroundResult(foregroundResult{
+			AgentID:        result.AgentID.String(),
+			Name:           result.Name,
+			State:          result.State,
+			DeliveryStatus: result.DeliveryStatus,
+			ResponseStatus: responseStatus,
+			Response:       response,
+		})
+	}
 	switch result.ResponseStatus {
 	case tool.DelegateResponseCompleted:
-		return marshalForegroundResult(foregroundResult{AgentID: result.AgentID.String(), Name: result.Name, State: result.State, Response: result.Response})
+		return marshalForegroundResult(foregroundResult{AgentID: result.AgentID.String(), Name: result.Name, State: result.State, Response: &result.Response})
 	case tool.DelegateResponseFailed:
 		return "error: agent failed"
 	case tool.DelegateResponseInterrupted:
@@ -106,20 +123,27 @@ func boundAgentOutput(value string) string {
 }
 
 type foregroundResult struct {
-	AgentID  string          `json:"agent_id"`
-	Name     string          `json:"name"`
-	State    tool.AgentState `json:"state"`
-	Response string          `json:"response"`
+	AgentID        string                      `json:"agent_id"`
+	Name           string                      `json:"name"`
+	State          tool.AgentState             `json:"state"`
+	DeliveryStatus tool.DelegateDeliveryStatus `json:"delivery_status,omitempty"`
+	ResponseStatus string                      `json:"response_status,omitempty"`
+	Response       *string                     `json:"response,omitempty"`
 }
 
 type backgroundResult struct {
-	AgentID string          `json:"agent_id"`
-	Name    string          `json:"name"`
-	State   tool.AgentState `json:"state"`
+	AgentID        string                      `json:"agent_id"`
+	Name           string                      `json:"name"`
+	State          tool.AgentState             `json:"state"`
+	DeliveryStatus tool.DelegateDeliveryStatus `json:"delivery_status,omitempty"`
 }
 
 func marshalForegroundResult(result foregroundResult) string {
-	response := boundAgentOutput(result.Response)
+	includeResponse := result.Response != nil
+	response := ""
+	if includeResponse {
+		response = boundAgentOutput(*result.Response)
+	}
 	prefixEnds := make([]int, 1, len(response)+1)
 	for end := 0; end < len(response); {
 		_, size := utf8.DecodeRuneInString(response[end:])
@@ -131,7 +155,10 @@ func marshalForegroundResult(result foregroundResult) string {
 	low, high := 0, len(prefixEnds)
 	for low < high {
 		mid := low + (high-low)/2
-		result.Response = response[:prefixEnds[mid]]
+		if includeResponse {
+			candidate := response[:prefixEnds[mid]]
+			result.Response = &candidate
+		}
 		encoded, err := json.Marshal(result)
 		if err != nil {
 			return "error: agent result unavailable"
@@ -150,7 +177,22 @@ func marshalForegroundResult(result foregroundResult) string {
 }
 
 func formatBackground(result tool.DelegateResult) string {
-	return marshalResult(backgroundResult{AgentID: result.AgentID.String(), Name: result.Name, State: result.State})
+	return marshalResult(backgroundResult{AgentID: result.AgentID.String(), Name: result.Name, State: result.State, DeliveryStatus: result.DeliveryStatus})
+}
+
+func wireResponseStatus(status tool.DelegateResponseStatus) string {
+	switch status {
+	case tool.DelegateResponseCompleted:
+		return "completed"
+	case tool.DelegateResponseFailed:
+		return "failed"
+	case tool.DelegateResponseInterrupted:
+		return "interrupted"
+	case tool.DelegateResponseTimedOut:
+		return "timed_out"
+	default:
+		return ""
+	}
 }
 
 func marshalResult(value any) string {

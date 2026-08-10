@@ -466,10 +466,7 @@ func TestNewNativeCodexReceivesModelAndEffortSeparately(t *testing.T) {
 	}
 	defer func() { _ = d.Close() }()
 
-	native, ok := nativeCfg.Harness.(launch.NativeHarnessAdapter)
-	if !ok {
-		t.Fatalf("native launch Harness = %T, want launch.NativeHarnessAdapter", nativeCfg.Harness)
-	}
+	native := nativeCfg.Harness
 	harness, ok := native.(*launch.CodexConnector)
 	if !ok {
 		t.Fatalf("native launch Harness = %T, want *launch.CodexConnector", native)
@@ -1036,10 +1033,7 @@ func TestNewNativeAuthOmitsProxyAndGatewayOverrides(t *testing.T) {
 
 			switch harnessName {
 			case HarnessClaudeCode:
-				native, ok := nativeCfg.Harness.(launch.NativeHarnessAdapter)
-				if !ok {
-					t.Fatalf("native launch Harness = %T, want launch.NativeHarnessAdapter", nativeCfg.Harness)
-				}
+				native := nativeCfg.Harness
 				harness, ok := native.(*launch.ClaudeConnector)
 				if !ok {
 					t.Fatalf("native launch Harness = %T, want *launch.ClaudeConnector", native)
@@ -1052,10 +1046,7 @@ func TestNewNativeAuthOmitsProxyAndGatewayOverrides(t *testing.T) {
 					t.Fatalf("native Claude effort = %q, want %q", harness.Effort, cfg.Effort)
 				}
 			case HarnessCodex:
-				native, ok := nativeCfg.Harness.(launch.NativeHarnessAdapter)
-				if !ok {
-					t.Fatalf("native launch Harness = %T, want launch.NativeHarnessAdapter", nativeCfg.Harness)
-				}
+				native := nativeCfg.Harness
 				harness, ok := native.(*launch.CodexConnector)
 				if !ok {
 					t.Fatalf("native launch Harness = %T, want *launch.CodexConnector", native)
@@ -1130,10 +1121,7 @@ func TestNewNativeHarnessManagedDoesNotSelectOrInjectModel(t *testing.T) {
 			}
 			switch harnessName {
 			case HarnessClaudeCode:
-				native, ok := nativeCfg.Harness.(launch.NativeHarnessAdapter)
-				if !ok {
-					t.Fatalf("managed native Harness = %T, want launch.NativeHarnessAdapter", nativeCfg.Harness)
-				}
+				native := nativeCfg.Harness
 				harness, ok := native.(*launch.ClaudeConnector)
 				if !ok {
 					t.Fatalf("managed native Harness = %T, want *launch.ClaudeConnector", native)
@@ -1142,10 +1130,7 @@ func TestNewNativeHarnessManagedDoesNotSelectOrInjectModel(t *testing.T) {
 					t.Fatalf("managed native Claude models = %+v, want empty", harness.Models)
 				}
 			case HarnessCodex:
-				native, ok := nativeCfg.Harness.(launch.NativeHarnessAdapter)
-				if !ok {
-					t.Fatalf("managed native Harness = %T, want launch.NativeHarnessAdapter", nativeCfg.Harness)
-				}
+				native := nativeCfg.Harness
 				harness, ok := native.(*launch.CodexConnector)
 				if !ok {
 					t.Fatalf("managed native Harness = %T, want *launch.CodexConnector", native)

@@ -228,6 +228,7 @@ func New(tb testing.TB, script Script) *Agent {
 
 	root := moduleRoot()
 	path := filepath.Join(tb.TempDir(), "steertest-agent")
+	// #nosec G204 -- this test fixture invokes the fixed Go tool to build its own helper into a test-owned temporary path.
 	build := exec.Command("go", "build", "-trimpath", "-o", path, "./internal/steertest/cmd")
 	build.Dir = root
 	if output, err := build.CombinedOutput(); err != nil {
@@ -696,6 +697,7 @@ func RunProcess() error {
 	if endpoint == "" {
 		return errors.New("steertest: control endpoint is required")
 	}
+	// #nosec G704 -- the child connects only to the fixture-owned Unix socket supplied by its parent.
 	control, err := net.Dial("unix", endpoint)
 	if err != nil {
 		return err

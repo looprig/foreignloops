@@ -168,27 +168,6 @@ func (a *steerSendAck) snapshot() steerSendResult {
 	return a.state
 }
 
-func (a *steerSendAck) wait(ctx context.Context) steerSendResult {
-	if a == nil {
-		return steerSendRejected
-	}
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	for {
-		if state := a.snapshot(); state != steerSendPending {
-			return state
-		}
-		select {
-		case <-a.ready:
-			// Read the state after waking. The channel does not itself carry
-			// authority over accepted versus terminal.
-		case <-ctx.Done():
-			return a.snapshot()
-		}
-	}
-}
-
 // sendResult enters the command mailbox and waits for its linearized
 // acknowledgement. Reserved calls use a nonblocking mailbox admission; the
 // reservation lane guarantees that this path cannot be confused with output

@@ -50,6 +50,14 @@ func RestoreTopology(ctx context.Context, topology Topology, sessionID uuid.UUID
 
 func (s *Session) attachRestoredLoop(started event.LoopStarted, parent loop.Provenance, bound loop.BoundDefinition, bindings tool.Bindings, folded foldResult, ri restoredInference, notifications []tool.ProcessCompletionNotification, foreignSID string) error {
 	loopCtx, cancel := context.WithCancel(s.sessionCtx)
+	var constructionHook *foreignDeliveryHook
+	loopCommitted := false
+	defer func() {
+		if !loopCommitted && constructionHook != nil {
+			s.revokeCollabLoop(constructionHook.loopID)
+			s.unregisterForeignDeliveryHook(constructionHook)
+		}
+	}()
 	var backend loop.Backend
 	var err error
 	switch bound.Engine() {
@@ -77,12 +85,31 @@ func (s *Session) attachRestoredLoop(started event.LoopStarted, parent loop.Prov
 			cancel()
 			return &RestoreError{Kind: RestoreForeignSIDMissing}
 		}
-		restoredBuilder, builderErr := s.restoredBuilder(bound)
-		if builderErr != nil {
-			cancel()
-			return builderErr
+		seed := foreign.RestoredForeign{ForeignSID: foreignSID, AgentSessionID: agentSessionID, TurnIndex: folded.TurnIndex, Msgs: folded.Msgs}
+		if s.usesServicesRestoredBuilder(bound) {
+			servicesBuilder, builderErr := s.servicesRestoredBuilder(bound)
+			if builderErr != nil {
+				cancel()
+				return builderErr
+			}
+			if err := s.startCollabBroker(); err != nil {
+				cancel()
+				return &RestoreError{Kind: RestoreLoopFailed, Cause: err}
+			}
+			services, hook := s.foreignServicesForTrackedWithController(started.LoopID, bindings.Delegate)
+			constructionHook = hook
+			backend, err = servicesBuilder(loopCtx, s.sessionID, started.LoopID, parent, s, bound, func() (uuid.UUID, error) { return s.newID() }, s.factory, seed, services)
+			if err == nil && constructionHook != nil {
+				err = constructionHook.brokerError()
+			}
+		} else {
+			restoredBuilder, builderErr := s.restoredBuilder(bound)
+			if builderErr != nil {
+				cancel()
+				return builderErr
+			}
+			backend, err = restoredBuilder(loopCtx, s.sessionID, started.LoopID, parent, s, bound, func() (uuid.UUID, error) { return s.newID() }, s.factory, seed)
 		}
-		backend, err = restoredBuilder(loopCtx, s.sessionID, started.LoopID, parent, s, bound, func() (uuid.UUID, error) { return s.newID() }, s.factory, foreign.RestoredForeign{ForeignSID: foreignSID, AgentSessionID: agentSessionID, TurnIndex: folded.TurnIndex, Msgs: folded.Msgs})
 	}
 	if err != nil {
 		cancel()
@@ -92,6 +119,7 @@ func (s *Session) attachRestoredLoop(started event.LoopStarted, parent loop.Prov
 	s.loopsMu.Lock()
 	s.loops[started.LoopID] = &loopHandle{id: started.LoopID, owner: s, bound: bound, bindings: bindings, backend: backend, parent: parent, cancel: cancel, liveMode: liveMode, liveModel: liveModel, state: tool.DelegateStatusIdle, agentName: started.DisplayName, agentMode: loop.ModeName(started.InitialMode), selectedHarness: restoredSelectedHarness(started.AgentRuntime)}
 	s.loopsMu.Unlock()
+	loopCommitted = true
 	return nil
 }
 
@@ -107,6 +135,26 @@ func (s *Session) restoredBuilder(bound loop.BoundDefinition) (foreign.RestoredB
 		return nil, &RestoreError{Kind: RestoreForeignBuilderMissing}
 	}
 	return s.foreignBuildRestored, nil
+}
+
+func (s *Session) usesServicesRestoredBuilder(bound loop.BoundDefinition) bool {
+	return s.foreignBuildRestoredServices != nil ||
+		(s.foreignRegistry != nil && bound.Engine() == loop.EngineAdapter && bound.RuntimeProfile() != "" &&
+			s.foreignRegistry.HasServicesBuilder(bound.RuntimeProfile()))
+}
+
+func (s *Session) servicesRestoredBuilder(bound loop.BoundDefinition) (foreign.ServicesRestoredBuilder, error) {
+	if s.foreignRegistry != nil && bound.Engine() == loop.EngineAdapter && bound.RuntimeProfile() != "" {
+		_, restored, err := s.foreignRegistry.ServicesBuilder(bound.RuntimeProfile())
+		if err != nil {
+			return nil, &RestoreError{Kind: RestoreForeignBuilderMissing, Cause: err}
+		}
+		return restored, nil
+	}
+	if s.foreignBuildRestoredServices == nil {
+		return nil, &RestoreError{Kind: RestoreForeignBuilderMissing}
+	}
+	return s.foreignBuildRestoredServices, nil
 }
 
 func restoreTopologySession(
@@ -605,6 +653,11 @@ func restoreTopologySession(
 			tombstoned[plan.started.LoopID] = struct{}{}
 		}
 	}
+	deliveryRepairs, err := persistUnresolvedDelegateDeliveryStates(ctx, j, factory, sessionID, allRecords, all, crashClosures)
+	if err != nil {
+		return abortAccepted(s, &RestoreError{Kind: RestoreAppendFailed, Cause: err})
+	}
+	all = append(all, deliveryRepairs...)
 	if err := seedResolvedDelegateRecords(manager, allRecords, all, crashClosures, tombstoned); err != nil {
 		return abortAccepted(s, &RestoreError{Kind: RestoreReplayFailed, Cause: err})
 	}
@@ -1129,6 +1182,14 @@ func buildRestoredSession(
 		gateAppender:        nopGateAppender{},
 		checkpointAdmission: newCheckpointAdmissionGate(),
 	}
+	var constructionHook *foreignDeliveryHook
+	loopCommitted := false
+	defer func() {
+		if !loopCommitted && constructionHook != nil {
+			s.revokeCollabLoop(constructionHook.loopID)
+			s.unregisterForeignDeliveryHook(constructionHook)
+		}
+	}()
 	// Apply the same opts the probe read (WithCommandAppender may replace the durable
 	// journal adapter for a direct/test caller; WithAllowConfigMismatch is a no-op here —
 	// already consumed; WithLimits sets the spawn caps the restored session enforces
@@ -1182,6 +1243,11 @@ func buildRestoredSession(
 			ObserveError: s.observeBestEffortCheckpointError,
 		})
 	}
+	if s.collabBrokerRequired(cfg) {
+		if err := s.startCollabBroker(); err != nil {
+			return abort(&RestoreError{Kind: RestoreLoopFailed, Cause: err})
+		}
+	}
 
 	// Seed the root loop under its ORIGINAL id (identity stable), coming up idle with
 	// the folded committed history + turnIndex. No empty loop is spawned and no
@@ -1220,16 +1286,31 @@ func buildRestoredSession(
 			restoreErr := &RestoreError{Kind: RestoreForeignSIDMissing}
 			return abort(restoreErr)
 		}
-		restoredBuilder, builderErr := s.restoredBuilder(cfg)
-		if builderErr != nil {
-			cancel()
-			return abort(builderErr)
-		}
 		// Legacy journals expose one foreign SID. Phase 6 dedicated journal wiring may
 		// replace the agent-side value with a separately journaled AgentSessionID.
-		l, err = restoredBuilder(loopCtx, sessionID, rootLoopID, loop.Provenance{}, s, cfg,
-			func() (uuid.UUID, error) { return newID() }, factory,
-			foreign.RestoredForeign{ForeignSID: foreignSID, AgentSessionID: agentSessionID, TurnIndex: folded.TurnIndex, Msgs: folded.Msgs})
+		seed := foreign.RestoredForeign{ForeignSID: foreignSID, AgentSessionID: agentSessionID, TurnIndex: folded.TurnIndex, Msgs: folded.Msgs}
+		if s.usesServicesRestoredBuilder(cfg) {
+			servicesBuilder, builderErr := s.servicesRestoredBuilder(cfg)
+			if builderErr != nil {
+				cancel()
+				return abort(builderErr)
+			}
+			services, hook := s.foreignServicesForTrackedWithController(rootLoopID, bindings.Delegate)
+			constructionHook = hook
+			l, err = servicesBuilder(loopCtx, sessionID, rootLoopID, loop.Provenance{}, s, cfg,
+				func() (uuid.UUID, error) { return newID() }, factory, seed, services)
+			if err == nil && constructionHook != nil {
+				err = constructionHook.brokerError()
+			}
+		} else {
+			restoredBuilder, builderErr := s.restoredBuilder(cfg)
+			if builderErr != nil {
+				cancel()
+				return abort(builderErr)
+			}
+			l, err = restoredBuilder(loopCtx, sessionID, rootLoopID, loop.Provenance{}, s, cfg,
+				func() (uuid.UUID, error) { return newID() }, factory, seed)
+		}
 	}
 	if err != nil {
 		cancel()
@@ -1246,6 +1327,7 @@ func buildRestoredSession(
 	// declares a requirement, and would hand the rest a separate observation set.
 	s.loops[rootLoopID] = &loopHandle{id: rootLoopID, owner: s, bound: cfg, bindings: bindings, backend: l, parent: loop.Provenance{}, cancel: cancel, liveMode: liveMode, liveModel: liveModel, state: tool.DelegateStatusIdle, selectedHarness: restoredSelectedHarness(ri.AgentRuntime)}
 	s.activeLoopID = rootLoopID
+	loopCommitted = true
 	return s, nil
 }
 

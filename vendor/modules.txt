@@ -135,7 +135,7 @@ github.com/gorilla/websocket
 # github.com/invopop/jsonschema v0.14.0
 ## explicit; go 1.24
 github.com/invopop/jsonschema
-# github.com/looprig/acp v0.1.1 => ../acp
+# github.com/looprig/acp v0.2.0
 ## explicit; go 1.26.4
 github.com/looprig/acp/client
 github.com/looprig/acp/launch
@@ -146,7 +146,7 @@ github.com/looprig/acp/transport/stdio
 github.com/looprig/core/content
 github.com/looprig/core/content/streamaccumulator
 github.com/looprig/core/uuid
-# github.com/looprig/harness v0.20.0 => ../harness
+# github.com/looprig/harness v0.22.0
 ## explicit; go 1.26.4
 github.com/looprig/harness/internal/delegationtool
 github.com/looprig/harness/internal/hustleruntime
@@ -168,7 +168,7 @@ github.com/looprig/harness/pkg/session
 github.com/looprig/harness/pkg/sessionstore
 github.com/looprig/harness/pkg/tool
 github.com/looprig/harness/pkg/workspacestore
-# github.com/looprig/inference v0.7.0 => ../inference
+# github.com/looprig/inference v0.9.0
 ## explicit; go 1.26.4
 github.com/looprig/inference
 github.com/looprig/inference/codec
@@ -185,7 +185,7 @@ github.com/looprig/inference/stream
 github.com/looprig/inference/usage
 github.com/looprig/inference/wire/jsonbody
 github.com/looprig/inference/wire/sse
-# github.com/looprig/storage v0.3.0 => ../storage
+# github.com/looprig/storage v0.3.1
 ## explicit; go 1.25.8
 github.com/looprig/storage
 # github.com/openai/openai-go/v3 v3.50.0
@@ -726,7 +726,3 @@ honnef.co/go/tools/stylecheck/st1021
 honnef.co/go/tools/stylecheck/st1022
 honnef.co/go/tools/stylecheck/st1023
 honnef.co/go/tools/unused
-# github.com/looprig/acp => ../acp
-# github.com/looprig/harness => ../harness
-# github.com/looprig/inference => ../inference
-# github.com/looprig/storage => ../storage
