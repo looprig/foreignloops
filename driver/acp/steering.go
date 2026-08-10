@@ -24,7 +24,7 @@ const (
 // steering support and a host-owned idle fallback. The exact Claude 0.65.0
 // profile is the sole compatibility exception for older advertisements.
 // Current Codex ACP is deliberately excluded because its idle race starts an
-// adapter-owned turn that CodeRig cannot correlate.
+// adapter-owned turn that Carbon cannot correlate.
 func steeringCapability(harness Harness, metadata client.InitializeMetadata) bool {
 	if harness != HarnessClaudeCode && harness != HarnessCodex {
 		return false
