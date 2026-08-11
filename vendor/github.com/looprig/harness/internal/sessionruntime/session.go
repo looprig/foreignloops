@@ -151,8 +151,9 @@ type Session struct {
 	// consumer-owned concept — the SAME kind of value as
 	// permissionReviewEvidenceContainment/permissionReviewEvidenceAllowedKinds
 	// above — that Harness has no way to originate itself (this module has no
-	// first-class "effective access posture" concept; CodeRig binds its own
-	// AccessProfile name here). Staying empty for a session that never opts
+	// first-class "effective access posture" concept; the product composition
+	// root binds its own AccessProfile name here). Staying empty for a session that
+	// never opts
 	// in makes loopReviewContext return nil (defense in depth; the LOUD
 	// failure is rig.Define()-time validation pairing this with
 	// WithPermissionClassifiers, mirroring WithPermissionReviewEvidence's
@@ -2626,8 +2627,13 @@ func (s *Session) activateProcessServiceBridge() error {
 	if err != nil {
 		return err
 	}
+	workflowPublisher, err := newCheckedWorkflowActivityPublisher(s.sessionID, s.hub, s.now)
+	if err != nil {
+		return err
+	}
 	s.resources.processServiceBridge.attachProcessLifecyclePublisher(publisher)
 	s.resources.processServiceBridge.attachProcessCompletionNotifier(s)
+	s.resources.processServiceBridge.attachWorkflowActivityPublisher(workflowPublisher)
 	return nil
 }
 
