@@ -625,7 +625,7 @@ func TestNewNativeCodexSelectionUsesAdapterFacingModelID(t *testing.T) {
 	cfg.Credential = loop.CredentialNativeAuth
 	cfg.Binding = launch.ProxyBinding{}
 	cfg.AgentSessionID = ""
-	cfg.ModelAlias = adapterModelID // CodeRig has already resolved friendlyAlias.
+	cfg.ModelAlias = adapterModelID // Carbon has already resolved friendlyAlias.
 	cfg.Effort = "none"
 	sess := newFakeSession("native-codex-adapter-model-id")
 	conn := &fakeClient{newSession: sess}
