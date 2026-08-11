@@ -1,0 +1,142 @@
+{
+  "schemaVersion": 1,
+  "repository": "foreignloops",
+  "proofSources": [
+    {
+      "id": "example-foreignloops-scripted-driver-fixture",
+      "type": "executable-fixture",
+      "path": "examples/scripted-driver/scripted_driver_test.go",
+      "symbol": "Example"
+    },
+    {
+      "id": "example-foreignloops-codex-spawn-source",
+      "type": "source",
+      "path": "driver/codex/codex.go",
+      "symbol": "(*agent).Spawn"
+    },
+    {
+      "id": "example-foreignloops-backend-lifecycle-fixture",
+      "type": "executable-fixture",
+      "path": "examples/backend-lifecycle/backend_lifecycle_test.go",
+      "symbol": "TestExampleBackendLifecycleAndRestore"
+    },
+    {
+      "id": "example-foreignloops-backend-new-source",
+      "type": "source",
+      "path": "backend/loop.go",
+      "symbol": "New"
+    },
+    {
+      "id": "example-foreignloops-backend-snapshot-source",
+      "type": "source",
+      "path": "backend/snapshot.go",
+      "symbol": "(*Loop).Snapshot"
+    },
+    {
+      "id": "example-foreignloops-backend-restore-source",
+      "type": "source",
+      "path": "backend/restored.go",
+      "symbol": "BuildRestoredWith"
+    },
+    {
+      "id": "example-foreignloops-typed-failures-source",
+      "type": "source",
+      "path": "backend/errors.go",
+      "symbol": "ConfigError"
+    },
+    {
+      "id": "example-foreignloops-acp-backend-fixture",
+      "type": "executable-fixture",
+      "path": "examples/acp-backend/acp_backend_test.go",
+      "symbol": "TestExampleACPBackendLifecycle"
+    },
+    {
+      "id": "example-foreignloops-acp-builder-source",
+      "type": "source",
+      "path": "driver/acp/builder.go",
+      "symbol": "BuildWith"
+    },
+    {
+      "id": "example-foreignloops-acp-client-source",
+      "type": "source",
+      "path": "driver/acp/driver.go",
+      "symbol": "New"
+    },
+    {
+      "id": "example-foreignloops-artifacts-contract-test",
+      "type": "test",
+      "path": "examples/contract_test.go",
+      "symbol": "TestDocsExamplesArtifacts"
+    }
+  ],
+  "examples": [
+    {
+      "id": "example-foreignloops-scripted-driver",
+      "ecosystem": "go",
+      "owner": "foreignloops",
+      "sourcePath": "examples/scripted-driver/scripted_driver_test.go",
+      "availability": "source-workspace",
+      "versions": {
+        "github.com/looprig/foreignloops": "source-workspace"
+      },
+      "offlineCommand": "GOWORK=off go test -race ./...",
+      "assertion": "A deterministic child process proves exact Codex JSONL framing, provider-neutral session and assistant events, unavailable authoritative history, idempotent cleanup, and errors.As classification of a non-zero process exit.",
+      "workflowPath": ".github/workflows/docs-examples.yml",
+      "jobId": "docs-examples",
+      "cleanup": "The example drains and closes both streams and removes the temporary executable directory after the supervised child processes exit.",
+      "liveGate": null,
+      "proofIds": [
+        "example-foreignloops-scripted-driver-fixture",
+        "example-foreignloops-codex-spawn-source",
+        "example-foreignloops-artifacts-contract-test"
+      ]
+    },
+    {
+      "id": "example-foreignloops-backend-lifecycle-restore",
+      "ecosystem": "go",
+      "owner": "foreignloops",
+      "sourcePath": "examples/backend-lifecycle/backend_lifecycle_test.go",
+      "availability": "source-workspace",
+      "versions": {
+        "github.com/looprig/foreignloops": "source-workspace"
+      },
+      "offlineCommand": "GOWORK=off go test -race ./...",
+      "assertion": "An in-process driver proves backend construction, durable input acceptance, event publication, consistent snapshots, checkpoint restoration, provider-session resume semantics, shutdown, and typed configuration failures.",
+      "workflowPath": ".github/workflows/docs-examples.yml",
+      "jobId": "docs-examples",
+      "cleanup": "Both backend actors receive acknowledged Shutdown commands; t.TempDir removes the workspace and its foreign-session lock files.",
+      "liveGate": null,
+      "proofIds": [
+        "example-foreignloops-backend-lifecycle-fixture",
+        "example-foreignloops-backend-new-source",
+        "example-foreignloops-backend-snapshot-source",
+        "example-foreignloops-backend-restore-source",
+        "example-foreignloops-typed-failures-source",
+        "example-foreignloops-artifacts-contract-test"
+      ]
+    },
+    {
+      "id": "example-foreignloops-acp-backend-lifecycle",
+      "ecosystem": "go",
+      "owner": "foreignloops",
+      "sourcePath": "examples/acp-backend/acp_backend_test.go",
+      "availability": "source-workspace",
+      "versions": {
+        "github.com/looprig/foreignloops": "source-workspace"
+      },
+      "offlineCommand": "GOWORK=off go test -race ./...",
+      "assertion": "A supervised child process speaking newline-framed ACP proves initialize, session/new, streamed session/update, prompt completion, backend checkpointing, session/load restoration, client teardown, and typed pre-launch validation without an installed harness or network.",
+      "workflowPath": ".github/workflows/docs-examples.yml",
+      "jobId": "docs-examples",
+      "cleanup": "Acknowledged backend shutdown closes each ACP client, which closes the stdio connection and reaps its self-hosted adapter subprocess; t.TempDir removes the workspace and lock files.",
+      "liveGate": null,
+      "proofIds": [
+        "example-foreignloops-acp-backend-fixture",
+        "example-foreignloops-acp-builder-source",
+        "example-foreignloops-acp-client-source",
+        "example-foreignloops-backend-snapshot-source",
+        "example-foreignloops-artifacts-contract-test"
+      ]
+    }
+  ]
+}
