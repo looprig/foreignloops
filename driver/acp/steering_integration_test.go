@@ -364,9 +364,6 @@ func TestSteeringIntegrationACPLateAcknowledgementIsIgnored(t *testing.T) {
 				}
 				lateObserved = true
 			}
-			if lateObserved {
-				break
-			}
 		case <-ctx.Done():
 			t.Fatalf("late acknowledgement observation: %v", ctx.Err())
 		}

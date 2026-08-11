@@ -519,6 +519,19 @@ func WithLifecycleForeignBuilders(b foreign.Builder, rb foreign.RestoredBuilder)
 	}
 }
 
+// WithLifecycleForeignServicesBuilders captures the additive foreign builder
+// seams for every live/restored session. Session construction starts one
+// private broker only when a foreign loop uses this opt-in seam, then mints a
+// fresh descriptor for each origin loop. Native and legacy builders remain
+// zero-services paths.
+func WithLifecycleForeignServicesBuilders(b foreign.ServicesBuilder, rb foreign.ServicesRestoredBuilder) LifecycleOption {
+	return func(r *Lifecycle) {
+		if b != nil && rb != nil {
+			r.baseOpts = append(r.baseOpts, WithForeignServicesBuilders(b, rb))
+		}
+	}
+}
+
 // WithLifecycleForeignBuilderRegistry forwards profile-keyed foreign routing to
 // every live/restored session while preserving the legacy builder pair option.
 func WithLifecycleForeignBuilderRegistry(registry *foreign.BuilderRegistry) LifecycleOption {

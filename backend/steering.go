@@ -692,13 +692,6 @@ func (m *steeringMachine) terminalReady() bool {
 	return m == nil || m.fault != nil || (m.active == nil || m.active.resolved) && len(m.pending) == 0
 }
 
-func (m *steeringMachine) faulted() error {
-	if m == nil {
-		return nil
-	}
-	return m.fault
-}
-
 func (m *steeringMachine) logFault() {
 	if m != nil && m.fault != nil {
 		slog.Error("foreignloop: steering state machine faulted", "error", m.fault)

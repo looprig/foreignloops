@@ -16,7 +16,7 @@ func TestCodexProductionDependencies(t *testing.T) {
 		t.Fatalf("glob production files: %v", err)
 	}
 	allowed := map[string]bool{
-		"github.com/looprig/core/content":       true,
+		"github.com/looprig/core/content":        true,
 		"github.com/looprig/foreignloops/driver": true,
 	}
 	fset := token.NewFileSet()

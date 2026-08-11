@@ -168,27 +168,6 @@ func (a *steerSendAck) snapshot() steerSendResult {
 	return a.state
 }
 
-func (a *steerSendAck) wait(ctx context.Context) steerSendResult {
-	if a == nil {
-		return steerSendRejected
-	}
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	for {
-		if state := a.snapshot(); state != steerSendPending {
-			return state
-		}
-		select {
-		case <-a.ready:
-			// Read the state after waking. The channel does not itself carry
-			// authority over accepted versus terminal.
-		case <-ctx.Done():
-			return a.snapshot()
-		}
-	}
-}
-
 // sendResult enters the command mailbox and waits for its linearized
 // acknowledgement. Reserved calls use a nonblocking mailbox admission; the
 // reservation lane guarantees that this path cannot be confused with output
@@ -559,7 +538,8 @@ func (d *Driver) runTurn(
 }
 
 type barrierRequest struct {
-	sequence uint64
+	sequence        uint64
+	waitForDelivery bool
 }
 
 type barrierResult struct {
@@ -600,7 +580,12 @@ func (b *barrierWorker) run() {
 	for {
 		select {
 		case request := <-b.requests:
-			err := waitForUpdatesThrough(b.ctx, b.session, request.sequence)
+			var err error
+			if request.waitForDelivery {
+				err = b.session.WaitForUpdates(b.ctx)
+			} else {
+				err = waitForUpdatesThrough(b.ctx, b.session, request.sequence)
+			}
 			select {
 			case b.results <- barrierResult{sequence: request.sequence, err: err}:
 			case <-b.ctx.Done():
@@ -613,11 +598,19 @@ func (b *barrierWorker) run() {
 }
 
 func (b *barrierWorker) request(sequence uint64) bool {
+	return b.enqueue(barrierRequest{sequence: sequence})
+}
+
+func (b *barrierWorker) requestDelivery(sequence uint64) bool {
+	return b.enqueue(barrierRequest{sequence: sequence, waitForDelivery: true})
+}
+
+func (b *barrierWorker) enqueue(request barrierRequest) bool {
 	if b == nil {
 		return false
 	}
 	select {
-	case b.requests <- barrierRequest{sequence: sequence}:
+	case b.requests <- request:
 		return true
 	case <-b.done:
 		return false
@@ -999,7 +992,7 @@ func (a *turnArbiter) maybeRequestPromptBarrier() {
 		return
 	}
 	a.promptBarrierRequested = true
-	a.requestBarrier(promptSequence(*a.prompt))
+	a.requestPromptBarrier(promptSequence(*a.prompt))
 }
 
 func hasPendingSteer(pending []arbObservation) bool {
@@ -1055,6 +1048,14 @@ func (a *turnArbiter) promptObservation(outcome promptOutcome) arbObservation {
 }
 
 func (a *turnArbiter) requestBarrier(sequence uint64) {
+	a.requestBarrierMode(sequence, false)
+}
+
+func (a *turnArbiter) requestPromptBarrier(sequence uint64) {
+	a.requestBarrierMode(sequence, true)
+}
+
+func (a *turnArbiter) requestBarrierMode(sequence uint64, waitForDelivery bool) {
 	if a.barrier == nil {
 		a.barrierFence = true
 		return
@@ -1066,6 +1067,10 @@ func (a *turnArbiter) requestBarrier(sequence uint64) {
 		return
 	}
 	if a.barrierBusy {
+		return
+	}
+	if waitForDelivery {
+		a.barrierBusy = a.barrier.requestDelivery(sequence)
 		return
 	}
 	a.barrierBusy = a.barrier.request(sequence)

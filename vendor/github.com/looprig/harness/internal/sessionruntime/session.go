@@ -289,9 +289,20 @@ type Session struct {
 	// RestoreForeignBuilderMissing). The session depends only on these narrow function
 	// seams, never on the foreignloop concrete loop (Dependency Inversion): loopruntime.New
 	// itself only ever builds native, and the foreign backend is injected here.
-	foreignBuild           foreign.Builder
-	foreignBuildRestored   foreign.RestoredBuilder
-	foreignRegistry        *foreign.BuilderRegistry
+	foreignBuild                 foreign.Builder
+	foreignBuildRestored         foreign.RestoredBuilder
+	foreignBuildServices         foreign.ServicesBuilder
+	foreignBuildRestoredServices foreign.ServicesRestoredBuilder
+	foreignRegistry              *foreign.BuilderRegistry
+	foreignDeliveryMu            sync.RWMutex
+	foreignDeliveryHooks         map[uuid.UUID]*foreignDeliveryHook
+	foreignDeliveryWatcherOnce   sync.Once
+	// collabBroker is created lazily when a services-aware foreign loop is
+	// constructed. Native and legacy foreign loops never receive a broker
+	// descriptor. The broker owns the endpoint; raw capabilities remain only in
+	// the immutable descriptor handed to the matching builder.
+	collabBrokerMu         sync.Mutex
+	collabBroker           *collabBroker
 	runtimeCatalog         loop.RuntimeCatalog
 	hasRuntimeCatalog      bool
 	runtimeCatalogProvider RuntimeCatalogProvider
@@ -510,6 +521,9 @@ func (s *Session) abortConstructionAfter(cause error, appendTerminal func(contex
 			handle.cancel()
 		}
 	}
+	// A construction failure must not leave a foreign adapter holding a live
+	// capability or a broker goroutine after the session's context is canceled.
+	_ = s.closeCollabBroker(context.Background())
 	loopDrains := make([]<-chan struct{}, 0, len(loops))
 	for _, handle := range loops {
 		if handle.backend != nil && handle.backend.DoneChan() != nil {
@@ -872,9 +886,78 @@ func (s *Session) PublishEventChecked(ctx context.Context, ev event.Event) error
 	if err := s.hub.PublishEventChecked(ctx, ev); err != nil {
 		return err
 	}
+	s.recordForeignDeliveryFold(ev)
 	s.recordLoopMechanicalState(ev)
 	s.clearReviewTurnState(ev)
 	return nil
+}
+
+func (s *Session) foreignServicesForTrackedWithController(loopID uuid.UUID, controller tool.DelegateController) (foreign.Services, *foreignDeliveryHook) {
+	hook := s.foreignDeliveryHookFor(loopID)
+	if hook == nil {
+		hook = newForeignDeliveryHook(s, loopID)
+	}
+	if s == nil || controller == nil {
+		return foreign.NewServices(foreign.BrokerDescriptor{}, hook), hook
+	}
+	hook.brokerMu.RLock()
+	if hook.brokerSet {
+		descriptor := hook.broker
+		hook.brokerMu.RUnlock()
+		return foreign.NewServices(descriptor, hook), hook
+	}
+	hook.brokerMu.RUnlock()
+	s.collabBrokerMu.Lock()
+	broker := s.collabBroker
+	s.collabBrokerMu.Unlock()
+	if broker == nil {
+		// Services-aware foreign construction is the opt-in boundary for the
+		// collaboration capability. Start exactly one broker for the session
+		// before invoking the builder; legacy builders and native loops never
+		// enter this path and therefore never receive a descriptor.
+		var err error
+		broker, err = s.ensureCollabBroker()
+		if err != nil {
+			hook.setBrokerError(err)
+			return foreign.NewServices(foreign.BrokerDescriptor{}, hook), hook
+		}
+	}
+	if controller == nil {
+		return foreign.NewServices(foreign.BrokerDescriptor{}, hook), hook
+	}
+	descriptor, err := broker.Mint(loopID, controller)
+	if err != nil {
+		hook.setBrokerError(err)
+		return foreign.NewServices(foreign.BrokerDescriptor{}, hook), hook
+	}
+	hook.setBrokerDescriptor(descriptor)
+	return foreign.NewServices(descriptor, hook), hook
+}
+
+// collabBrokerRequired reports whether a bound loop will use the additive
+// services-aware foreign construction seam. Native loops and the legacy
+// Builder/RestoredBuilder seams deliberately do not start a broker or receive
+// a broker descriptor. Services-aware adapter profiles routed through a
+// registry use the services lookup path and therefore opt in as well.
+func (s *Session) collabBrokerRequired(bound loop.BoundDefinition) bool {
+	if s == nil || bound == nil || bound.Engine() == loop.EngineNative {
+		return false
+	}
+	if s.foreignBuildServices != nil {
+		return true
+	}
+	return s.foreignRegistry != nil && bound.Engine() == loop.EngineAdapter && bound.RuntimeProfile() != "" &&
+		s.foreignRegistry.HasServicesBuilder(bound.RuntimeProfile())
+}
+
+func (s *Session) foreignDeliveryHookFor(loopID uuid.UUID) *foreignDeliveryHook {
+	if s == nil {
+		return nil
+	}
+	s.foreignDeliveryMu.RLock()
+	hook := s.foreignDeliveryHooks[loopID]
+	s.foreignDeliveryMu.RUnlock()
+	return hook
 }
 
 // CommitBoundary is the native loop-actor boundary seam. Without a configured
@@ -1465,6 +1548,19 @@ func (s *Session) newLoopWithAdmission(parent loop.Provenance, cfg loop.Definiti
 	// it is "" for native (omitzero drops it). Every failure path rolls back the quota
 	// reservation (release()) and cancels the loopCtx, exactly like the surrounding code.
 	loopCtx, cancel := context.WithCancel(s.sessionCtx)
+	var constructionHook *foreignDeliveryHook
+	loopCommitted := false
+	defer func() {
+		if !loopCommitted && constructionHook != nil {
+			s.revokeCollabLoop(constructionHook.loopID)
+			s.unregisterForeignDeliveryHook(constructionHook)
+		}
+	}()
+	servicesFor := func() foreign.Services {
+		services, hook := s.foreignServicesForTrackedWithController(loopID, bindings.Delegate)
+		constructionHook = hook
+		return services
+	}
 	var b loop.Backend
 	var foreignSID string
 	var agentSessionHeader event.Header
@@ -1493,14 +1589,34 @@ func (s *Session) newLoopWithAdmission(parent loop.Provenance, cfg loop.Definiti
 		}
 		bound = selectedBound
 		if s.foreignRegistry != nil {
-			builder, _, lookupErr := s.foreignRegistry.Builder(bound.RuntimeProfile())
-			if lookupErr != nil {
-				release()
-				cancel()
-				return uuid.UUID{}, &SessionError{Kind: SessionForeignBuilderMissing, Cause: lookupErr}
+			if s.foreignRegistry.HasServicesBuilder(bound.RuntimeProfile()) {
+				builder, _, lookupErr := s.foreignRegistry.ServicesBuilder(bound.RuntimeProfile())
+				if lookupErr != nil {
+					release()
+					cancel()
+					return uuid.UUID{}, &SessionError{Kind: SessionForeignBuilderMissing, Cause: lookupErr}
+				}
+				b, foreignSID, err = builder(loopCtx, s.sessionID, loopID, parent, eventTarget, selectedBound,
+					func() (uuid.UUID, error) { return s.newID() }, s.factory, servicesFor())
+				if err == nil && constructionHook != nil {
+					err = constructionHook.brokerError()
+				}
+			} else {
+				builder, _, lookupErr := s.foreignRegistry.Builder(bound.RuntimeProfile())
+				if lookupErr != nil {
+					release()
+					cancel()
+					return uuid.UUID{}, &SessionError{Kind: SessionForeignBuilderMissing, Cause: lookupErr}
+				}
+				b, foreignSID, err = builder(loopCtx, s.sessionID, loopID, parent, eventTarget, selectedBound,
+					func() (uuid.UUID, error) { return s.newID() }, s.factory)
 			}
-			b, foreignSID, err = builder(loopCtx, s.sessionID, loopID, parent, eventTarget, selectedBound,
-				func() (uuid.UUID, error) { return s.newID() }, s.factory)
+		} else if s.foreignBuildServices != nil {
+			b, foreignSID, err = s.foreignBuildServices(loopCtx, s.sessionID, loopID, parent, eventTarget, selectedBound,
+				func() (uuid.UUID, error) { return s.newID() }, s.factory, servicesFor())
+			if err == nil && constructionHook != nil {
+				err = constructionHook.brokerError()
+			}
 		} else if s.foreignBuild != nil {
 			// The legacy function-pair seam remains a valid composition path for
 			// adapter definitions. A profile-aware dispatcher supplied through
@@ -1514,7 +1630,7 @@ func (s *Session) newLoopWithAdmission(parent loop.Provenance, cfg loop.Definiti
 			return uuid.UUID{}, &SessionError{Kind: SessionForeignBuilderMissing}
 		}
 	default:
-		if s.foreignBuild == nil {
+		if s.foreignBuildServices == nil && s.foreignBuild == nil {
 			release()
 			cancel()
 			return uuid.UUID{}, &SessionError{Kind: SessionForeignBuilderMissing}
@@ -1526,8 +1642,16 @@ func (s *Session) newLoopWithAdmission(parent loop.Provenance, cfg loop.Definiti
 			return uuid.UUID{}, selectErr
 		}
 		bound = selectedBound
-		b, foreignSID, err = s.foreignBuild(loopCtx, s.sessionID, loopID, parent, eventTarget, selectedBound,
-			func() (uuid.UUID, error) { return s.newID() }, s.factory)
+		if s.foreignBuildServices != nil {
+			b, foreignSID, err = s.foreignBuildServices(loopCtx, s.sessionID, loopID, parent, eventTarget, selectedBound,
+				func() (uuid.UUID, error) { return s.newID() }, s.factory, servicesFor())
+			if err == nil && constructionHook != nil {
+				err = constructionHook.brokerError()
+			}
+		} else {
+			b, foreignSID, err = s.foreignBuild(loopCtx, s.sessionID, loopID, parent, eventTarget, selectedBound,
+				func() (uuid.UUID, error) { return s.newID() }, s.factory)
+		}
 	}
 	if err != nil {
 		release()
@@ -1692,6 +1816,7 @@ func (s *Session) newLoopWithAdmission(parent loop.Provenance, cfg loop.Definiti
 		admission.publisher.release()
 		admissionSubscriptionOwned = false
 	}
+	loopCommitted = true
 	return loopID, nil
 }
 
@@ -1973,6 +2098,14 @@ func newSessionTopology(ctx context.Context, topology Topology, newID idGenerato
 	}
 	if len(prepared) == 0 {
 		return abort(&SessionError{Kind: SessionLoopNotFound})
+	}
+	for _, primer := range prepared {
+		if s.collabBrokerRequired(primer.loop.bound) {
+			if err := s.startCollabBroker(); err != nil {
+				return abort(err)
+			}
+			break
+		}
 	}
 
 	// The hub is built before any loop, so a loop publishing through the session's
@@ -2582,6 +2715,12 @@ func (s *Session) shutdown() error {
 	s.loopsMu.Unlock()
 	s.activeMu.Unlock()
 	timeouts := s.resolveShutdownTimeouts(snapshot)
+	// Revoke every origin before any target loop receives Shutdown. This closes
+	// the authority race: a foreign adapter can no longer admit MessageAgent
+	// work while its loop is draining.
+	for _, item := range snapshot {
+		s.revokeCollabLoop(item.loopID)
+	}
 	// design §15's fourth cancellation trigger: the session shuts down. Every
 	// active permission review is signalled to stop before the shared Hustle
 	// runtime begins its own drain, so in-flight classifier calls observe
@@ -2593,6 +2732,10 @@ func (s *Session) shutdown() error {
 	failures = append(failures, sendErr)
 	failures = append(failures, s.waitLoopShutdowns(shutdownRoot, snapshot, targets, timeouts.loopDrain))
 	s.waitHustlesDrained()
+	// The broker waits for already-admitted calls to release before its endpoint
+	// is removed. Its admission/I/O deadlines are separate from MessageAgent's
+	// response observation deadline.
+	failures = append(failures, s.closeCollabBrokerWithTimeout(shutdownRoot, timeouts.collabBroker))
 
 	// From here onward every phase gets a fresh private deadline. A timeout in one
 	// component therefore cannot suppress checkpoint, durable-stop, or lease cleanup.
@@ -2611,6 +2754,7 @@ func (s *Session) shutdown() error {
 	if s.sessionCancel != nil {
 		s.sessionCancel()
 	}
+	s.abandonForeignDeliveryHooks()
 	return combineShutdownErrors(failures...)
 }
 

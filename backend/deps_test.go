@@ -18,7 +18,7 @@ const backendDriverImport = "github.com/looprig/foreignloops/driver"
 var backendAllowedImports = map[string]struct{}{
 	"github.com/looprig/core/content":         {},
 	"github.com/looprig/core/uuid":            {},
-	"github.com/looprig/foreignloops/driver":   {},
+	"github.com/looprig/foreignloops/driver":  {},
 	"github.com/looprig/harness/pkg/command":  {},
 	"github.com/looprig/harness/pkg/event":    {},
 	"github.com/looprig/harness/pkg/foreign":  {},

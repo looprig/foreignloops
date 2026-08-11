@@ -474,15 +474,6 @@ func (l *Loop) driveTurnToMailbox(turnCtx context.Context, cancel context.Cancel
 	l.driveTurnToSink(turnCtx, cancel, turn, cur, sidBound, sink, result, productionTurnLockOps(), streamReady)
 }
 
-// driveTurn keeps the pre-mailbox test seam source-compatible. Production
-// turns use driveTurnToMailbox; this compatibility path still filters terminal
-// events so the producer cannot become a lifecycle publisher.
-func (l *Loop) driveTurn(turnCtx context.Context, cancel context.CancelFunc, turn driver.Turn,
-	cur event.TurnIndex, sidBound bool, pub func(event.Event), result chan turnOutcome,
-) {
-	l.driveTurnWithLocks(turnCtx, cancel, turn, cur, sidBound, pub, result, productionTurnLockOps())
-}
-
 // driveTurnWithLocks is retained as a small compatibility seam for the lock
 // lifecycle tests. It routes non-terminal observations to the supplied trace
 // callback but deliberately never publishes a terminal from the producer.
@@ -565,17 +556,6 @@ func (l *Loop) driveTurnToSink(turnCtx context.Context, cancel context.CancelFun
 	}
 	sink(turnObservation{event: event.TurnDone{TurnIndex: cur, Message: lastOf(drained.assistant)}})
 	outcome = turnOutcome{committed: committed, success: true, spawned: spawned, boundSID: drained.boundSID}
-}
-
-func (l *Loop) drainStream(stream driver.Stream, cur event.TurnIndex, sidBound bool,
-	expectedSID string, bindSID func(string) error, pub func(event.Event),
-) drainedTurn {
-	return l.drainStreamToSink(stream, cur, sidBound, expectedSID, bindSID, func(observation turnObservation) bool {
-		if observation.event != nil && pub != nil {
-			pub(observation.event)
-		}
-		return true
-	})
 }
 
 func (l *Loop) drainStreamToSink(stream driver.Stream, cur event.TurnIndex, sidBound bool,
@@ -981,61 +961,6 @@ func (l *Loop) drainSteeringShutdownWithOutcome(ctx context.Context, cur event.T
 	}
 }
 
-func (l *Loop) receiveTurnOutcome(ctx context.Context, cur event.TurnIndex, turnID, stepID uuid.UUID,
-	mailbox <-chan turnObservation, result <-chan turnOutcome, machine *steeringMachine, publish bool,
-) (turnOutcome, error) {
-	if machine != nil {
-		if _, err := machine.beforeTerminal(); err != nil {
-			return turnOutcome{}, err
-		}
-	}
-	var (
-		outcome      turnOutcome
-		haveOutcome  bool
-		terminalHold *turnObservation
-	)
-	for {
-		if haveOutcome && mailbox == nil && (machine == nil || machine.terminalReady()) {
-			if terminalHold != nil && publish {
-				if err := l.publishTurnObservation(ctx, cur, turnID, stepID, *terminalHold); err != nil {
-					return outcome, err
-				}
-			}
-			return outcome, nil
-		}
-		select {
-		case value, ok := <-result:
-			if !ok {
-				result = nil
-				continue
-			}
-			outcome = value
-			haveOutcome = true
-			result = nil
-		case observation, ok := <-mailbox:
-			if !ok {
-				mailbox = nil
-				continue
-			}
-			if err := l.processTurnOutcomeObservation(ctx, cur, turnID, stepID, observation, machine, &terminalHold, publish); err != nil {
-				return outcome, err
-			}
-		case completion := <-machine.completionsChan():
-			if err := machine.complete(completion); err != nil {
-				return outcome, err
-			}
-		case <-machine.timerChan():
-			if err := machine.timeout(); err != nil {
-				return outcome, err
-			}
-		case <-machine.deadlineTimerChan():
-			if err := machine.deadlineTimeout(); err != nil {
-				return outcome, err
-			}
-		}
-	}
-}
-
 // commitTurn asks for provider-neutral authoritative history only after the
 // caller has closed the stream. Deliberately unavailable or failed history
 // degrades to the complete assistant messages observed on the live stream.
@@ -1067,15 +992,6 @@ func (l *Loop) commitTurnToSink(stream driver.Stream, assistant []*content.AIMes
 		committed = append(committed, group...)
 	}
 	return committed
-}
-
-func commitFromAssistant(assistant []*content.AIMessage, pub func(event.Event)) content.AgenticMessages {
-	return commitFromAssistantToSink(assistant, func(observation turnObservation) bool {
-		if observation.event != nil && pub != nil {
-			pub(observation.event)
-		}
-		return true
-	})
 }
 
 func commitFromAssistantToSink(assistant []*content.AIMessage, sink func(turnObservation) bool) content.AgenticMessages {

@@ -501,6 +501,75 @@ func TestSpawnReusesOnePersistentSessionAcrossTurns(t *testing.T) {
 	}
 }
 
+type promptDeliveryBarrierSession struct {
+	*scriptedSession
+	fullBarrierStarted chan struct{}
+	releaseFullBarrier chan struct{}
+	startOnce          sync.Once
+	throughCalls       atomic.Int32
+}
+
+func (s *promptDeliveryBarrierSession) WaitForUpdatesThrough(context.Context, uint64) error {
+	s.throughCalls.Add(1)
+	return nil
+}
+
+func (s *promptDeliveryBarrierSession) WaitForUpdates(ctx context.Context) error {
+	s.startOnce.Do(func() { close(s.fullBarrierStarted) })
+	select {
+	case <-s.releaseFullBarrier:
+		s.updates <- client.Update{ReceiveSequence: 1, SessionUpdate: protocol.SessionUpdate{
+			AgentMessageChunk: &protocol.ContentChunk{Content: protocol.ContentBlock{
+				Text: &protocol.TextContent{Text: "prompt-delivery answer"},
+			}},
+		}}
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func TestSpawnWaitsForSessionUpdateHandoffBeforePromptTerminal(t *testing.T) {
+	sess := &promptDeliveryBarrierSession{
+		scriptedSession:    newScriptedSession("session-prompt-delivery"),
+		fullBarrierStarted: make(chan struct{}),
+		releaseFullBarrier: make(chan struct{}),
+	}
+	sess.updates = make(chan client.Update)
+	sess.promptHook = func(int, []protocol.ContentBlock) (*client.PromptResult, error) {
+		return &client.PromptResult{
+			StopReason:      protocol.StopReasonEndTurn,
+			ReceiveSequence: 2,
+		}, nil
+	}
+	d := &Driver{session: sess, driverCtx: context.Background()}
+
+	stream, err := d.Spawn(context.Background(), driver.Turn{})
+	if err != nil {
+		t.Fatalf("Spawn() error = %v", err)
+	}
+	defer stream.Close()
+
+	select {
+	case <-sess.fullBarrierStarted:
+	case <-time.After(time.Second):
+		t.Fatal("prompt completion did not request the full update-delivery barrier")
+	}
+	if got := sess.throughCalls.Load(); got != 0 {
+		t.Fatalf("prompt completion used sequence-only barrier %d times", got)
+	}
+
+	close(sess.releaseFullBarrier)
+	events := collectTurnEvents(t, stream)
+	wantKinds := []driver.Kind{driver.KindTextDelta, driver.KindStepComplete, driver.KindTerminalOK}
+	if got := eventKinds(events); !reflect.DeepEqual(got, wantKinds) {
+		t.Fatalf("event kinds = %v, want %v", got, wantKinds)
+	}
+	if events[0].Text != "prompt-delivery answer" {
+		t.Fatalf("first event = %#v, want prompt-delivery answer", events[0])
+	}
+}
+
 func TestSpawnWaitsForOrderedUpdateDeliveryBeforeTerminal(t *testing.T) {
 	sess := newScriptedSession("session-barrier")
 	promptReturned := make(chan struct{})

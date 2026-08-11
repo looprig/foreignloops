@@ -16,6 +16,7 @@ import (
 	"github.com/looprig/harness/internal/delegationtool"
 	"github.com/looprig/harness/pkg/command"
 	"github.com/looprig/harness/pkg/event"
+	"github.com/looprig/harness/pkg/foreign"
 	"github.com/looprig/harness/pkg/gate"
 	"github.com/looprig/harness/pkg/identity"
 	"github.com/looprig/harness/pkg/journal"
@@ -61,6 +62,12 @@ type delegationManager struct {
 	runtimeCatalog         loop.RuntimeCatalog
 	hasRuntimeCatalog      bool
 	runtimeCatalogProvider RuntimeCatalogProvider
+	// foreignDeliveryResponsiveness is private coordinator bookkeeping. It never
+	// adjudicates the hook or cancels the target, and never synthesizes a
+	// model-visible delivery result; the session-owned coordinator continues on
+	// the durable hook signal after this bound.
+	foreignDeliveryResponsiveness time.Duration
+	foreignDeliveryTimerFactory   func(time.Duration) foreignDeliveryObserverTimer
 }
 
 type delegateAdmission struct {
@@ -138,15 +145,25 @@ type resolvedRequest struct {
 	text    string
 }
 
+type delegateRestoreContradictionError struct {
+	requestID uuid.UUID
+	reason    string
+}
+
+func (e *delegateRestoreContradictionError) Error() string {
+	return "delegate restore contradiction for " + e.requestID.String() + ": " + e.reason
+}
+
 func newDelegationManager(topology Topology, catalogs ...loop.RuntimeCatalog) *delegationManager {
 	byName := make(map[identity.AgentName]loop.Definition, len(topology.Definitions))
 	for _, def := range topology.Definitions {
 		byName[def.Name()] = def
 	}
 	manager := &delegationManager{
-		byName:   byName,
-		requests: make(map[uuid.UUID]*requestTracker),
-		resolved: make(map[uuid.UUID]resolvedRequest),
+		byName:                        byName,
+		requests:                      make(map[uuid.UUID]*requestTracker),
+		resolved:                      make(map[uuid.UUID]resolvedRequest),
+		foreignDeliveryResponsiveness: foreignDeliveryResponsivenessBound,
 	}
 	if len(catalogs) > 0 {
 		manager.runtimeCatalog = catalogs[0]
@@ -175,7 +192,7 @@ func (m *delegationManager) catalogFor(parent loop.Definition) (loop.RuntimeCata
 }
 
 // seedResolvedDelegateRecords reconstructs durable delegate correlation from required
-// machine NoFold intents, then overlays exact started-turn terminals and crash closures.
+// machine delegate intents, then overlays exact started-turn terminals and crash closures.
 func seedResolvedDelegateRecords(m *delegationManager, records []journal.JournalRecord, replayed, closures []event.Event, tombstonedSet ...map[uuid.UUID]struct{}) error {
 	tombstoned := map[uuid.UUID]struct{}{}
 	if len(tombstonedSet) > 0 && tombstonedSet[0] != nil {
@@ -185,10 +202,46 @@ func seedResolvedDelegateRecords(m *delegationManager, records []journal.Journal
 	if err != nil {
 		return err
 	}
+	targets, err := phasedDelegateTargets(records)
+	if err != nil {
+		return err
+	}
+	phased, err := phasedDelegateCommands(records)
+	if err != nil {
+		return err
+	}
 	combined := make([]event.Event, 0, len(replayed)+len(closures))
 	combined = append(combined, replayed...)
 	combined = append(combined, closures...)
+	sessionID, err := phasedDelegateSessionID(records)
+	if err != nil {
+		return err
+	}
+	if err := validateDelegateRestoreCorrelations(combined, targets, sessionID); err != nil {
+		return err
+	}
+	deliveryStates, err := collectDelegateDeliveryStates(combined, targets, sessionID)
+	if err != nil {
+		return err
+	}
+	if err := validateDelegateDeliveryPhases(phased, deliveryStates); err != nil {
+		return err
+	}
 	index := make(map[uuid.UUID]resolvedRequest)
+	deliveryUnknown := make(map[uuid.UUID]struct{})
+	opened := make(map[uuid.UUID]struct{})
+	for _, ev := range combined {
+		var requestID uuid.UUID
+		switch opening := ev.(type) {
+		case event.TurnStarted:
+			requestID = opening.Cause.CommandID
+		case event.TurnFoldedInto:
+			requestID = opening.Cause.CommandID
+		}
+		if !requestID.IsZero() {
+			opened[requestID] = struct{}{}
+		}
+	}
 	for _, ev := range combined {
 		var requestID, childID uuid.UUID
 		switch accepted := ev.(type) {
@@ -211,7 +264,42 @@ func seedResolvedDelegateRecords(m *delegationManager, records []journal.Journal
 		}
 		index[requestID] = resolvedRequest{childID: target, status: tool.DelegateStatusInterrupted}
 	}
-	for requestID, terminal := range foldDelegateTerminals(combined) {
+	// Only terminal delivery adjudications suppress recovery. A reservation is
+	// intermediate: a fold/turn terminal may supersede it, while a durable fallback
+	// command may still be re-admitted after a crash.
+	for requestID, state := range deliveryStates {
+		target := targets[requestID]
+		switch {
+		case delegateDeliveryStateTerminal(state):
+			index[requestID] = resolvedRequest{childID: target, status: tool.DelegateStatusUnknown}
+			deliveryUnknown[requestID] = struct{}{}
+		case state == event.DelegateDeliverySteerAttemptReserved:
+			// A reservation without a durable fallback is repaired as unknown by
+			// the normal restore path. An authoritative opening has already crossed
+			// the actor boundary and remains correlated to its eventual terminal;
+			// only an unopened reservation retains the fail-closed result. A
+			// fallback phase remains re-admittable.
+			if _, admitted := opened[requestID]; !admitted {
+				if fallback, ok := phased[requestID]; !ok || fallback.DelegateDeliveryPhase != command.DelegateDeliveryPhaseFallbackQueued {
+					index[requestID] = resolvedRequest{childID: target, status: tool.DelegateStatusUnknown}
+				}
+			}
+		}
+	}
+	terminals, err := foldDelegateTerminalsChecked(combined, sessionID)
+	if err != nil {
+		return err
+	}
+	for requestID, terminal := range terminals {
+		if state, hasDeliveryState := deliveryStates[requestID]; hasDeliveryState && delegateDeliveryStateTerminal(state) {
+			return &delegateRestoreContradictionError{requestID: requestID, reason: "delivery state conflicts with turn terminal"}
+		}
+		if _, unknown := deliveryUnknown[requestID]; unknown {
+			continue
+		}
+		if target, admitted := targets[requestID]; admitted && terminal.childID != target {
+			return &journal.CommandRouteMismatchError{RecordLoopID: terminal.childID, TargetLoopID: target}
+		}
 		if _, admitted := index[requestID]; admitted {
 			index[requestID] = terminal
 		}
@@ -233,6 +321,12 @@ func seedResolvedDelegateRecords(m *delegationManager, records []journal.Journal
 		if !ok {
 			continue
 		}
+		if state, hasDeliveryState := deliveryStates[cancelled.Cause.CommandID]; hasDeliveryState && delegateDeliveryStateTerminal(state) {
+			return &delegateRestoreContradictionError{requestID: cancelled.Cause.CommandID, reason: "delivery state conflicts with cancellation"}
+		}
+		if _, unknown := deliveryUnknown[cancelled.Cause.CommandID]; unknown {
+			continue
+		}
 		if cancelled.LoopID != admitted.childID {
 			return &journal.CommandRouteMismatchError{RecordLoopID: cancelled.LoopID, TargetLoopID: admitted.childID}
 		}
@@ -249,9 +343,10 @@ func seedResolvedDelegateRecords(m *delegationManager, records []journal.Journal
 
 // backgroundDelegateIntents returns the durable request-to-child map for the one
 // managed request shape whose completion must cross the child-to-parent boundary
-// after a process restart. The marker is intentionally narrower than "machine
-// NoFold": foreground responses and ordinary machine input must never be replayed
-// as parent hand-backs.
+// after a process restart. Both the legacy non-folding marker and the phased
+// foldable marker are admitted. The marker is intentionally narrower than
+// "machine NoFold": foreground responses and ordinary machine input must never be
+// replayed as parent hand-backs.
 func backgroundDelegateIntents(records []journal.JournalRecord) (map[uuid.UUID]uuid.UUID, error) {
 	intents := make(map[uuid.UUID]uuid.UUID)
 	for _, record := range records {
@@ -263,12 +358,360 @@ func backgroundDelegateIntents(records []journal.JournalRecord) (map[uuid.UUID]u
 			return nil, err
 		}
 		input, ok := commandRecord.Command().(command.UserInput)
-		if !ok || !input.BackgroundHandBack || !input.NoFold || input.Agency != identity.AgencyMachine || input.TargetLoopID.IsZero() || input.CommandID.IsZero() {
+		if !ok || !input.BackgroundHandBack || input.Agency != identity.AgencyMachine || input.TargetLoopID.IsZero() || input.CommandID.IsZero() {
 			continue
+		}
+		if !input.NoFold && !input.DelegateDeliveryPhase.Valid() {
+			continue
+		}
+		if prior, exists := intents[input.CommandID]; exists && prior != input.TargetLoopID {
+			return nil, &journal.CommandRouteMismatchError{RecordLoopID: input.TargetLoopID, TargetLoopID: prior}
 		}
 		intents[input.CommandID] = input.TargetLoopID
 	}
 	return intents, nil
+}
+
+// phasedDelegateCommands returns every foldable native command, regardless of
+// whether its caller requested a background parent hand-back. Foreground phased
+// commands are restored as session-owned work; only background commands cross the
+// parent boundary after recovery.
+func phasedDelegateCommands(records []journal.JournalRecord) (map[uuid.UUID]command.UserInput, error) {
+	commands := make(map[uuid.UUID]command.UserInput)
+	for _, record := range records {
+		commandRecord, ok := record.(journal.CommandRecord)
+		if !ok {
+			continue
+		}
+		if err := journal.ValidateCommandRecordRoute(commandRecord); err != nil {
+			return nil, err
+		}
+		input, ok := commandRecord.Command().(command.UserInput)
+		if !ok || input.Agency != identity.AgencyMachine || input.DelegateDeliveryPhase == "" || !input.DelegateDeliveryPhase.Valid() || input.CommandID.IsZero() || input.TargetLoopID.IsZero() {
+			continue
+		}
+		if prior, exists := commands[input.CommandID]; exists && prior.TargetLoopID != input.TargetLoopID {
+			return nil, &journal.CommandRouteMismatchError{RecordLoopID: input.TargetLoopID, TargetLoopID: prior.TargetLoopID}
+		}
+		commands[input.CommandID] = input
+	}
+	return commands, nil
+}
+
+// phasedDelegateTargets is the route index used by restore correlation checks.
+// It includes foreground phased commands as well as background intents, while
+// legacy NoFold commands remain in the background-only index above.
+func phasedDelegateTargets(records []journal.JournalRecord) (map[uuid.UUID]uuid.UUID, error) {
+	intents, err := backgroundDelegateIntents(records)
+	if err != nil {
+		return nil, err
+	}
+	commands, err := phasedDelegateCommands(records)
+	if err != nil {
+		return nil, err
+	}
+	targets := make(map[uuid.UUID]uuid.UUID, len(intents)+len(commands))
+	for requestID, target := range intents {
+		targets[requestID] = target
+	}
+	for requestID, input := range commands {
+		if prior, exists := targets[requestID]; exists && prior != input.TargetLoopID {
+			return nil, &journal.CommandRouteMismatchError{RecordLoopID: input.TargetLoopID, TargetLoopID: prior}
+		}
+		targets[requestID] = input.TargetLoopID
+	}
+	return targets, nil
+}
+
+// delegateDeliveryStateTerminal distinguishes the reservation gate from the
+// terminal adjudications. A reservation only proves that steering admission was
+// attempted; a later turn fold/terminal or fallback command can still decide the
+// request's fate during restore.
+func delegateDeliveryStateTerminal(state event.DelegateDeliveryState) bool {
+	return state == event.DelegateDeliveryResolvedUnknown || state == event.DelegateDeliveryResolvedUntrackable
+}
+
+// restoredDelegateDeliveryStatus translates an actor-owned terminal delivery
+// adjudication into the categorical status carried by the parent hand-back.
+// These states are terminal for child admission, but they still require one
+// parent-visible result when restore finds no durable result already processed.
+func restoredDelegateDeliveryStatus(state event.DelegateDeliveryState) (tool.DelegateDeliveryStatus, bool) {
+	switch state {
+	case event.DelegateDeliveryResolvedUnknown:
+		return tool.DelegateDeliveryUnknown, true
+	case event.DelegateDeliveryResolvedUntrackable:
+		return tool.DelegateDeliveryUntrackable, true
+	default:
+		return "", false
+	}
+}
+
+// collectDelegateDeliveryStates folds the durable delivery-state events while
+// preserving reservation as an intermediate state. Repeated identical events are
+// idempotent; a terminal state cannot regress to reservation or change terminal
+// kind without a fail-closed restore error.
+func phasedDelegateSessionID(records []journal.JournalRecord) (uuid.UUID, error) {
+	for _, record := range records {
+		commandRecord, ok := record.(journal.CommandRecord)
+		if !ok || commandRecord.SessionID().IsZero() {
+			continue
+		}
+		input, ok := commandRecord.Command().(command.UserInput)
+		if !ok || input.DelegateDeliveryPhase == "" || !input.DelegateDeliveryPhase.Valid() {
+			continue
+		}
+		// A restore stream can contain records from multiple loops and
+		// sessions. The session identity is only authoritative when checked
+		// against the delivery state for its own request; callers must not
+		// reject the whole stream because unrelated records differ.
+		return commandRecord.SessionID(), nil
+	}
+	return uuid.UUID{}, nil
+}
+
+func collectDelegateDeliveryStates(events []event.Event, targets map[uuid.UUID]uuid.UUID, sessionID uuid.UUID) (map[uuid.UUID]event.DelegateDeliveryState, error) {
+	states := make(map[uuid.UUID]event.DelegateDeliveryState)
+	for _, ev := range events {
+		state, ok := ev.(event.DelegateDeliveryStateChanged)
+		if !ok || state.RequestID.IsZero() {
+			continue
+		}
+		target, admitted := targets[state.RequestID]
+		if !admitted {
+			continue
+		}
+		if !sessionID.IsZero() && state.SessionID != sessionID {
+			return nil, &delegateRestoreContradictionError{requestID: state.RequestID, reason: "delivery state session mismatch"}
+		}
+		if state.TargetLoopID != target {
+			return nil, &journal.CommandRouteMismatchError{RecordLoopID: state.TargetLoopID, TargetLoopID: target}
+		}
+		if !state.State.Valid() {
+			return nil, &delegateRestoreContradictionError{requestID: state.RequestID, reason: "invalid delivery state"}
+		}
+		prior, exists := states[state.RequestID]
+		if !exists && delegateDeliveryStateTerminal(state.State) {
+			return nil, &delegateRestoreContradictionError{requestID: state.RequestID, reason: "terminal delivery state lacks reservation predecessor"}
+		}
+		if !exists || prior == state.State {
+			states[state.RequestID] = state.State
+			continue
+		}
+		if prior == event.DelegateDeliverySteerAttemptReserved && delegateDeliveryStateTerminal(state.State) {
+			states[state.RequestID] = state.State
+			continue
+		}
+		return nil, &delegateRestoreContradictionError{requestID: state.RequestID, reason: "delivery state regressed or changed terminal kind"}
+	}
+	return states, nil
+}
+
+func validateDelegateDeliveryPhases(phased map[uuid.UUID]command.UserInput, states map[uuid.UUID]event.DelegateDeliveryState) error {
+	for requestID, state := range states {
+		if !delegateDeliveryStateTerminal(state) {
+			continue
+		}
+		if cmd, ok := phased[requestID]; ok && cmd.DelegateDeliveryPhase == command.DelegateDeliveryPhaseFallbackQueued {
+			return &delegateRestoreContradictionError{requestID: requestID, reason: "fallback command conflicts with terminal delivery state"}
+		}
+	}
+	return nil
+}
+
+// persistUnresolvedDelegateDeliveryStates closes only an intent-only durable
+// foreign/native delivery reservation before RestoreDone. A fallback command or
+// an authoritative turn/cancellation already decides the request and remains
+// recoverable from that evidence. Existing unknown or untrackable states are
+// terminal and are not appended again.
+func persistUnresolvedDelegateDeliveryStates(ctx context.Context, j journal.SessionJournal, factory *event.Factory, sessionID uuid.UUID, records []journal.JournalRecord, replayed, closures []event.Event) ([]event.Event, error) {
+	targets, err := phasedDelegateTargets(records)
+	if err != nil {
+		return nil, err
+	}
+	combined := make([]event.Event, 0, len(replayed)+len(closures))
+	combined = append(combined, replayed...)
+	combined = append(combined, closures...)
+	if err := validateDelegateRestoreCorrelations(combined, targets, sessionID); err != nil {
+		return nil, err
+	}
+	deliveryStates, err := collectDelegateDeliveryStates(combined, targets, sessionID)
+	if err != nil {
+		return nil, err
+	}
+	phased, err := phasedDelegateCommands(records)
+	if err != nil {
+		return nil, err
+	}
+	if err := validateDelegateDeliveryPhases(phased, deliveryStates); err != nil {
+		return nil, err
+	}
+	terminals, err := foldDelegateTerminalsChecked(combined, sessionID)
+	if err != nil {
+		return nil, err
+	}
+	closed := make(map[uuid.UUID]struct{}, len(terminals))
+	opened := make(map[uuid.UUID]struct{})
+	for _, ev := range combined {
+		var requestID uuid.UUID
+		switch opening := ev.(type) {
+		case event.TurnStarted:
+			requestID = opening.Cause.CommandID
+		case event.TurnFoldedInto:
+			requestID = opening.Cause.CommandID
+		}
+		if !requestID.IsZero() {
+			opened[requestID] = struct{}{}
+		}
+	}
+	for requestID := range terminals {
+		closed[requestID] = struct{}{}
+	}
+	for _, ev := range combined {
+		switch terminal := ev.(type) {
+		case event.TurnRejected, event.InputCancelled:
+			if requestID := terminal.EventHeader().Cause.CommandID; !requestID.IsZero() {
+				closed[requestID] = struct{}{}
+			}
+		}
+	}
+	requestIDs := make([]uuid.UUID, 0, len(deliveryStates))
+	for requestID, state := range deliveryStates {
+		if state != event.DelegateDeliverySteerAttemptReserved {
+			continue
+		}
+		if _, done := closed[requestID]; done {
+			continue
+		}
+		// TurnStarted and TurnFoldedInto are authoritative actor admission
+		// evidence. A reservation that has already crossed either boundary is
+		// still awaiting its terminal correlation, not an ambiguous provider
+		// delivery that restore may repair to unknown.
+		if _, admitted := opened[requestID]; admitted {
+			continue
+		}
+		if fallback, ok := phased[requestID]; ok && fallback.DelegateDeliveryPhase == command.DelegateDeliveryPhaseFallbackQueued {
+			continue
+		}
+		requestIDs = append(requestIDs, requestID)
+	}
+	sort.Slice(requestIDs, func(i, j int) bool { return requestIDs[i].String() < requestIDs[j].String() })
+	repairs := make([]event.Event, 0, len(requestIDs))
+	for _, requestID := range requestIDs {
+		targetLoopID := targets[requestID]
+		repair := event.DelegateDeliveryStateChanged{
+			Header:       event.Header{Coordinates: identity.Coordinates{SessionID: sessionID}},
+			RequestID:    requestID,
+			TargetLoopID: targetLoopID,
+			State:        event.DelegateDeliveryResolvedUnknown,
+		}
+		header, err := factory.Stamp(repair.EventHeader())
+		if err != nil {
+			return nil, &RestoreError{Kind: RestoreIDGenerationFailed, Cause: err}
+		}
+		repair.Header = header
+		if err := event.ValidateEvent(repair); err != nil {
+			return nil, err
+		}
+		if _, err := j.Append(ctx, journal.NewEventRecord(repair)); err != nil {
+			return nil, err
+		}
+		repairs = append(repairs, repair)
+	}
+	return repairs, nil
+}
+
+// validateDelegateRestoreCorrelations performs the fail-closed checks before a
+// restore repair can append a new delivery-state event. In particular, a repair
+// must never be written first and only then discover that the same request also
+// has an authoritative turn terminal or cancellation.
+func validateDelegateRestoreCorrelations(events []event.Event, intents map[uuid.UUID]uuid.UUID, sessionID uuid.UUID) error {
+	terminals, err := foldDelegateTerminalsChecked(events, sessionID)
+	if err != nil {
+		return err
+	}
+	deliveryStates, err := collectDelegateDeliveryStates(events, intents, sessionID)
+	if err != nil {
+		return err
+	}
+	cancellations := make(map[uuid.UUID]struct{})
+	openings := make(map[uuid.UUID]struct{})
+	closures := make(map[uuid.UUID]struct{})
+	validateTargetRoute := func(requestID, loopID uuid.UUID) error {
+		if requestID.IsZero() {
+			return nil
+		}
+		if target, admitted := intents[requestID]; admitted && loopID != target {
+			return &journal.CommandRouteMismatchError{RecordLoopID: loopID, TargetLoopID: target}
+		}
+		return nil
+	}
+	validateEventSession := func(actual, requestID uuid.UUID) error {
+		if sessionID.IsZero() || actual.IsZero() || actual == sessionID {
+			return nil
+		}
+		return &delegateRestoreContradictionError{requestID: requestID, reason: "delegate evidence session mismatch"}
+	}
+	for _, ev := range events {
+		switch typed := ev.(type) {
+		case event.TurnStarted:
+			if err := validateTargetRoute(typed.Cause.CommandID, typed.LoopID); err != nil {
+				return err
+			}
+			if !typed.Cause.CommandID.IsZero() {
+				openings[typed.Cause.CommandID] = struct{}{}
+			}
+		case event.TurnFoldedInto:
+			if err := validateTargetRoute(typed.Cause.CommandID, typed.LoopID); err != nil {
+				return err
+			}
+			if !typed.Cause.CommandID.IsZero() {
+				openings[typed.Cause.CommandID] = struct{}{}
+			}
+		case event.TurnRejected:
+			if err := validateEventSession(typed.SessionID, typed.Cause.CommandID); err != nil {
+				return err
+			}
+			if err := validateTargetRoute(typed.Cause.CommandID, typed.LoopID); err != nil {
+				return err
+			}
+			if !typed.Cause.CommandID.IsZero() {
+				closures[typed.Cause.CommandID] = struct{}{}
+			}
+		case event.InputCancelled:
+			if err := validateEventSession(typed.SessionID, typed.Cause.CommandID); err != nil {
+				return err
+			}
+			if err := validateTargetRoute(typed.Cause.CommandID, typed.LoopID); err != nil {
+				return err
+			}
+			if !typed.Cause.CommandID.IsZero() {
+				closures[typed.Cause.CommandID] = struct{}{}
+				cancellations[typed.Cause.CommandID] = struct{}{}
+			}
+		}
+	}
+	for requestID, terminal := range terminals {
+		if state, hasDeliveryState := deliveryStates[requestID]; hasDeliveryState && delegateDeliveryStateTerminal(state) {
+			return &delegateRestoreContradictionError{requestID: requestID, reason: "delivery state conflicts with turn terminal"}
+		}
+		if target, admitted := intents[requestID]; admitted && terminal.childID != target {
+			return &journal.CommandRouteMismatchError{RecordLoopID: terminal.childID, TargetLoopID: target}
+		}
+	}
+	for requestID := range closures {
+		if _, opened := openings[requestID]; opened {
+			return &delegateRestoreContradictionError{requestID: requestID, reason: "rejection or cancellation conflicts with turn opening"}
+		}
+		if _, terminal := terminals[requestID]; terminal {
+			return &delegateRestoreContradictionError{requestID: requestID, reason: "rejection or cancellation conflicts with turn terminal"}
+		}
+	}
+	for requestID := range cancellations {
+		if state, hasDeliveryState := deliveryStates[requestID]; hasDeliveryState && delegateDeliveryStateTerminal(state) {
+			return &delegateRestoreContradictionError{requestID: requestID, reason: "delivery state conflicts with cancellation"}
+		}
+	}
+	return nil
 }
 
 func (m *delegationManager) getResolved(requestID uuid.UUID) (resolvedRequest, bool) {
@@ -288,6 +731,15 @@ type restoredBackgroundPlan struct {
 	name      string
 	resolved  resolvedRequest
 	handBack  *command.SubagentResult
+	// deliveryStatus is set for an actor-owned unknown/untrackable delivery
+	// decision. It is a categorical parent hand-back, never a child re-admission
+	// or target-turn watcher.
+	deliveryStatus tool.DelegateDeliveryStatus
+	// reAdmit is set for a foldable phased command whose durable journal has
+	// no opening/cancellation/terminal evidence. Restore sends this exact
+	// command id back through the child actor; it never steers a request with
+	// an ambiguous delivery state.
+	reAdmit *command.UserInput
 }
 
 // planRestoredBackgroundRequests reconstructs the durable child-terminal to
@@ -299,6 +751,37 @@ type restoredBackgroundPlan struct {
 func (m *delegationManager) planRestoredBackgroundRequests(s *Session, records []journal.JournalRecord, replayed, closures []event.Event) ([]restoredBackgroundPlan, error) {
 	intents, err := backgroundDelegateIntents(records)
 	if err != nil {
+		return nil, err
+	}
+	restoreSessionID, err := phasedDelegateSessionID(records)
+	if err != nil {
+		return nil, err
+	}
+	if !s.sessionID.IsZero() {
+		if !restoreSessionID.IsZero() && restoreSessionID != s.sessionID {
+			return nil, &delegateRestoreContradictionError{reason: "delegate command session mismatch"}
+		}
+		restoreSessionID = s.sessionID
+	}
+	phased, err := phasedDelegateCommands(records)
+	if err != nil {
+		return nil, err
+	}
+	targets, err := phasedDelegateTargets(records)
+	if err != nil {
+		return nil, err
+	}
+	combined := make([]event.Event, 0, len(replayed)+len(closures))
+	combined = append(combined, replayed...)
+	combined = append(combined, closures...)
+	if err := validateDelegateRestoreCorrelations(combined, targets, restoreSessionID); err != nil {
+		return nil, err
+	}
+	deliveryStates, err := collectDelegateDeliveryStates(combined, targets, restoreSessionID)
+	if err != nil {
+		return nil, err
+	}
+	if err := validateDelegateDeliveryPhases(phased, deliveryStates); err != nil {
 		return nil, err
 	}
 
@@ -322,7 +805,7 @@ func (m *delegationManager) planRestoredBackgroundRequests(s *Session, records [
 	// the live registry as a fallback for legacy LoopStarted records that predate the
 	// durable display-name field.
 	s.loopsMu.RLock()
-	for childID := range intents {
+	for _, childID := range targets {
 		if _, ok := children[childID]; ok {
 			continue
 		}
@@ -371,7 +854,7 @@ func (m *delegationManager) planRestoredBackgroundRequests(s *Session, records [
 		if childID.IsZero() || parentID.IsZero() {
 			return nil, &journal.CommandRouteMismatchError{RecordLoopID: parentID, TargetLoopID: childID}
 		}
-		if target, admitted := intents[requestID]; admitted && target != childID {
+		if target, admitted := targets[requestID]; admitted && target != childID {
 			return nil, &journal.CommandRouteMismatchError{RecordLoopID: childID, TargetLoopID: target}
 		}
 		if info, known := children[childID]; known && !info.parent.IsZero() && info.parent != parentID {
@@ -385,10 +868,38 @@ func (m *delegationManager) planRestoredBackgroundRequests(s *Session, records [
 		}
 		handBacks[requestID] = handBackRecord{commandID: handBack.CommandID, command: handBack, childID: childID, parentID: parentID}
 	}
+	handBackParents := make(map[uuid.UUID]map[uuid.UUID]struct{}, len(handBacks))
+	for _, handBack := range handBacks {
+		parents := handBackParents[handBack.commandID]
+		if parents == nil {
+			parents = make(map[uuid.UUID]struct{})
+			handBackParents[handBack.commandID] = parents
+		}
+		parents[handBack.parentID] = struct{}{}
+	}
 
 	processed := make(map[uuid.UUID]struct{})
-	for _, ev := range append(append([]event.Event(nil), replayed...), closures...) {
+	// requestOpened is intentionally separate from processed parent hand-back
+	// commands. A TurnStarted/TurnFoldedInto proves a child request crossed the
+	// actor boundary; InputQueued does not and is therefore omitted.
+	requestOpened := make(map[uuid.UUID]struct{})
+	requestTerminal := make(map[uuid.UUID]struct{})
+	for _, ev := range combined {
 		commandID := ev.EventHeader().Cause.CommandID
+		switch typed := ev.(type) {
+		case event.TurnStarted:
+			if !typed.Cause.CommandID.IsZero() {
+				requestOpened[typed.Cause.CommandID] = struct{}{}
+			}
+		case event.TurnFoldedInto:
+			if !typed.Cause.CommandID.IsZero() {
+				requestOpened[typed.Cause.CommandID] = struct{}{}
+			}
+		case event.InputCancelled, event.TurnRejected:
+			if !commandID.IsZero() {
+				requestTerminal[commandID] = struct{}{}
+			}
+		}
 		// The completion envelope is also durable in the parent turn input.
 		// This correlation survives even when the audit-only SubagentResult
 		// command append failed, so a processed completion cannot be replayed
@@ -418,18 +929,36 @@ func (m *delegationManager) planRestoredBackgroundRequests(s *Session, records [
 		if !isProcessed {
 			continue
 		}
-		for _, handBack := range handBacks {
-			if handBack.commandID == commandID && ev.EventHeader().LoopID == handBack.parentID {
+		if parents, indexed := handBackParents[commandID]; indexed {
+			if _, matched := parents[ev.EventHeader().LoopID]; matched {
 				processed[commandID] = struct{}{}
 			}
 		}
 	}
 
-	requestIDs := make([]uuid.UUID, 0, len(intents))
+	requestIDSet := make(map[uuid.UUID]struct{}, len(intents))
 	for requestID := range intents {
+		requestIDSet[requestID] = struct{}{}
+	}
+	for requestID := range phased {
+		requestIDSet[requestID] = struct{}{}
+	}
+	requestIDs := make([]uuid.UUID, 0, len(requestIDSet))
+	for requestID := range requestIDSet {
 		if _, resolved := m.getResolved(requestID); resolved {
 			requestIDs = append(requestIDs, requestID)
+			continue
 		}
+		if _, isPhased := phased[requestID]; isPhased {
+			requestIDs = append(requestIDs, requestID)
+		}
+	}
+	terminals, err := foldDelegateTerminalsChecked(combined, restoreSessionID)
+	if err != nil {
+		return nil, err
+	}
+	for requestID := range terminals {
+		requestTerminal[requestID] = struct{}{}
 	}
 	sort.Slice(requestIDs, func(i, j int) bool { return requestIDs[i].String() < requestIDs[j].String() })
 
@@ -438,11 +967,56 @@ func (m *delegationManager) planRestoredBackgroundRequests(s *Session, records [
 		if _, done := processed[requestID]; done {
 			continue
 		}
+		childID := targets[requestID]
+		if childID.IsZero() {
+			if phasedCommand, ok := phased[requestID]; ok {
+				childID = phasedCommand.TargetLoopID
+			}
+		}
+		deliveryStatus := tool.DelegateDeliveryStatus("")
+		if state, deliveryState := deliveryStates[requestID]; deliveryState {
+			if status, terminal := restoredDelegateDeliveryStatus(state); terminal {
+				if _, background := intents[requestID]; !background {
+					// A terminal delivery state on a foreground phased request is
+					// authoritative for child admission, but it is not a parent
+					// hand-back contract. Leave it closed without inventing one.
+					continue
+				}
+				deliveryStatus = status
+			}
+		}
+		if phasedCommand, isPhased := phased[requestID]; isPhased && deliveryStatus == "" {
+			// An opening event is already authoritative. An explicit terminal or
+			// cancellation is also final evidence; an intent-only reservation is
+			// repaired to unknown, while a fallback reservation remains replayable.
+			_, opened := requestOpened[requestID]
+			_, terminal := requestTerminal[requestID]
+			state, deliveryState := deliveryStates[requestID]
+			if deliveryState && state == event.DelegateDeliverySteerAttemptReserved && phasedCommand.DelegateDeliveryPhase != command.DelegateDeliveryPhaseFallbackQueued && !opened && !terminal {
+				// An intent-only reservation is repaired to unknown by the normal
+				// restore path and is never re-admitted. A durable fallback is the
+				// one reservation successor that remains eligible for replay.
+				continue
+			}
+			if !opened && !terminal && (!deliveryState || !delegateDeliveryStateTerminal(state)) {
+				info, known := children[childID]
+				if known && (!phasedCommand.BackgroundHandBack || !info.parent.IsZero()) {
+					copy := phasedCommand
+					plan = append(plan, restoredBackgroundPlan{
+						requestID: requestID,
+						childID:   childID,
+						parentID:  info.parent,
+						name:      info.name,
+						reAdmit:   &copy,
+					})
+				}
+				continue
+			}
+		}
 		resolved, ok := m.getResolved(requestID)
 		if !ok {
 			continue
 		}
-		childID := intents[requestID]
 		if resolved.childID != childID {
 			return nil, &journal.CommandRouteMismatchError{RecordLoopID: resolved.childID, TargetLoopID: childID}
 		}
@@ -452,7 +1026,7 @@ func (m *delegationManager) planRestoredBackgroundRequests(s *Session, records [
 			// private resolution index for diagnostics, but do not invent a parent.
 			continue
 		}
-		entry := restoredBackgroundPlan{requestID: requestID, childID: childID, parentID: info.parent, name: info.name, resolved: resolved}
+		entry := restoredBackgroundPlan{requestID: requestID, childID: childID, parentID: info.parent, name: info.name, resolved: resolved, deliveryStatus: deliveryStatus}
 		if handBack, exists := handBacks[requestID]; exists {
 			if _, done := processed[handBack.commandID]; !done {
 				copy := handBack.command
@@ -474,12 +1048,20 @@ func (m *delegationManager) planRestoredBackgroundRequests(s *Session, records [
 // dispatch and released by the normal parent event path.
 func (m *delegationManager) reconcileRestoredBackgroundRequests(s *Session, plan []restoredBackgroundPlan) {
 	for _, entry := range plan {
+		if entry.reAdmit != nil {
+			m.readmitRestoredBackgroundRequest(s, entry)
+			continue
+		}
 		s.expectTurn(s.sessionCtx, entry.childID)
 		var err error
 		if entry.handBack != nil {
 			err = s.replaySubagentResult(s.sessionCtx, *entry.handBack)
 		} else {
-			err = s.deliverSubagentResult(s.sessionCtx, entry.parentID, entry.childID, backgroundCompletionBlocks(entry.childID, entry.name, entry.requestID, entry.resolved.status, entry.resolved.text))
+			blocks := backgroundCompletionBlocks(entry.childID, entry.name, entry.requestID, entry.resolved.status, entry.resolved.text)
+			if entry.deliveryStatus != "" {
+				blocks = backgroundCompletionBlocksWithState(entry.childID, entry.name, entry.requestID, entry.resolved.status, entry.resolved.text, entry.deliveryStatus, true)
+			}
+			err = s.deliverSubagentResult(s.sessionCtx, entry.parentID, entry.childID, blocks)
 		}
 		if err != nil {
 			// No parent event can release the restored wake token when transport
@@ -489,37 +1071,276 @@ func (m *delegationManager) reconcileRestoredBackgroundRequests(s *Session, plan
 	}
 }
 
-// foldDelegateTerminals correlates every turn's opening request id (TurnStarted's
-// Cause.CommandID) to its terminal (TurnDone answer / TurnFailed / TurnInterrupted). A
-// turn with a zero Cause.CommandID (no correlating submit) is skipped. It mirrors the live
-// delegate drain exactly: only TurnDone.Message is an answer; StepDone is progress.
-func foldDelegateTerminals(events []event.Event) map[uuid.UUID]resolvedRequest {
-	type turnKey struct {
-		loopID    uuid.UUID
-		commandID uuid.UUID
+// readmitRestoredBackgroundRequest sends the exact durable phased command back
+// through the child actor when no event proves that the prior admission crossed
+// an opening/terminal boundary. The transient Accepted channel is recreated only
+// for this in-memory dispatch; it is never written to the journal. The subscription
+// is installed before dispatch so TurnStarted, TurnFoldedInto, or InputCancelled
+// cannot race past the session-owned hand-back drain.
+func (m *delegationManager) readmitRestoredBackgroundRequest(s *Session, entry restoredBackgroundPlan) {
+	if s == nil || entry.reAdmit == nil {
+		return
 	}
-	byTurn := make(map[uuid.UUID]turnKey)
-	out := make(map[uuid.UUID]resolvedRequest)
+	sub, err := s.subscribeLoop(entry.childID)
+	if err != nil {
+		return
+	}
+	backend, ok := s.loopFor(entry.childID)
+	if !ok || backend == nil {
+		_ = sub.Close()
+		return
+	}
+	tracked := m.registerRequest(entry.requestID, entry.childID)
+	if s.hub != nil && entry.reAdmit.BackgroundHandBack {
+		s.expectTurn(s.sessionCtx, entry.childID)
+	}
+	cmd := *entry.reAdmit
+	cmd.Accepted = make(chan error, 1)
+	hook := s.foreignDeliveryHookFor(entry.childID)
+	hookBound := false
+	if hook != nil {
+		if err := hook.observeRestoredCommand(cmd); err != nil {
+			_ = sub.Close()
+			m.removeRequest(entry.requestID, tracked)
+			if s.hub != nil && cmd.BackgroundHandBack {
+				s.cancelExpectTurn(context.Background(), entry.childID)
+			}
+			return
+		}
+		hookBound = true
+	}
+	dispatched := false
+	defer func() {
+		if hookBound && !dispatched {
+			hook.abandon(entry.requestID)
+		}
+	}()
+	select {
+	case backend.CommandSink() <- cmd:
+		dispatched = true
+		// Drain immediately. The actor's acceptance ack is intentionally not
+		// awaited here: the durable command is valid, and the drain observes
+		// the authoritative opening/rejection event without blocking RestoreDone.
+		if cmd.BackgroundHandBack {
+			m.handBackRequest(s, entry.parentID, entry.childID, entry.name, tracked, entry.requestID, sub, nil, true)
+		} else {
+			m.observeRestoredForegroundRequest(s, tracked, entry.requestID, sub)
+		}
+	case <-backend.DoneChan():
+		_ = sub.Close()
+		m.removeRequest(entry.requestID, tracked)
+		if s.hub != nil && entry.reAdmit.BackgroundHandBack {
+			s.cancelExpectTurn(context.Background(), entry.childID)
+		}
+	case <-s.sessionCtx.Done():
+		_ = sub.Close()
+		m.removeRequest(entry.requestID, tracked)
+		if s.hub != nil && entry.reAdmit.BackgroundHandBack {
+			s.cancelExpectTurn(context.Background(), entry.childID)
+		}
+	}
+}
+
+// observeRestoredForegroundRequest keeps only the session-owned lifecycle tracker
+// for a foreground phased command. A caller that was waiting before the crash is
+// gone, so restore must never manufacture a parent SubagentResult; the tracker is
+// removed when the child opens/terminates the request or the session shuts down.
+func (m *delegationManager) observeRestoredForegroundRequest(s *Session, tracked *requestTracker, requestID uuid.UUID, sub event.Subscription) {
+	go func() {
+		defer func() { _ = sub.Close() }()
+		defer m.removeRequest(requestID, tracked)
+		_, _ = drainDelegateAnswerObservedWithDisposition(s.sessionCtx, sub, requestID, nil, tracked.markOpening)
+		tracked.markTerminal()
+	}()
+}
+
+// foldDelegateTerminals preserves the historical map-only helper for focused live
+// correlation tests. Restore uses foldDelegateTerminalsChecked so contradictory
+// durable histories fail closed instead of silently taking the last write.
+func foldDelegateTerminals(events []event.Event) map[uuid.UUID]resolvedRequest {
+	terminals, _ := foldDelegateTerminalsChecked(events)
+	return terminals
+}
+
+// foldDelegateTerminalsChecked correlates every turn's opening and folded request
+// ids to its terminal (TurnDone answer / TurnFailed / TurnInterrupted). It rejects
+// a request mapped to multiple turns, a turn id routed to multiple loops, and
+// incompatible terminal events. InputQueued is deliberately ignored; it is an
+// ephemeral admission hint and does not prove that a request reached a turn.
+func foldDelegateTerminalsChecked(events []event.Event, expectedSessionIDs ...uuid.UUID) (map[uuid.UUID]resolvedRequest, error) {
+	var expectedSessionID uuid.UUID
+	if len(expectedSessionIDs) > 0 {
+		expectedSessionID = expectedSessionIDs[0]
+	}
+	type turnKey struct {
+		loopID uuid.UUID
+		turnID uuid.UUID
+	}
+	type terminalObservation struct {
+		kind string
+		text string
+	}
+	type turnLifecycle struct {
+		started  bool
+		terminal bool
+	}
+	byTurn := make(map[turnKey]map[uuid.UUID]struct{})
+	requestTurns := make(map[uuid.UUID]turnKey)
+	turnOwners := make(map[uuid.UUID]uuid.UUID)
+	terminalOwners := make(map[uuid.UUID]uuid.UUID)
+	lifecycle := make(map[turnKey]turnLifecycle)
+	terminals := make(map[turnKey]terminalObservation)
+	validateSession := func(actual, requestID uuid.UUID) error {
+		if expectedSessionID.IsZero() || actual.IsZero() || actual == expectedSessionID {
+			return nil
+		}
+		return &delegateRestoreContradictionError{requestID: requestID, reason: "delegate evidence session mismatch"}
+	}
+	validateRoute := func(key turnKey) error {
+		if priorLoop, exists := turnOwners[key.turnID]; exists && priorLoop != key.loopID {
+			return &journal.CommandRouteMismatchError{RecordLoopID: key.loopID, TargetLoopID: priorLoop}
+		}
+		if priorLoop, exists := terminalOwners[key.turnID]; exists && priorLoop != key.loopID {
+			return &journal.CommandRouteMismatchError{RecordLoopID: key.loopID, TargetLoopID: priorLoop}
+		}
+		turnOwners[key.turnID] = key.loopID
+		return nil
+	}
+	addRequest := func(key turnKey, requestID uuid.UUID) error {
+		if !requestID.IsZero() {
+			if prior, exists := requestTurns[requestID]; exists && prior != key {
+				return &delegateRestoreContradictionError{requestID: requestID, reason: "request belongs to multiple turns"}
+			}
+			requestTurns[requestID] = key
+		}
+		requests := byTurn[key]
+		if requests == nil {
+			requests = make(map[uuid.UUID]struct{})
+			byTurn[key] = requests
+		}
+		if !requestID.IsZero() {
+			requests[requestID] = struct{}{}
+		}
+		return nil
+	}
+	addStarted := func(key turnKey, requestID uuid.UUID) error {
+		if err := validateRoute(key); err != nil {
+			return err
+		}
+		state := lifecycle[key]
+		if state.terminal {
+			return &delegateRestoreContradictionError{requestID: requestID, reason: "turn opening appears after terminal"}
+		}
+		if state.started {
+			return &delegateRestoreContradictionError{requestID: requestID, reason: "turn has multiple TurnStarted openings"}
+		}
+		state.started = true
+		lifecycle[key] = state
+		return addRequest(key, requestID)
+	}
+	addFolded := func(key turnKey, requestID uuid.UUID) error {
+		if err := validateRoute(key); err != nil {
+			return err
+		}
+		state := lifecycle[key]
+		if !state.started {
+			return &delegateRestoreContradictionError{requestID: requestID, reason: "turn fold appears before TurnStarted opening"}
+		}
+		if state.terminal {
+			return &delegateRestoreContradictionError{requestID: requestID, reason: "turn fold appears after terminal"}
+		}
+		return addRequest(key, requestID)
+	}
+	observeTerminal := func(key turnKey, observation terminalObservation) error {
+		if err := validateRoute(key); err != nil {
+			return err
+		}
+		state := lifecycle[key]
+		if !state.started {
+			return &delegateRestoreContradictionError{reason: "turn terminal appears before TurnStarted opening"}
+		}
+		if state.terminal {
+			reason := "turn has duplicate terminal events"
+			if prior, exists := terminals[key]; exists && prior != observation {
+				reason = "turn has incompatible terminal events"
+			}
+			for requestID := range byTurn[key] {
+				return &delegateRestoreContradictionError{requestID: requestID, reason: reason}
+			}
+			return &delegateRestoreContradictionError{reason: reason}
+		}
+		state.terminal = true
+		lifecycle[key] = state
+		terminalOwners[key.turnID] = key.loopID
+		terminals[key] = observation
+		return nil
+	}
 	for _, ev := range events {
 		switch e := ev.(type) {
 		case event.TurnStarted:
-			byTurn[e.Coordinates.TurnID] = turnKey{loopID: e.Coordinates.LoopID, commandID: e.Cause.CommandID}
+			if err := validateSession(e.SessionID, e.Cause.CommandID); err != nil {
+				return nil, err
+			}
+			key := turnKey{loopID: e.Coordinates.LoopID, turnID: e.Coordinates.TurnID}
+			if err := addStarted(key, e.Cause.CommandID); err != nil {
+				return nil, err
+			}
+		case event.TurnFoldedInto:
+			if err := validateSession(e.SessionID, e.Cause.CommandID); err != nil {
+				return nil, err
+			}
+			key := turnKey{loopID: e.Coordinates.LoopID, turnID: e.Coordinates.TurnID}
+			if err := addFolded(key, e.Cause.CommandID); err != nil {
+				return nil, err
+			}
 		case event.TurnDone:
-			if k, ok := byTurn[e.Coordinates.TurnID]; ok && !k.commandID.IsZero() {
-				text := aiText(e.Message)
-				out[k.commandID] = resolvedRequest{childID: k.loopID, status: tool.DelegateStatusCompleted, text: text}
+			if err := validateSession(e.SessionID, uuid.UUID{}); err != nil {
+				return nil, err
+			}
+			key := turnKey{loopID: e.Coordinates.LoopID, turnID: e.Coordinates.TurnID}
+			if err := observeTerminal(key, terminalObservation{kind: "done", text: aiText(e.Message)}); err != nil {
+				return nil, err
 			}
 		case event.TurnFailed:
-			if k, ok := byTurn[e.Coordinates.TurnID]; ok && !k.commandID.IsZero() {
-				out[k.commandID] = resolvedRequest{childID: k.loopID, status: tool.DelegateStatusFailed, text: delegateFailureDetail(e.Err)}
+			if err := validateSession(e.SessionID, uuid.UUID{}); err != nil {
+				return nil, err
+			}
+			key := turnKey{loopID: e.Coordinates.LoopID, turnID: e.Coordinates.TurnID}
+			if err := observeTerminal(key, terminalObservation{kind: "failed", text: delegateFailureDetail(e.Err)}); err != nil {
+				return nil, err
 			}
 		case event.TurnInterrupted:
-			if k, ok := byTurn[e.Coordinates.TurnID]; ok && !k.commandID.IsZero() {
-				out[k.commandID] = resolvedRequest{childID: k.loopID, status: tool.DelegateStatusInterrupted}
+			if err := validateSession(e.SessionID, uuid.UUID{}); err != nil {
+				return nil, err
+			}
+			key := turnKey{loopID: e.Coordinates.LoopID, turnID: e.Coordinates.TurnID}
+			if err := observeTerminal(key, terminalObservation{kind: "interrupted"}); err != nil {
+				return nil, err
 			}
 		}
 	}
-	return out
+	out := make(map[uuid.UUID]resolvedRequest)
+	for key, requests := range byTurn {
+		terminal, ok := terminals[key]
+		if !ok {
+			continue
+		}
+		for requestID := range requests {
+			resolved := resolvedRequest{childID: key.loopID}
+			switch terminal.kind {
+			case "done":
+				resolved.status = tool.DelegateStatusCompleted
+				resolved.text = terminal.text
+			case "failed":
+				resolved.status = tool.DelegateStatusFailed
+				resolved.text = terminal.text
+			case "interrupted":
+				resolved.status = tool.DelegateStatusInterrupted
+			}
+			out[requestID] = resolved
+		}
+	}
+	return out, nil
 }
 
 // attach binds the live session so scoped controllers can spawn and address children.
@@ -573,7 +1394,9 @@ func delegateExtraTools(def loop.Definition, manager *delegationManager) []tool.
 
 // controllerFor builds the parent-scoped controller injected into one loop's atomic
 // agent-tool bundle. The allowed delegate set and delegation style are derived from the PARENT
-// definition (least privilege). It tolerates a nil manager receiver so a struct-literal
+// definition (least privilege). The collaboration broker resolves this exact
+// controller from the originating loop; its bearer capability never widens the
+// direct-child set. It tolerates a nil manager receiver so a struct-literal
 // session with no delegation manager can still bind loops that carry no agent tools.
 func (m *delegationManager) controllerFor(parentLoopID uuid.UUID, parent loop.Definition) tool.DelegateController {
 	allowed := make(map[identity.AgentName]struct{})
@@ -600,6 +1423,8 @@ type requestTracker struct {
 
 	mu        sync.Mutex
 	lifecycle requestLifecycle
+	opening   tool.DelegateDeliveryStatus
+	delivery  tool.DelegateDeliveryStatus
 }
 
 type requestLifecycle uint8
@@ -616,6 +1441,52 @@ func (p *requestTracker) markActive() {
 		p.lifecycle = requestActive
 	}
 	p.mu.Unlock()
+}
+
+func (p *requestTracker) markOpening(status tool.DelegateDeliveryStatus) {
+	if status != tool.DelegateDeliveryQueued && status != tool.DelegateDeliveryInjected {
+		return
+	}
+	p.mu.Lock()
+	if p.opening == "" {
+		p.opening = status
+	}
+	if p.delivery == "" {
+		p.delivery = status
+	}
+	if p.lifecycle == requestQueued {
+		p.lifecycle = requestActive
+	}
+	p.mu.Unlock()
+}
+
+func (p *requestTracker) openingStatus() tool.DelegateDeliveryStatus {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.opening == "" {
+		return p.delivery
+	}
+	return p.opening
+}
+
+func (p *requestTracker) markDelivery(status tool.DelegateDeliveryStatus) {
+	if p == nil || status == "" {
+		return
+	}
+	p.mu.Lock()
+	if p.delivery == "" || p.delivery == tool.DelegateDeliveryAcceptedPending {
+		p.delivery = status
+	}
+	p.mu.Unlock()
+}
+
+func (p *requestTracker) deliveryStatus() tool.DelegateDeliveryStatus {
+	if p == nil {
+		return ""
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.delivery
 }
 
 func (p *requestTracker) markTerminal() {
@@ -678,15 +1549,18 @@ func (m *delegationManager) removeRequest(requestID uuid.UUID, tracked *requestT
 // handBackRequest starts the session-owned drain for one background response. The drain
 // runs on the session lifetime, not the parent tool-call context. Its only terminal
 // delivery is a machine-originated SubagentResult to the direct parent.
-func (m *delegationManager) handBackRequest(s *Session, parentID, childID uuid.UUID, name string, tracked *requestTracker, requestID uuid.UUID, sub event.Subscription, timeoutSeconds *int) {
+func (m *delegationManager) handBackRequest(s *Session, parentID, childID uuid.UUID, name string, tracked *requestTracker, requestID uuid.UUID, sub event.Subscription, timeoutSeconds *int, suppressInterrupt bool) {
 	go func() {
-		defer func() { _ = sub.Close() }()
-		defer m.removeRequest(requestID, tracked)
 		waitCtx, cancel := waitContext(s.sessionCtx, timeoutSeconds)
 		defer cancel()
-		text, err := drainDelegateAnswerObserved(waitCtx, sub, requestID, func() {
-			_, _ = s.cancelDelegateRequest(childID, requestID)
-		}, tracked.markActive)
+		var interrupt func()
+		if !suppressInterrupt {
+			interrupt = func() {
+				_, _ = s.cancelDelegateRequest(childID, requestID)
+			}
+		}
+		text, err := drainDelegateAnswerObservedWithDisposition(waitCtx, sub, requestID, interrupt, tracked.markOpening)
+		observerExpired := drainObserverExpired(err)
 		status := statusFromDrain(err)
 		if status == tool.DelegateStatusInterrupted && didTimeout(timeoutSeconds, waitCtx) {
 			status = tool.DelegateStatusTimedOut
@@ -694,12 +1568,31 @@ func (m *delegationManager) handBackRequest(s *Session, parentID, childID uuid.U
 		if status == tool.DelegateStatusFailed && text == "" {
 			text = delegateFailureDetail(err)
 		}
-		tracked.markTerminal()
-		if err := s.deliverSubagentResult(s.sessionCtx, parentID, childID, backgroundCompletionBlocks(childID, name, requestID, status, text)); err != nil {
+		var blocks []content.Block
+		if suppressInterrupt {
+			deliveryStatus := tracked.openingStatus()
+			if deliveryStatus == "" && observerExpired {
+				deliveryStatus = tool.DelegateDeliveryAcceptedPending
+			}
+			blocks = backgroundCompletionBlocksWithState(childID, name, requestID, status, text, deliveryStatus, observerExpired)
+		} else {
+			blocks = backgroundCompletionBlocks(childID, name, requestID, status, text)
+		}
+		if err := s.deliverSubagentResult(s.sessionCtx, parentID, childID, blocks); err != nil {
 			// No parent event can release the hand-back token when dispatch itself is
 			// impossible (session shutdown, parent exit, or command-id failure).
 			s.cancelExpectTurn(context.Background(), childID)
 		}
+		if suppressInterrupt && observerExpired {
+			// The parent observer has expired, but the accepted native request is
+			// still live. Keep the session-owned tracker and subscription until an
+			// opening/terminal event resolves it so status cannot regress to idle.
+			m.observeRestoredForegroundRequest(s, tracked, requestID, sub)
+			return
+		}
+		tracked.markTerminal()
+		_ = sub.Close()
+		m.removeRequest(requestID, tracked)
 	}()
 }
 
@@ -715,6 +1608,23 @@ func (m *delegationManager) pendingCount(childID uuid.UUID) int {
 		}
 	}
 	return count
+}
+
+// hasNonterminalRequest exposes only the session-owned mechanical fact needed by
+// status snapshots. A retained native request keeps its child working after a
+// caller's observer expires, until the authoritative child event resolves it.
+func (m *delegationManager) hasNonterminalRequest(childID uuid.UUID) bool {
+	if m == nil {
+		return false
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, request := range m.requests {
+		if request.childID == childID && !request.terminal() {
+			return true
+		}
+	}
+	return false
 }
 
 // scopedController is the parent-scoped tool.DelegateController for one live parent
@@ -1141,17 +2051,98 @@ func (c *scopedController) status(s *Session, req tool.DelegateRequest) (tool.De
 	return tool.DelegateResult{Agents: agents, Truncated: truncated}, nil
 }
 
+func waitForeignDeliveryStatus(s *Session, hook *foreignDeliveryHook, requestID uuid.UUID) tool.DelegateDeliveryStatus {
+	if s == nil || hook == nil {
+		return ""
+	}
+	base := s.sessionCtx
+	if base == nil {
+		base = context.Background()
+	}
+	// The actor owns the bounded delivery adjudication deadline. Until it emits
+	// a concrete terminal phase, this observer must retain accepted-pending
+	// state; a session shutdown merely ends observation and is not provider
+	// evidence of Unknown.
+	return hook.waitDeliveryStatus(base, requestID)
+}
+
+func (c *scopedController) categoricalForeignResult(s *Session, childID, requestID uuid.UUID, status tool.DelegateDeliveryStatus, name string) tool.DelegateResult {
+	result := c.agentResult(s, childID)
+	result.CorrelationID = requestID
+	result.State = tool.AgentStateWorking
+	result.DeliveryStatus = status
+	result.ResponseStatus = tool.DelegateResponseUnknown
+	if name != "" {
+		result.Name = name
+	}
+	return result
+}
+
 // resolveOrQueue receives the tracker installed during admission, then either returns
 // the foreground response or starts the automatic durable parent hand-back.
 func (c *scopedController) resolveOrQueue(ctx context.Context, s *Session, childID, requestID uuid.UUID, sub event.Subscription, tracked *requestTracker, req tool.DelegateRequest) (tool.DelegateResult, error) {
+	foreignHook := s.foreignDeliveryHookFor(childID)
+	foreignMessage := req.Operation == tool.DelegateSend && foreignHook != nil
+	if foreignMessage {
+		if req.WaitForResponse {
+			return c.resolveForeignForeground(ctx, s, childID, requestID, tracked, sub, req, foreignHook)
+		}
+		return c.resolveForeignBackground(s, childID, requestID, tracked, sub, req, foreignHook)
+	}
 	if req.WaitForResponse {
-		defer func() { _ = sub.Close() }()
-		defer c.manager.removeRequest(requestID, tracked)
 		waitCtx, cancel := waitContext(ctx, req.TimeoutSeconds)
 		defer cancel()
-		text, err := drainDelegateAnswerObserved(waitCtx, sub, requestID, func() {
-			_, _ = s.cancelDelegateRequest(childID, requestID)
-		}, tracked.markActive)
+		var deliveryStatus tool.DelegateDeliveryStatus
+		if foreignMessage {
+			// Delivery adjudication is session-owned. If the caller's response
+			// observer expires first, the actor continues and the result retains
+			// an accepted-pending disposition rather than retracting the request.
+			deliveryCh := make(chan tool.DelegateDeliveryStatus, 1)
+			go func() { deliveryCh <- waitForeignDeliveryStatus(s, foreignHook, requestID) }()
+			select {
+			case deliveryStatus = <-deliveryCh:
+				if deliveryStatus == "" && s.sessionCtx != nil && s.sessionCtx.Err() != nil {
+					// Session shutdown ended observation before the actor emitted a
+					// terminal phase. Preserve the accepted request as pending; the
+					// observer boundary is not provider Unknown evidence.
+					deliveryStatus = tool.DelegateDeliveryAcceptedPending
+					tracked.markDelivery(deliveryStatus)
+					tracked.markTerminal()
+					_ = sub.Close()
+					c.manager.removeRequest(requestID, tracked)
+					return c.categoricalForeignResult(s, childID, requestID, deliveryStatus, req.Name), nil
+				}
+			case <-waitCtx.Done():
+				deliveryStatus = tracked.deliveryStatus()
+				if deliveryStatus == "" {
+					deliveryStatus = foreignHook.deliveryStatus(requestID)
+				}
+				if deliveryStatus == "" {
+					deliveryStatus = tool.DelegateDeliveryAcceptedPending
+				}
+			}
+			tracked.markDelivery(deliveryStatus)
+			if deliveryStatus == tool.DelegateDeliveryUnknown || deliveryStatus == tool.DelegateDeliveryUntrackable {
+				tracked.markTerminal()
+				_ = sub.Close()
+				c.manager.removeRequest(requestID, tracked)
+				return c.categoricalForeignResult(s, childID, requestID, deliveryStatus, req.Name), nil
+			}
+		}
+		var interrupt func()
+		nativeMessage := req.Operation == tool.DelegateSend && s.nativeDelegateLoop(childID)
+		if !nativeMessage && !foreignMessage {
+			interrupt = func() {
+				_, _ = s.cancelDelegateRequest(childID, requestID)
+			}
+		}
+		var text string
+		var err error
+		if nativeMessage || foreignMessage {
+			text, err = drainDelegateAnswerObservedWithDisposition(waitCtx, sub, requestID, interrupt, tracked.markOpening)
+		} else {
+			text, err = drainDelegateAnswerObserved(waitCtx, sub, requestID, interrupt, tracked.markActive)
+		}
 		status := statusFromDrain(err)
 		if status == tool.DelegateStatusInterrupted && didTimeout(req.TimeoutSeconds, waitCtx) {
 			status = tool.DelegateStatusTimedOut
@@ -1159,8 +2150,25 @@ func (c *scopedController) resolveOrQueue(ctx context.Context, s *Session, child
 		if status == tool.DelegateStatusFailed && text == "" {
 			text = delegateFailureDetail(err)
 		}
-		tracked.markTerminal()
+		observerExpired := drainObserverExpired(err)
+		if observerExpired && nativeMessage {
+			c.manager.observeRestoredForegroundRequest(s, tracked, requestID, sub)
+		} else {
+			tracked.markTerminal()
+			_ = sub.Close()
+			c.manager.removeRequest(requestID, tracked)
+		}
 		result := c.responseResult(s, childID, requestID, status, text)
+		if observerExpired {
+			result.State = tool.AgentStateWorking
+		}
+		if nativeMessage || foreignMessage {
+			openingStatus := tracked.openingStatus()
+			if openingStatus == "" && observerExpired {
+				openingStatus = tool.DelegateDeliveryAcceptedPending
+			}
+			result.DeliveryStatus = openingStatus
+		}
 		if req.Name != "" {
 			result.Name = req.Name
 		}
@@ -1170,10 +2178,33 @@ func (c *scopedController) resolveOrQueue(ctx context.Context, s *Session, child
 	if name == "" {
 		name = c.agentSnapshot(s, childID).Name
 	}
-	c.manager.handBackRequest(s, c.parentLoopID, childID, name, tracked, requestID, sub, req.TimeoutSeconds)
+	deliveryStatus := tool.DelegateDeliveryStatus("")
+	if foreignMessage {
+		deliveryStatus = waitForeignDeliveryStatus(s, foreignHook, requestID)
+		if deliveryStatus == "" {
+			deliveryStatus = tool.DelegateDeliveryAcceptedPending
+		}
+		tracked.markDelivery(deliveryStatus)
+	} else if req.Operation == tool.DelegateSend && s.nativeDelegateLoop(childID) {
+		deliveryStatus = tool.DelegateDeliveryAcceptedPending
+	}
+	if foreignMessage && (deliveryStatus == tool.DelegateDeliveryUnknown || deliveryStatus == tool.DelegateDeliveryUntrackable) {
+		if err := s.deliverSubagentResult(s.sessionCtx, c.parentLoopID, childID,
+			backgroundCompletionBlocksWithState(childID, name, requestID, tool.DelegateStatusUnknown, "", deliveryStatus, true)); err != nil {
+			s.cancelExpectTurn(context.Background(), childID)
+		}
+		tracked.markTerminal()
+		_ = sub.Close()
+		c.manager.removeRequest(requestID, tracked)
+		return c.categoricalForeignResult(s, childID, requestID, deliveryStatus, name), nil
+	}
+	c.manager.handBackRequest(s, c.parentLoopID, childID, name, tracked, requestID, sub, req.TimeoutSeconds, req.Operation == tool.DelegateSend && (s.nativeDelegateLoop(childID) || foreignMessage))
 	result := c.agentResult(s, childID)
 	result.CorrelationID = requestID
 	result.State = tool.AgentStateWorking
+	if deliveryStatus != "" {
+		result.DeliveryStatus = deliveryStatus
+	}
 	if req.Name != "" {
 		result.Name = req.Name
 	}
@@ -1184,7 +2215,8 @@ type backgroundCompletionEnvelope struct {
 	AgentID        string                      `json:"agent_id"`
 	Name           string                      `json:"name"`
 	State          tool.AgentState             `json:"state"`
-	ResponseStatus tool.DelegateResponseStatus `json:"response_status"`
+	DeliveryStatus tool.DelegateDeliveryStatus `json:"delivery_status,omitempty"`
+	ResponseStatus tool.DelegateResponseStatus `json:"response_status,omitempty"`
 	CorrelationID  string                      `json:"correlation_id"`
 	Response       string                      `json:"response"`
 }
@@ -1208,9 +2240,21 @@ func decodeBackgroundCompletion(blocks []content.Block) (backgroundCompletionEnv
 // delivered to a parent. Correlation stays internal to durable orchestration: agent
 // tools never expose or accept it, while the persisted SubagentResult blocks retain it
 // for restore-time idempotence.
-func backgroundCompletionBlocks(agentID uuid.UUID, name string, correlationID uuid.UUID, status tool.DelegateStatusValue, response string) []content.Block {
+func backgroundCompletionBlocks(agentID uuid.UUID, name string, correlationID uuid.UUID, status tool.DelegateStatusValue, response string, deliveryStatus ...tool.DelegateDeliveryStatus) []content.Block {
+	var disposition tool.DelegateDeliveryStatus
+	if len(deliveryStatus) > 0 {
+		disposition = deliveryStatus[0]
+	}
+	return backgroundCompletionBlocksWithState(agentID, name, correlationID, status, response, disposition, false)
+}
+
+func backgroundCompletionBlocksWithState(agentID uuid.UUID, name string, correlationID uuid.UUID, status tool.DelegateStatusValue, response string, disposition tool.DelegateDeliveryStatus, working bool) []content.Block {
+	state := tool.AgentStateIdle
+	if working {
+		state = tool.AgentStateWorking
+	}
 	envelope := backgroundCompletionEnvelope{
-		AgentID: agentID.String(), Name: boundUTF8(name, 4096), State: tool.AgentStateIdle,
+		AgentID: agentID.String(), Name: boundUTF8(name, 4096), State: state, DeliveryStatus: disposition,
 		ResponseStatus: responseStatus(status), CorrelationID: correlationID.String(),
 	}
 	response = boundUTF8(response, maxDelegateOutputBytes)
@@ -1474,6 +2518,9 @@ func (c *scopedController) childStatus(s *Session, childID uuid.UUID) tool.Deleg
 		return tool.DelegateStatusFailed
 	default:
 	}
+	if c.manager.hasNonterminalRequest(childID) {
+		return tool.DelegateStatusRunning
+	}
 	return handle.mechanicalState()
 }
 
@@ -1561,9 +2608,19 @@ func runtimeEffortString(value inferencemodel.Effort) string {
 	return string(value)
 }
 
-// sendDelegate enqueues a distinct NON-FOLDING follow-up turn on an existing owned
-// child. It subscribes BEFORE the enqueue so the correlated turn's opening event is
-// never missed.
+// nativeDelegateLoop reports whether the target uses the in-process native loop.
+// Native MessageAgent sends use the ordinary fold semantics; the legacy
+// non-folding command remains available for foreign or headless seams without a
+// bound native definition.
+func (s *Session) nativeDelegateLoop(loopID uuid.UUID) bool {
+	s.loopsMu.RLock()
+	h := s.loops[loopID]
+	s.loopsMu.RUnlock()
+	return h != nil && h.bound != nil && h.bound.Engine() == loop.EngineNative
+}
+
+// sendDelegate enqueues a follow-up turn on an existing owned child. It subscribes
+// BEFORE the enqueue so the correlated opening event is never missed.
 func (s *Session) sendDelegate(ctx context.Context, childID uuid.UUID, message string, background bool, registerRequest func(requestID, childID uuid.UUID) *requestTracker, removeRequest func(uuid.UUID, *requestTracker)) (requestID uuid.UUID, sub event.Subscription, tracked *requestTracker, err error) {
 	sub, err = s.subscribeLoop(childID)
 	if err != nil {
@@ -1571,7 +2628,7 @@ func (s *Session) sendDelegate(ctx context.Context, childID uuid.UUID, message s
 	}
 	wakeOwned := background
 	if background {
-		s.expectTurn(ctx, childID)
+		s.expectTurn(s.sessionCtx, childID)
 		defer func() {
 			if wakeOwned {
 				s.cancelExpectTurn(context.Background(), childID)
@@ -1599,12 +2656,11 @@ func (s *Session) subscribeLoop(loopID uuid.UUID) (event.Subscription, error) {
 	})
 }
 
-// enqueueDelegateTurn is the internal NON-FOLDING delegate enqueue: a distinct
-// machine-originated turn whose minted command id correlates the child's turn. It submits
-// with NoFold=true, so even a send to a child that is mid-tool-turn NEVER folds into the
-// running turn (the loop actor's drainInbox skips non-folding entries); it queues behind
-// the running turn and starts its OWN distinct turn when that finishes. The public
-// Session.SubmitToLoop keeps its interactive queue/fold semantics (NoFold=false).
+// enqueueDelegateTurn is the internal machine-originated delegate enqueue. Native
+// MessageAgent requests deliberately use NoFold=false so a busy child can fold the
+// request into its current turn; the durable phase marker distinguishes that
+// recovery path. Unknown/foreign-bound seams retain the historical non-folding
+// command.
 func (s *Session) enqueueDelegateTurn(ctx context.Context, loopID uuid.UUID, blocks []content.Block, background bool, registerRequest func(requestID, childID uuid.UUID) *requestTracker, removeRequest func(uuid.UUID, *requestTracker)) (requestID uuid.UUID, tracked *requestTracker, err error) {
 	if err := s.faultIfFaulted(); err != nil {
 		return uuid.UUID{}, nil, err
@@ -1621,38 +2677,74 @@ func (s *Session) enqueueDelegateTurn(ctx context.Context, loopID uuid.UUID, blo
 		return uuid.UUID{}, nil, err
 	}
 	accepted := make(chan error, 1)
+	native := s.nativeDelegateLoop(loopID)
+	deliveryHook := s.foreignDeliveryHookFor(loopID)
+	deliveryIntentPublished := false
 	cmd := command.UserInput{
 		Header:             command.Header{CommandID: id, Agency: identity.AgencyMachine, CreatedAt: s.stampNow()},
 		Blocks:             blocks,
-		NoFold:             true,
+		NoFold:             !native,
 		TargetLoopID:       loopID,
 		BackgroundHandBack: background,
 		Accepted:           accepted,
 	}
-	if err := s.appendDelegateCommand(ctx, loopID, cmd); err != nil {
+	if native || deliveryHook != nil {
+		cmd.DelegateDeliveryPhase = command.DelegateDeliveryPhaseIntent
+	}
+	if deliveryHook != nil {
+		if err := deliveryHook.bindCommand(cmd); err != nil {
+			return uuid.UUID{}, nil, err
+		}
+		if err := deliveryHook.CreateIntent(ctx, foreign.DeliveryIntent{LoopID: loopID, RequestID: id}); err != nil {
+			return uuid.UUID{}, nil, err
+		}
+		deliveryIntentPublished = true
+	} else if err := s.appendDelegateCommand(ctx, loopID, cmd); err != nil {
 		return uuid.UUID{}, nil, err
+	}
+	deliveryCtx := ctx
+	if native || deliveryHook != nil {
+		// Once the intent record is durable, native MessageAgent delivery belongs to
+		// the session, not the caller's observation context. The caller may stop
+		// waiting, but it cannot retract a command whose delivery is in flight.
+		deliveryCtx = s.sessionCtx
 	}
 	tracked = registerRequest(id, loopID)
 	registered := tracked
 	admitted := false
 	defer func() {
 		if !admitted {
+			if deliveryIntentPublished {
+				deliveryHook.abandon(id)
+			}
 			removeRequest(id, registered)
 		}
 	}()
+	if deliveryHook != nil && !deliveryHook.registerDeliveryWaiter(id) {
+		return uuid.UUID{}, nil, &SessionError{Kind: SessionDelegateAdmissionCommitFailed}
+	}
 	select {
 	case backend.CommandSink() <- cmd:
-		canceled, err := awaitDelegateAcceptance(ctx, accepted, backend.DoneChan())
+		var canceled bool
+		if native {
+			canceled, err = awaitNativeDelegateAcceptance(deliveryCtx, accepted, backend.DoneChan())
+		} else {
+			canceled, err = awaitDelegateAcceptance(deliveryCtx, accepted, backend.DoneChan())
+		}
 		if err != nil {
 			return uuid.UUID{}, nil, err
 		}
 		admitted = true
 		if canceled {
+			// awaitDelegateAcceptance reports cancellation only when the caller
+			// won the race before the durable acceptance receive. An accepted
+			// native request therefore never reaches this branch for a post-ack
+			// timeout/cancel, while a true pre-ack cancel still retracts queued work.
 			_, _ = s.cancelDelegateRequest(loopID, id)
 		}
 		return id, tracked, nil
-	case <-ctx.Done():
-		return uuid.UUID{}, nil, &SessionError{Kind: SessionContextDone, Cause: ctx.Err()}
+	case <-deliveryCtx.Done():
+		return uuid.UUID{}, nil, &SessionError{Kind: SessionContextDone, Cause: deliveryCtx.Err()}
 	case <-backend.DoneChan():
 		return uuid.UUID{}, nil, &SessionError{Kind: SessionLoopExited}
 	}
@@ -1682,6 +2774,44 @@ func awaitDelegateAcceptance(ctx context.Context, accepted <-chan error, backend
 					return canceled, &SessionError{Kind: SessionDelegateAdmissionCommitFailed, Cause: acceptErr}
 				}
 				return canceled || ctx.Err() != nil, nil
+			default:
+				return canceled, &SessionError{Kind: SessionLoopExited}
+			}
+		}
+	}
+}
+
+// awaitNativeDelegateAcceptance keeps the native foldable admission boundary
+// distinct from the legacy helper above. If caller cancellation and the ack are
+// ready together, an already-buffered ack wins; cancellation observed before the
+// ack remains eligible for the queued retraction branch in enqueueDelegateTurn.
+func awaitNativeDelegateAcceptance(ctx context.Context, accepted <-chan error, backendDone <-chan struct{}) (canceled bool, err error) {
+	ctxDone := ctx.Done()
+	for {
+		select {
+		case acceptErr := <-accepted:
+			if acceptErr != nil {
+				return canceled, &SessionError{Kind: SessionDelegateAdmissionCommitFailed, Cause: acceptErr}
+			}
+			return canceled, nil
+		case <-ctxDone:
+			select {
+			case acceptErr := <-accepted:
+				if acceptErr != nil {
+					return false, &SessionError{Kind: SessionDelegateAdmissionCommitFailed, Cause: acceptErr}
+				}
+				return false, nil
+			default:
+			}
+			canceled = true
+			ctxDone = nil
+		case <-backendDone:
+			select {
+			case acceptErr := <-accepted:
+				if acceptErr != nil {
+					return canceled, &SessionError{Kind: SessionDelegateAdmissionCommitFailed, Cause: acceptErr}
+				}
+				return canceled, nil
 			default:
 				return canceled, &SessionError{Kind: SessionLoopExited}
 			}
