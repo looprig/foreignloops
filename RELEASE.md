@@ -33,7 +33,6 @@ go mod edit -dropreplace=github.com/looprig/core
 go mod edit -dropreplace=github.com/looprig/inference
 go mod edit -dropreplace=github.com/looprig/storage
 GOWORK=off go mod tidy
-GOWORK=off go mod vendor
 ! rg -n '^[[:space:]]*replace([[:space:]]|\()' go.mod
 
 GOWORK=off go test -count=1 -race ./...
@@ -45,7 +44,7 @@ go mod verify
 # approved offline Go vulnerability database:
 go tool govulncheck ./...
 git diff --check
-git add go.mod go.sum vendor
+git add go.mod go.sum
 git commit -m 'build: prepare Harness release metadata'
 test -z "$(git status --short)"
 ```
@@ -85,19 +84,18 @@ go mod edit -dropreplace=github.com/looprig/harness
 go mod edit -dropreplace=github.com/looprig/inference
 go mod edit -dropreplace=github.com/looprig/storage
 GOWORK=off go mod tidy
-GOWORK=off make vendor
 ! rg -n '^[[:space:]]*replace([[:space:]]|\()' go.mod
 
 make root-check
 make build
-make test GOFLAGS='-mod=vendor -count=1'
+GOWORK=off make test GOFLAGS='-count=1'
 go test -count=1 -tags integration -race ./...
 go test ./driver/claude -run '^$' -fuzz '^FuzzDecodeStreamLine$' -fuzztime=30s
 go test ./driver/claude -run '^$' -fuzz '^FuzzDecodeTranscriptLine$' -fuzztime=30s
 go test ./driver/codex -run '^$' -fuzz '^FuzzDecodeLine$' -fuzztime=30s
 make secure
 git diff --check
-git add go.mod go.sum vendor
+git add go.mod go.sum
 git commit -m 'build: prepare foreignloop release metadata'
 test -z "$(git status --short)"
 ```
