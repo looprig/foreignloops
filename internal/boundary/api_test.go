@@ -41,7 +41,7 @@ func TestBackendAndDriverPublicTopLevelSymbols(t *testing.T) {
 				"BuildRestoredWith", "BuildRestoredWithServices", "BuildWith", "BuildWithServices", "Config", "ConfigError", "ForeignProtocolError",
 				"ForeignPublicationError", "ForeignResultError", "ForeignSessionBusyError", "LockError", "Loop", "New",
 				"SIDLateBound", "SIDMode", "SIDPrebound", "SnapshotContextDone", "SnapshotError",
-				"SnapshotErrorReason", "SnapshotLoopExited",
+				"SnapshotErrorReason", "SnapshotLoopExited", "SnapshotUnsupportedContent",
 			},
 		},
 	}

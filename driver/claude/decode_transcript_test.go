@@ -45,7 +45,12 @@ func transcriptCases() map[string][]content.AgenticMessages {
 			{userMessage("hi there")},
 			{
 				assistantMessage(
-					&content.ThinkingBlock{Thinking: "let me think", Signature: "sig"},
+					// Labelled, not bare: the CLI fronts the Messages API, so the
+					// decoder stamps "anthropic" as the minting dialect. An
+					// unlabelled signature has no provable issuer and is refused
+					// at the wire boundary, so the label is what makes this block
+					// replayable at all.
+					content.NewSignedThinkingBlock("let me think", "sig", "anthropic", nil, ""),
 					&content.TextBlock{Text: "Working"},
 					&content.ToolUseBlock{ID: "toolu_9", Name: "Read", Input: json.RawMessage(`{"path":"/x"}`)},
 				),

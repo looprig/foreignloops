@@ -220,7 +220,7 @@ func (l *Loop) awaitTurn(loopCtx context.Context, cur event.TurnIndex, activeCom
 				return true
 			}
 		case req := <-l.snapshots:
-			req.reply <- snapshotResult{msgs: cloneMessages(l.msgs), turnIndex: l.turnIndex}
+			req.reply <- l.snapshotReply()
 		case input := <-commands:
 			if done, exit := l.handleTurnCommand(loopCtx, input, cur, activeCommandID, turnID, stepID, cancel, pub, mailbox, result, machine); done {
 				return exit

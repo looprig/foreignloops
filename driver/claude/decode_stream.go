@@ -171,7 +171,14 @@ func assistantBlocks(blocks []streamBlock) []content.Block {
 		case blockText:
 			out = append(out, &content.TextBlock{Text: block.Text})
 		case blockThinking:
-			out = append(out, &content.ThinkingBlock{Thinking: block.Thinking, Signature: block.Signature})
+			// Labelled "anthropic": the Claude Code CLI fronts the Messages API,
+			// so a signature in its transcript was minted by that dialect. The
+			// label is what lets these blocks be replayed if the session ever
+			// re-encodes them through anthropicapi — an unlabelled signature has
+			// no provable issuer and is refused at the wire boundary, which
+			// cannot degrade to "unsigned" because an unsigned thinking block is
+			// rejected too.
+			out = append(out, content.NewSignedThinkingBlock(block.Thinking, block.Signature, "anthropic", nil, ""))
 		case blockToolUse:
 			out = append(out, &content.ToolUseBlock{ID: block.ID, Name: block.Name, Input: block.Input})
 		}

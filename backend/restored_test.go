@@ -4,10 +4,12 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"reflect"
 	"sync"
 	"testing"
 
 	"github.com/looprig/core/content"
+	"github.com/looprig/core/content/blocktest"
 	"github.com/looprig/core/uuid"
 	"github.com/looprig/foreignloops/driver"
 	"github.com/looprig/harness/pkg/event"
@@ -214,12 +216,19 @@ func TestRestoreConstructionClonesSnapshotSeed(t *testing.T) {
 		t.Fatal("restored state aliases seed message slice")
 	}
 
-	clone := cloneMessages(state.msgs)
+	clone, err := cloneMessages(state.msgs)
+	if err != nil {
+		t.Fatalf("cloneMessages: %v", err)
+	}
 	clone[0] = aiMessage("mutated clone")
 	if state.msgs[0] != original {
 		t.Fatal("cloneMessages result aliases actor-owned slice")
 	}
-	if cloneMessages(nil) != nil {
+	nilClone, err := cloneMessages(nil)
+	if err != nil {
+		t.Fatalf("cloneMessages(nil): %v", err)
+	}
+	if nilClone != nil {
 		t.Fatal("cloneMessages(nil) must preserve nil")
 	}
 }
@@ -364,6 +373,40 @@ func TestRestoreConstructionDeepClonesSeed(t *testing.T) {
 	assertRichMessagesOriginal(t, state.msgs)
 }
 
+// TestDeepCloneCoversEverySealedBlockVariant is the field- and
+// variant-completeness guard on this module's defensive copy, and it exists
+// here only because the fixture builder moved out of Harness's internal/ tree
+// and into core, beside the union it mirrors. richMessages() below is a
+// hand-written transcript: it exercises the blocks somebody thought of, which
+// is exactly the blind spot that let ProviderState go missing from three
+// clones at once elsewhere in the workspace.
+//
+// blocktest.Blocks is a bijection with the sealed union as content's own source
+// declares it, and every exported field of every fixture is populated by
+// reflection. A variant or a field added to core therefore fails this actor's
+// snapshot copy immediately, instead of being dropped into a foreign loop's
+// transcript where the loss is invisible until a provider rejects the replay.
+func TestDeepCloneCoversEverySealedBlockVariant(t *testing.T) {
+	t.Parallel()
+
+	blocks := blocktest.Blocks(t)
+	messages := content.AgenticMessages{
+		&content.AIMessage{Message: content.Message{Role: content.RoleAssistant, Blocks: blocks}},
+	}
+
+	cloned, err := cloneMessages(messages)
+	if err != nil {
+		t.Fatalf("cloneMessages: %v", err)
+	}
+	if !reflect.DeepEqual(cloned, messages) {
+		t.Fatalf("cloneMessages dropped or altered a field:\n got %#v\nwant %#v", cloned, messages)
+	}
+	got := cloned[0].(*content.AIMessage).Blocks
+	for index, want := range blocks {
+		blocktest.AssertIndependent(t, want, got[index])
+	}
+}
+
 func TestDeepClonePreservesNilAndEmptyShape(t *testing.T) {
 	t.Parallel()
 	emptyBlocks := []content.Block{}
@@ -377,7 +420,10 @@ func TestDeepClonePreservesNilAndEmptyShape(t *testing.T) {
 			&content.AudioBlock{Data: emptyBytes},
 		}}},
 	}
-	cloned := cloneMessages(messages)
+	cloned, err := cloneMessages(messages)
+	if err != nil {
+		t.Fatalf("cloneMessages: %v", err)
+	}
 	if cloned[0] != nil {
 		t.Fatalf("nil conversation cloned as %T", cloned[0])
 	}
@@ -416,6 +462,48 @@ func TestSnapshotDeepClonesActorStateAndOtherSnapshots(t *testing.T) {
 	}
 	assertRichMessagesOriginal(t, second)
 	assertRichMessagesOriginal(t, state.msgs)
+}
+
+// TestSnapshotPreservesRefusalBlocks pins that a model refusal survives the
+// defensive copy as a refusal. A refusal is not assistant text, so folding it
+// into a TextBlock would misreport a declined turn as an answered one; before
+// core/content gained the variant it reached the clone's default arm and killed
+// the actor goroutine.
+func TestSnapshotPreservesRefusalBlocks(t *testing.T) {
+	t.Parallel()
+	seed := foreign.RestoredForeign{ForeignSID: "refusal-snapshot", TurnIndex: 1, Msgs: content.AgenticMessages{
+		&content.AIMessage{Message: content.Message{Role: content.RoleAssistant, Blocks: []content.Block{
+			&content.RefusalBlock{Text: "I will not do that."},
+			&content.ToolResultBlock{ToolUseID: "tool-1", Content: []content.Block{&content.RefusalBlock{Text: "nested refusal"}}},
+		}}},
+	}}
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	built, err := BuildRestoredWith(restoredValidConfig(t))(ctx, mustID(t), mustID(t), loop.Provenance{}, &fakePublisher{}, validBoundDefinition(), seqIDGen(), workingFac(), seed)
+	if err != nil {
+		t.Fatalf("BuildRestoredWith: %v", err)
+	}
+	state := built.(*Loop)
+	t.Cleanup(func() { shutdown(t, state) })
+
+	snapshot, _, err := state.Snapshot(context.Background())
+	if err != nil {
+		t.Fatalf("Snapshot: %v", err)
+	}
+	blocks := snapshot[0].(*content.AIMessage).Blocks
+	refusal, ok := blocks[0].(*content.RefusalBlock)
+	if !ok || refusal.Text != "I will not do that." {
+		t.Fatalf("snapshot block = %#v, want *content.RefusalBlock", blocks[0])
+	}
+	nested, ok := blocks[1].(*content.ToolResultBlock).Content[0].(*content.RefusalBlock)
+	if !ok || nested.Text != "nested refusal" {
+		t.Fatalf("nested snapshot block = %#v, want *content.RefusalBlock", blocks[1].(*content.ToolResultBlock).Content[0])
+	}
+
+	refusal.Text = "mutated"
+	if state.msgs[0].(*content.AIMessage).Blocks[0].(*content.RefusalBlock).Text != "I will not do that." {
+		t.Fatal("snapshot refusal aliases actor-owned state")
+	}
 }
 
 func TestSnapshotPreservesTopLevelNilAndEmptyMessages(t *testing.T) {

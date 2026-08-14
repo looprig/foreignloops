@@ -17,6 +17,7 @@
         "blocks": [
           {
             "Signature": "sig",
+            "SignatureFormat": "anthropic",
             "Thinking": "let me think",
             "type": "thinking"
           },
@@ -75,6 +76,7 @@
         "blocks": [
           {
             "Signature": "sig",
+            "SignatureFormat": "anthropic",
             "Thinking": "let me think",
             "type": "thinking"
           },
@@ -130,6 +132,7 @@
       "blocks": [
         {
           "Signature": "sig",
+          "SignatureFormat": "anthropic",
           "Thinking": "let me think",
           "type": "thinking"
         },

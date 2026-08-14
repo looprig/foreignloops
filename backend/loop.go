@@ -90,7 +90,7 @@ func (l *Loop) run(loopCtx context.Context) {
 		case <-loopCtx.Done():
 			return
 		case req := <-l.snapshots:
-			req.reply <- snapshotResult{msgs: cloneMessages(l.msgs), turnIndex: l.turnIndex}
+			req.reply <- l.snapshotReply()
 		case input := <-l.Commands:
 			switch typed := input.(type) {
 			case command.UserInput:

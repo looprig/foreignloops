@@ -18,12 +18,15 @@ import (
 
 func TestSteeringCapabilityRequiresAdvertisedSafeIdleFallback(t *testing.T) {
 	tests := []struct {
-		name     string
-		harness  Harness
-		nameInfo string
-		version  string
-		meta     string
-		want     bool
+		name string
+		// noAgentInfo omits AgentInfo entirely, the shape an adapter that
+		// declines to identify itself produces.
+		noAgentInfo bool
+		harness     Harness
+		nameInfo    string
+		version     string
+		meta        string
+		want        bool
 	}{
 		{
 			name:     "missing metadata",
@@ -49,12 +52,61 @@ func TestSteeringCapabilityRequiresAdvertisedSafeIdleFallback(t *testing.T) {
 			want:     true,
 		},
 		{
-			name:     "exact Claude exception",
+			// The shape every shipping Claude adapter actually produces:
+			// steering.supported with no idleBehaviors array, because no
+			// adapter advertises an idle behavior upstream yet.
+			name:     "verified Claude version",
 			harness:  HarnessClaudeCode,
 			nameInfo: "@agentclientprotocol/claude-agent-acp",
 			version:  "0.65.0",
 			meta:     `{"steering":{"supported":true}}`,
 			want:     true,
+		},
+		{
+			// Installing the current release must not silently lose
+			// steering: 0.66.0 honors the same promptRequired opt-in and
+			// still does not advertise it.
+			name:     "current Claude version",
+			harness:  HarnessClaudeCode,
+			nameInfo: "@agentclientprotocol/claude-agent-acp",
+			version:  "0.66.0",
+			meta:     `{"steering":{"supported":true}}`,
+			want:     true,
+		},
+		{
+			name:     "first Claude version with the opt-in",
+			harness:  HarnessClaudeCode,
+			nameInfo: "@agentclientprotocol/claude-agent-acp",
+			version:  "0.64.0",
+			meta:     `{"steering":{"supported":true}}`,
+			want:     true,
+		},
+		{
+			// 0.63.0 predates the promptRequired opt-in and answers an
+			// idle steer with startedNewTurn.
+			name:     "Claude version predating the opt-in",
+			harness:  HarnessClaudeCode,
+			nameInfo: "@agentclientprotocol/claude-agent-acp",
+			version:  "0.63.0",
+			meta:     `{"steering":{"supported":true}}`,
+			want:     false,
+		},
+		{
+			// A newer-than-verified version must fail closed, not be
+			// admitted for being newer.
+			name:     "unverified newer Claude version",
+			harness:  HarnessClaudeCode,
+			nameInfo: "@agentclientprotocol/claude-agent-acp",
+			version:  "0.67.0",
+			meta:     `{"steering":{"supported":true}}`,
+			want:     false,
+		},
+		{
+			name:        "Claude without identity and no safe idle",
+			harness:     HarnessClaudeCode,
+			noAgentInfo: true,
+			meta:        `{"steering":{"supported":true}}`,
+			want:        false,
 		},
 		{
 			name:     "unscoped Claude exception rejected",
@@ -79,10 +131,84 @@ func TestSteeringCapabilityRequiresAdvertisedSafeIdleFallback(t *testing.T) {
 			want:     false,
 		},
 		{
-			name:     "current Codex",
+			name:     "known bad Codex",
 			harness:  HarnessCodex,
 			nameInfo: "@agentclientprotocol/codex-acp",
 			version:  "1.1.9",
+			meta:     `{"steering":{"supported":true,"idleBehaviors":["promptRequired"]}}`,
+			want:     false,
+		},
+		{
+			// The whole point of the gate: a newer Codex whose idle race
+			// nobody has verified fixed must stay excluded. An equality
+			// test on one bad version re-enables steering here.
+			name:     "newer unverified Codex",
+			harness:  HarnessCodex,
+			nameInfo: "@agentclientprotocol/codex-acp",
+			version:  "1.2.0",
+			meta:     `{"steering":{"supported":true,"idleBehaviors":["promptRequired"]}}`,
+			want:     false,
+		},
+		{
+			name:     "older Codex below any verified floor",
+			harness:  HarnessCodex,
+			nameInfo: "@agentclientprotocol/codex-acp",
+			version:  "1.1.6",
+			meta:     `{"steering":{"supported":true,"idleBehaviors":["promptRequired"]}}`,
+			want:     false,
+		},
+		{
+			name:     "unparseable Codex version",
+			harness:  HarnessCodex,
+			nameInfo: "@agentclientprotocol/codex-acp",
+			version:  "1.2",
+			meta:     `{"steering":{"supported":true,"idleBehaviors":["promptRequired"]}}`,
+			want:     false,
+		},
+		{
+			name:     "prerelease Codex version",
+			harness:  HarnessCodex,
+			nameInfo: "@agentclientprotocol/codex-acp",
+			version:  "1.2.0-rc1",
+			meta:     `{"steering":{"supported":true,"idleBehaviors":["promptRequired"]}}`,
+			want:     false,
+		},
+		{
+			name:     "empty Codex version",
+			harness:  HarnessCodex,
+			nameInfo: "@agentclientprotocol/codex-acp",
+			version:  "",
+			meta:     `{"steering":{"supported":true,"idleBehaviors":["promptRequired"]}}`,
+			want:     false,
+		},
+		{
+			name:        "Codex without identity",
+			harness:     HarnessCodex,
+			noAgentInfo: true,
+			meta:        `{"steering":{"supported":true,"idleBehaviors":["promptRequired"]}}`,
+			want:        false,
+		},
+		{
+			name:     "legacy unscoped Codex name",
+			harness:  HarnessCodex,
+			nameInfo: "codex-acp",
+			version:  "1.2.0",
+			meta:     `{"steering":{"supported":true,"idleBehaviors":["promptRequired"]}}`,
+			want:     false,
+		},
+		{
+			name:     "unrelated Codex-family adapter",
+			harness:  HarnessCodex,
+			nameInfo: "@example/codex-acp-fork",
+			version:  "9.9.9",
+			meta:     `{"steering":{"supported":true,"idleBehaviors":["promptRequired"]}}`,
+			want:     false,
+		},
+		{
+			name:     "unknown harness",
+			harness:  Harness("gemini"),
+			nameInfo: "@agentclientprotocol/claude-agent-acp",
+			version:  "0.65.0",
 			meta:     `{"steering":{"supported":true,"idleBehaviors":["promptRequired"]}}`,
 			want:     false,
 		},
@@ -94,11 +220,125 @@ func TestSteeringCapabilityRequiresAdvertisedSafeIdleFallback(t *testing.T) {
 			if tt.meta != "" {
 				meta = json.RawMessage(tt.meta)
 			}
-			got := steeringCapability(tt.harness, client.InitializeMetadata{
-				AgentInfo: &protocol.Implementation{Name: tt.nameInfo, Version: tt.version},
-				Meta:      meta,
+			metadata := client.InitializeMetadata{Meta: meta}
+			if !tt.noAgentInfo {
+				metadata.AgentInfo = &protocol.Implementation{Name: tt.nameInfo, Version: tt.version}
+			}
+			got := steeringCapability(tt.harness, metadata)
+			if got != tt.want {
+				t.Fatalf("steeringCapability() = %t, want %t", got, tt.want)
+			}
+		})
+	}
+}
+
+// TestCodexSteeringFloorIsUnsetUntilAFixIsVerified pins the fail-closed
+// default. codexSteeringFloor may only be set once a specific upstream
+// codex-acp release is verified to have fixed the adapter-owned idle turn;
+// until then no Codex adapter, however new, may steer. If this fails because
+// someone set a floor, that is the deliberate change -- update this test and
+// the constant's doc comment together with the evidence.
+func TestCodexSteeringFloorIsUnsetUntilAFixIsVerified(t *testing.T) {
+	if codexSteeringFloor != nil {
+		t.Fatalf("codexSteeringFloor = %v, want nil until a codex-acp release is verified to fix the idle race", codexSteeringFloor)
+	}
+}
+
+// TestCodexSteeringFloorAdmitsOnlyVerifiedVersionsAndAbove proves the gate's
+// shape, not today's value: once a floor is set it admits that version and
+// every later one and rejects everything below it, so the exclusion can no
+// longer evaporate on a routine adapter upgrade the way an equality test did.
+func TestCodexSteeringFloorAdmitsOnlyVerifiedVersionsAndAbove(t *testing.T) {
+	floor := launch.CodexVersion{Major: 1, Minor: 2, Patch: 0}
+	tests := []struct {
+		name    string
+		floor   *launch.CodexVersion
+		version string
+		want    bool
+	}{
+		{name: "no floor rejects the floor version itself", version: "1.2.0"},
+		{name: "no floor rejects a far newer version", version: "99.0.0"},
+		{name: "below floor", floor: &floor, version: "1.1.9"},
+		{name: "far below floor", floor: &floor, version: "0.16.0"},
+		{name: "at floor", floor: &floor, version: "1.2.0", want: true},
+		{name: "patch above floor", floor: &floor, version: "1.2.1", want: true},
+		{name: "minor above floor", floor: &floor, version: "1.3.0", want: true},
+		{name: "major above floor", floor: &floor, version: "2.0.0", want: true},
+		{name: "unparseable above floor", floor: &floor, version: "1.3"},
+		{name: "prerelease at floor", floor: &floor, version: "1.2.0-rc1"},
+		{name: "empty", floor: &floor, version: ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			original := codexSteeringFloor
+			codexSteeringFloor = tt.floor
+			t.Cleanup(func() { codexSteeringFloor = original })
+
+			got := steeringCapability(HarnessCodex, client.InitializeMetadata{
+				AgentInfo: &protocol.Implementation{Name: "@agentclientprotocol/codex-acp", Version: tt.version},
+				Meta:      json.RawMessage(`{"steering":{"supported":true,"idleBehaviors":["promptRequired"]}}`),
 			})
 			if got != tt.want {
+				t.Fatalf("steeringCapability(codex %q, floor %v) = %t, want %t", tt.version, tt.floor, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestCodexSteeringFloorStillRequiresAdvertisementAndIdentity proves the
+// floor only ever narrows: a version at or above it is still rejected when
+// the adapter fails any earlier check.
+func TestCodexSteeringFloorStillRequiresAdvertisementAndIdentity(t *testing.T) {
+	floor := launch.CodexVersion{Major: 1, Minor: 2, Patch: 0}
+	original := codexSteeringFloor
+	codexSteeringFloor = &floor
+	t.Cleanup(func() { codexSteeringFloor = original })
+
+	const aboveFloor = "1.2.0"
+	tests := []struct {
+		name        string
+		noAgentInfo bool
+		agentName   string
+		meta        string
+		want        bool
+	}{
+		{
+			name: "fully admissible", agentName: codexAgentACPName,
+			meta: `{"steering":{"supported":true,"idleBehaviors":["promptRequired"]}}`, want: true,
+		},
+		{name: "no advertisement", agentName: codexAgentACPName},
+		{name: "supported without safe idle", agentName: codexAgentACPName, meta: `{"steering":{"supported":true}}`},
+		{
+			name: "unrecognized idle behavior", agentName: codexAgentACPName,
+			meta: `{"steering":{"supported":true,"idleBehaviors":["queued"]}}`,
+		},
+		{
+			name: "malformed advertisement", agentName: codexAgentACPName,
+			meta: `{"steering":{"supported":true,"idleBehaviors":"promptRequired"}}`,
+		},
+		{
+			name: "no identity", noAgentInfo: true,
+			meta: `{"steering":{"supported":true,"idleBehaviors":["promptRequired"]}}`,
+		},
+		{
+			name: "unscoped name", agentName: "codex-acp",
+			meta: `{"steering":{"supported":true,"idleBehaviors":["promptRequired"]}}`,
+		},
+		{
+			name: "Claude name under the Codex harness", agentName: claudeAgentACPName,
+			meta: `{"steering":{"supported":true,"idleBehaviors":["promptRequired"]}}`,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			metadata := client.InitializeMetadata{}
+			if tt.meta != "" {
+				metadata.Meta = json.RawMessage(tt.meta)
+			}
+			if !tt.noAgentInfo {
+				metadata.AgentInfo = &protocol.Implementation{Name: tt.agentName, Version: aboveFloor}
+			}
+			if got := steeringCapability(HarnessCodex, metadata); got != tt.want {
 				t.Fatalf("steeringCapability() = %t, want %t", got, tt.want)
 			}
 		})

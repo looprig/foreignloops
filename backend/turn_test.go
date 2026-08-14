@@ -257,7 +257,11 @@ func TestHistoryGroupingMatchesClaudeGoldenProjection(t *testing.T) {
 		{&content.UserMessage{Message: content.Message{Role: content.RoleUser, Blocks: []content.Block{&content.TextBlock{Text: "hi there"}}}}},
 		{
 			&content.AIMessage{Message: content.Message{Role: content.RoleAssistant, Blocks: []content.Block{
-				&content.ThinkingBlock{Thinking: "let me think", Signature: "sig"},
+				// Labelled to match what the Claude driver actually decodes: this
+				// projection is compared against that driver's shared golden, so a
+				// bare signature here would assert a shape the decoder no longer
+				// produces.
+				content.NewSignedThinkingBlock("let me think", "sig", "anthropic", nil, ""),
 				&content.TextBlock{Text: "Working"},
 				&content.ToolUseBlock{ID: "toolu_9", Name: "Read", Input: json.RawMessage(`{"path":"/x"}`)},
 			}}},

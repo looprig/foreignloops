@@ -155,13 +155,19 @@ func DefaultScript() Script {
 // ClaudeScript is an alias for DefaultScript.
 func ClaudeScript() Script { return DefaultScript() }
 
-// CodexScript returns a current Codex ACP identity. Current Codex remains
-// steering-disabled in the production driver, making this useful for queued
-// fallback tests.
+// CodexScript returns the current Codex ACP identity. Every Codex version
+// remains steering-disabled in the production driver -- as of 1.2.0 the
+// adapter still answers an idle steer by starting a turn the host cannot
+// correlate -- making this useful for queued fallback tests.
+//
+// The inherited metadata deliberately advertises more than real Codex does
+// (the shipping adapter advertises `steering.supported` with no idle
+// behavior at all), so the fixture proves the driver refuses Codex steering
+// even against the most permissive advertisement it could receive.
 func CodexScript() Script {
 	s := DefaultScript()
 	s.AgentName = "@agentclientprotocol/codex-acp"
-	s.AgentVersion = "1.1.9"
+	s.AgentVersion = "1.2.0"
 	return s
 }
 

@@ -2,6 +2,7 @@ package driver
 
 import (
 	"context"
+	"fmt"
 	"reflect"
 	"testing"
 
@@ -94,6 +95,79 @@ func TestSteerRequestOwnsPromptBlocks(t *testing.T) {
 	if got := request.Prompt(); !reflect.DeepEqual(got, want) {
 		t.Fatalf("SteerRequest.Prompt() = %#v, want %#v", got, want)
 	}
+}
+
+// TestSteerRequestCarriesEveryBlockVariantWhole is steering's copy of the
+// guarantee backend/snapshot.go already carries: a steering prompt is a real
+// message payload, so every sealed content.Block variant must survive the clone
+// with every exported field intact.
+//
+// Two concrete losses this pins. ToolUseBlock's ProviderState /
+// ProviderStateFormat are what let a provider accept the next turn of a tool
+// loop; a struct literal that names only ID/Name/Input drops them silently, and
+// the steering prompt then replays a tool_use the issuing dialect rejects.
+// RefusalBlock had no arm at all, so a prompt containing one was rejected
+// outright as an "unknown type" — a declined turn that cannot be steered.
+//
+// The comparison is reflect.DeepEqual against a separately built expectation
+// with every field populated, not a field-by-field assertion, so a field added
+// to core fails here rather than going unnoticed.
+func TestSteerRequestCarriesEveryBlockVariantWhole(t *testing.T) {
+	blocks := []content.Block{
+		&content.TextBlock{Text: "text"},
+		&content.ImageBlock{MediaType: content.MediaTypeImagePNG, Source: content.ImageSource{URL: "https://example.test/i.png", Data: []byte("image")}},
+		&content.AudioBlock{MediaType: content.MediaTypeAudioWAV, Data: []byte("audio")},
+		&content.DocumentBlock{MediaType: content.MediaTypeDocumentPDF, Name: "doc.pdf", Data: []byte("document"), Text: "document text"},
+		&content.ThinkingBlock{Thinking: "thought", Signature: "sig", ProviderState: []byte(`{"opaque":"thinking"}`), ProviderStateFormat: "anthropic"},
+		&content.ToolUseBlock{ID: "tool-1", Name: "lookup", Input: []byte(`{"path":"p"}`), ProviderState: []byte(`{"opaque":"tooluse"}`), ProviderStateFormat: "anthropic"},
+		&content.RefusalBlock{Text: "I will not do that."},
+		&content.ToolResultBlock{ToolUseID: "tool-1", IsError: true, Content: []content.Block{
+			&content.RefusalBlock{Text: "nested refusal"},
+			&content.ToolUseBlock{ID: "tool-2", Name: "nested", Input: []byte(`{"n":1}`), ProviderState: []byte(`{"opaque":"nested"}`), ProviderStateFormat: "anthropic"},
+		}},
+	}
+
+	request, err := NewSteerRequest(blocks)
+	if err != nil {
+		t.Fatalf("NewSteerRequest() error = %v", err)
+	}
+	got := request.Prompt()
+	if len(got) != len(blocks) {
+		t.Fatalf("SteerRequest.Prompt() returned %d blocks, want %d", len(got), len(blocks))
+	}
+	// Compared per index: %#v on a []content.Block prints only pointers, and a
+	// dropped field has to name itself to be worth pinning.
+	for i := range blocks {
+		if !reflect.DeepEqual(got[i], blocks[i]) {
+			t.Errorf("prompt[%d] = %s, want %s", i, blockString(got[i]), blockString(blocks[i]))
+		}
+	}
+	if t.Failed() {
+		t.FailNow()
+	}
+
+	// Every byte-backed field must be a copy, not a view. Mutating the source
+	// after construction proves it for the retained value; mutating one
+	// snapshot proves it for the next.
+	blocks[5].(*content.ToolUseBlock).ProviderState[2] = 'X'
+	blocks[7].(*content.ToolResultBlock).Content[1].(*content.ToolUseBlock).ProviderState[2] = 'X'
+	snapshot := request.Prompt()
+	if got := string(snapshot[5].(*content.ToolUseBlock).ProviderState); got != `{"opaque":"tooluse"}` {
+		t.Fatalf("retained tool_use provider state = %s; the clone aliases the caller's bytes", got)
+	}
+	if got := string(snapshot[7].(*content.ToolResultBlock).Content[1].(*content.ToolUseBlock).ProviderState); got != `{"opaque":"nested"}` {
+		t.Fatalf("retained nested tool_use provider state = %s; the clone aliases the caller's bytes", got)
+	}
+	snapshot[5].(*content.ToolUseBlock).ProviderState[2] = 'Y'
+	if got := string(request.Prompt()[5].(*content.ToolUseBlock).ProviderState); got != `{"opaque":"tooluse"}` {
+		t.Fatalf("second snapshot provider state = %s; snapshots share backing arrays", got)
+	}
+}
+
+// blockString renders a block's VALUE rather than its pointer, so a diff names
+// the field that was dropped.
+func blockString(block content.Block) string {
+	return fmt.Sprintf("%T%+v", block, reflect.ValueOf(block).Elem().Interface())
 }
 
 func TestSteerRequestRejectsMissingPrompt(t *testing.T) {

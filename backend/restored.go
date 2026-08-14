@@ -73,6 +73,10 @@ func newRestoredStateWithServices(
 	if err := validateRestoredSeed(seed); err != nil {
 		return nil, err
 	}
+	msgs, err := cloneMessages(seed.Msgs)
+	if err != nil {
+		return nil, err
+	}
 	return &Loop{
 		Commands:   make(chan command.Command),
 		Done:       make(chan struct{}),
@@ -87,7 +91,7 @@ func newRestoredStateWithServices(
 		idGen:      idGen,
 		fac:        fac,
 		services:   cloneServices(services),
-		msgs:       cloneMessages(seed.Msgs),
+		msgs:       msgs,
 		turnIndex:  seed.TurnIndex,
 		hasSpawned: true,
 		sidBound:   true,

@@ -7,6 +7,12 @@ import (
 	"github.com/looprig/foreignloops/driver"
 )
 
+// errUnsupportedContent is the sentinel behind every deep-copy refusal. The
+// content vocabulary is sealed upstream, so this only fires when a variant is
+// added there and not absorbed here; the copy fails closed rather than
+// panicking on the actor goroutine or aliasing actor-owned memory.
+var errUnsupportedContent = errors.New("foreignloop: unsupported content")
+
 // ConfigError reports invalid backend composition or runtime wiring.
 type ConfigError struct{ Field, Reason string }
 
@@ -111,8 +117,12 @@ func (e *ForeignPublicationError) Unwrap() error {
 type SnapshotErrorReason string
 
 const (
-	SnapshotLoopExited  SnapshotErrorReason = "loop_exited"
-	SnapshotContextDone SnapshotErrorReason = "context_done"
+	SnapshotLoopExited SnapshotErrorReason = "loop_exited"
+	// SnapshotUnsupportedContent means the committed state holds a content
+	// value this module's deep copy does not recognize, so no consistent
+	// defensive view can be produced.
+	SnapshotUnsupportedContent SnapshotErrorReason = "unsupported_content"
+	SnapshotContextDone        SnapshotErrorReason = "context_done"
 )
 
 // SnapshotError reports that the backend could not return a consistent view of
@@ -126,6 +136,11 @@ func (e *SnapshotError) Error() string {
 	switch e.Reason {
 	case SnapshotLoopExited:
 		return "foreignloop: snapshot failed: loop exited"
+	case SnapshotUnsupportedContent:
+		if e.Cause != nil {
+			return "foreignloop: snapshot failed: " + e.Cause.Error()
+		}
+		return "foreignloop: snapshot failed: unsupported content"
 	case SnapshotContextDone:
 		if e.Cause != nil {
 			return "foreignloop: snapshot failed: context done: " + e.Cause.Error()

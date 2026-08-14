@@ -70,58 +70,70 @@ func cloneSteerBlocks(blocks []content.Block, depth int, active map[*content.Too
 
 const maxSteerBlockDepth = 64
 
+// cloneSteerBlock deep-copies one sealed content.Block variant.
+//
+// Every arm is a STRUCT COPY plus an explicit copy of each byte-backed field,
+// matching backend/snapshot.go's cloneBlock. A struct literal that names fields
+// one by one is blind to a field core adds later: the code still compiles, the
+// existing tests still pass, and the new field is silently gone. That is
+// precisely how the tool_use arm here lost ProviderState/ProviderStateFormat —
+// the provider-opaque continuation state without which the next turn of a tool
+// loop is rejected by the dialect that issued it — while the thinking arm ten
+// lines up kept them.
 func cloneSteerBlock(block content.Block, depth int, active map[*content.ToolResultBlock]struct{}) (content.Block, error) {
 	switch typed := block.(type) {
 	case *content.TextBlock:
 		if typed == nil {
 			return nil, &steerRequestError{field: "block", reason: "nil"}
 		}
-		return &content.TextBlock{Text: typed.Text}, nil
+		cloned := *typed
+		return &cloned, nil
+	case *content.RefusalBlock:
+		if typed == nil {
+			return nil, &steerRequestError{field: "block", reason: "nil"}
+		}
+		// A refusal is the model declining, not assistant prose. Without this
+		// arm a prompt containing one fell to the default below and was
+		// rejected as an unknown type, so a declined turn could not be steered
+		// at all.
+		cloned := *typed
+		return &cloned, nil
 	case *content.ImageBlock:
 		if typed == nil {
 			return nil, &steerRequestError{field: "block", reason: "nil"}
 		}
-		return &content.ImageBlock{
-			MediaType: typed.MediaType,
-			Source: content.ImageSource{
-				URL:  typed.Source.URL,
-				Data: cloneSteerBytes(typed.Source.Data),
-			},
-		}, nil
+		cloned := *typed
+		cloned.Source.Data = cloneSteerBytes(typed.Source.Data)
+		return &cloned, nil
 	case *content.AudioBlock:
 		if typed == nil {
 			return nil, &steerRequestError{field: "block", reason: "nil"}
 		}
-		return &content.AudioBlock{MediaType: typed.MediaType, Data: cloneSteerBytes(typed.Data)}, nil
+		cloned := *typed
+		cloned.Data = cloneSteerBytes(typed.Data)
+		return &cloned, nil
 	case *content.DocumentBlock:
 		if typed == nil {
 			return nil, &steerRequestError{field: "block", reason: "nil"}
 		}
-		return &content.DocumentBlock{
-			MediaType: typed.MediaType,
-			Name:      typed.Name,
-			Data:      cloneSteerBytes(typed.Data),
-			Text:      typed.Text,
-		}, nil
+		cloned := *typed
+		cloned.Data = cloneSteerBytes(typed.Data)
+		return &cloned, nil
 	case *content.ThinkingBlock:
 		if typed == nil {
 			return nil, &steerRequestError{field: "block", reason: "nil"}
 		}
-		return &content.ThinkingBlock{
-			Thinking:            typed.Thinking,
-			Signature:           typed.Signature,
-			ProviderState:       cloneSteerBytes(typed.ProviderState),
-			ProviderStateFormat: typed.ProviderStateFormat,
-		}, nil
+		cloned := *typed
+		cloned.ProviderState = cloneSteerBytes(typed.ProviderState)
+		return &cloned, nil
 	case *content.ToolUseBlock:
 		if typed == nil {
 			return nil, &steerRequestError{field: "block", reason: "nil"}
 		}
-		return &content.ToolUseBlock{
-			ID:    typed.ID,
-			Name:  typed.Name,
-			Input: cloneSteerBytes(typed.Input),
-		}, nil
+		cloned := *typed
+		cloned.Input = cloneSteerBytes(typed.Input)
+		cloned.ProviderState = cloneSteerBytes(typed.ProviderState)
+		return &cloned, nil
 	case *content.ToolResultBlock:
 		if typed == nil {
 			return nil, &steerRequestError{field: "block", reason: "nil"}
@@ -139,11 +151,9 @@ func cloneSteerBlock(block content.Block, depth int, active map[*content.ToolRes
 				return nil, err
 			}
 		}
-		return &content.ToolResultBlock{
-			ToolUseID: typed.ToolUseID,
-			Content:   clonedContent,
-			IsError:   typed.IsError,
-		}, nil
+		cloned := *typed
+		cloned.Content = clonedContent
+		return &cloned, nil
 	default:
 		return nil, &steerRequestError{field: "block", reason: "unknown type"}
 	}
