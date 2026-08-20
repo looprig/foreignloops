@@ -5,11 +5,13 @@ import (
 	"context"
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"runtime"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -694,4 +696,30 @@ func cleanPath(t *testing.T, path string) string {
 
 func shellQuote(value string) string {
 	return "'" + strings.ReplaceAll(value, "'", "'\"'\"'") + "'"
+}
+
+// TestExitErrorIgnoresSignalTermination is the Codex peer of the Claude
+// driver's guard: shutdown signals its own process group before reaping, so a
+// leader still running at Close dies by our hand and must not be reported as a
+// foreign-agent exit failure. A genuine non-zero exit must still surface.
+func TestExitErrorIgnoresSignalTermination(t *testing.T) {
+	t.Parallel()
+	cmd := exec.Command("/bin/sh", "-c", "trap '' INT; sleep 30")
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	if err := cmd.Process.Signal(syscall.SIGKILL); err != nil {
+		t.Fatalf("signal: %v", err)
+	}
+	waitErr := cmd.Wait()
+	var exitErr *exec.ExitError
+	if !errors.As(waitErr, &exitErr) {
+		t.Fatalf("Wait() error = %T %v, want *exec.ExitError", waitErr, waitErr)
+	}
+	if code := exitErr.ExitCode(); code != -1 {
+		t.Fatalf("ExitCode() = %d, want -1 for a signalled process", code)
+	}
+	if got := exitError(waitErr); got != nil {
+		t.Fatalf("exitError(signalled) = %T %v, want nil", got, got)
+	}
 }

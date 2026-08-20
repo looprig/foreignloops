@@ -201,7 +201,12 @@ func exitError(err error) error {
 	}
 	var exitErr *exec.ExitError
 	if errors.As(err, &exitErr) {
-		if code := exitErr.ExitCode(); code != 0 {
+		// A signalled process reports exit code -1. shutdown always signals
+		// this driver's own process group before reaping, so a leader still
+		// running at Close dies by our hand; blaming the foreign agent for
+		// that teardown is wrong. Only a genuine non-zero exit is an
+		// ExitError.
+		if code := exitErr.ExitCode(); code > 0 {
 			return &driver.ExitError{Code: code}
 		}
 	}

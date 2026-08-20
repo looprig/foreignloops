@@ -7,10 +7,12 @@ import (
 	"context"
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"runtime"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -490,4 +492,33 @@ func cleanPath(t *testing.T, path string) string {
 		t.Fatalf("eval symlinks %s: %v", path, err)
 	}
 	return clean
+}
+
+// TestExitErrorIgnoresSignalTermination pins the classification shutdown
+// depends on. shutdown always signals the process group before reaping, so a
+// leader still running at Close -- for instance one that has not yet finished
+// writing a line this driver stopped reading after a decode error -- dies of
+// our own SIGINT. os/exec reports a signalled process as exit code -1, and
+// reporting that as a foreign-agent exit failure blames the agent for this
+// driver's own teardown. A genuine non-zero exit must still surface.
+func TestExitErrorIgnoresSignalTermination(t *testing.T) {
+	t.Parallel()
+	cmd := exec.Command("/bin/sh", "-c", "trap '' INT; sleep 30")
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	if err := cmd.Process.Signal(syscall.SIGKILL); err != nil {
+		t.Fatalf("signal: %v", err)
+	}
+	waitErr := cmd.Wait()
+	var exitErr *exec.ExitError
+	if !errors.As(waitErr, &exitErr) {
+		t.Fatalf("Wait() error = %T %v, want *exec.ExitError", waitErr, waitErr)
+	}
+	if code := exitErr.ExitCode(); code != -1 {
+		t.Fatalf("ExitCode() = %d, want -1 for a signalled process", code)
+	}
+	if got := exitError(waitErr); got != nil {
+		t.Fatalf("exitError(signalled) = %T %v, want nil", got, got)
+	}
 }
