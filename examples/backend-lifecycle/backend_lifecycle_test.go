@@ -62,6 +62,13 @@ func TestExampleBackendLifecycleAndRestore(t *testing.T) {
 		t.Fatalf("submit input: %v", err)
 	}
 	waitForEvent[event.TurnDone](t, ctx, publisher)
+	// TurnDone is published from the turn goroutine before the actor folds the
+	// outcome into l.msgs/l.turnIndex (backend.applyOutcome runs only once the
+	// turn returns). Observing the event therefore proves the provider turn
+	// finished, not that the committed transcript is readable yet, so wait for
+	// the actor-visible fold before snapshotting -- the same readiness the
+	// restored path below already uses.
+	waitForTurn(t, ctx, state, 1)
 
 	messages, turnIndex, err := state.Snapshot(ctx)
 	if err != nil {

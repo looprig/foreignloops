@@ -407,8 +407,8 @@ func buildSteeringIntegrationBackend(t *testing.T, ctx context.Context, agent dr
 }
 
 func TestSteeringIntegrationInjectedFoldCheckedBeforeTerminal(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	t.Cleanup(cancel)
+	overallCtx, overallCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	t.Cleanup(overallCancel)
 	script := steertest.DefaultScript()
 	script.Prompts = []steertest.PromptScript{{Actions: []steertest.Action{
 		{Kind: steertest.ActionTerminal, Gate: "active-terminal"},
@@ -416,18 +416,30 @@ func TestSteeringIntegrationInjectedFoldCheckedBeforeTerminal(t *testing.T) {
 	script.Steers = []steertest.SteerScript{{Actions: []steertest.Action{
 		{Kind: steertest.ActionSteerReply, Outcome: steertest.OutcomeInjected, Gate: "steer-ack"},
 	}}}
-	agent, fixture := newSteeringIntegrationACP(t, ctx, script, acpdriver.HarnessClaudeCode)
+	agent, fixture := newSteeringIntegrationACP(t, overallCtx, script, acpdriver.HarnessClaudeCode)
 	hook := &steeringIntegrationDeliveryHook{}
 	pub := newSteeringIntegrationPublisher()
 	sessionID, loopID := steeringIntegrationUUID(t), steeringIntegrationUUID(t)
 	idGen := steeringIntegrationIDGen()
 	state, _, err := foreignbackend.BuildWithServices(foreignbackend.Config{Agent: agent, Cwd: t.TempDir(), SIDMode: foreignbackend.SIDPrebound})(
-		ctx, sessionID, loopID, loop.Provenance{}, pub, steeringIntegrationBoundDefinition(t, sessionID, loopID),
+		overallCtx, sessionID, loopID, loop.Provenance{}, pub, steeringIntegrationBoundDefinition(t, sessionID, loopID),
 		idGen, event.NewFactory(idGen, time.Now), foreign.NewServices(foreign.BrokerDescriptor{}, hook))
 	if err != nil {
 		t.Fatalf("BuildWithServices() error = %v", err)
 	}
-	t.Cleanup(func() { shutdownSteeringIntegration(t, state, ctx) })
+	t.Cleanup(func() {
+		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer shutdownCancel()
+		shutdownSteeringIntegration(t, state, shutdownCtx)
+	})
+	if _, err := fixture.WaitForNth(overallCtx, steertest.EventNewSession, 0); err != nil {
+		t.Fatalf("ACP fixture session readiness: %v; transcript=%s", err, fixture.Transcript())
+	}
+	if _, _, err := state.Snapshot(overallCtx); err != nil {
+		t.Fatalf("backend actor readiness: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(overallCtx, 5*time.Second)
+	defer cancel()
 
 	activeID := steeringIntegrationUUID(t)
 	if err := sendSteeringIntegrationInput(t, ctx, state, loopID, activeID, "active", false); err != nil {
@@ -481,8 +493,8 @@ func TestSteeringIntegrationInjectedFoldCheckedBeforeTerminal(t *testing.T) {
 }
 
 func TestSteeringIntegrationPromptRequiredQueuesExactlyOneFallback(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-	t.Cleanup(cancel)
+	overallCtx, overallCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	t.Cleanup(overallCancel)
 	script := steertest.DefaultScript()
 	script.Prompts = []steertest.PromptScript{
 		{Actions: []steertest.Action{{Kind: steertest.ActionTerminal, Gate: "active-terminal"}}},
@@ -491,11 +503,18 @@ func TestSteeringIntegrationPromptRequiredQueuesExactlyOneFallback(t *testing.T)
 	script.Steers = []steertest.SteerScript{{Actions: []steertest.Action{
 		{Kind: steertest.ActionSteerReply, Outcome: steertest.OutcomePromptRequired, Gate: "steer-ack"},
 	}}}
-	base, fixture := newSteeringIntegrationACP(t, ctx, script, acpdriver.HarnessClaudeCode)
+	base, fixture := newSteeringIntegrationACP(t, overallCtx, script, acpdriver.HarnessClaudeCode)
 	counting := &steeringIntegrationCountingAgent{Driver: base}
 	hook := &steeringIntegrationDeliveryHook{}
 	pub := newSteeringIntegrationPublisher()
-	state, loopID := buildSteeringIntegrationBackend(t, ctx, counting, hook, pub)
+	state, loopID := buildSteeringIntegrationBackend(t, overallCtx, counting, hook, pub)
+	// The ACP fixture builds a helper binary and completes the ACP initialize
+	// handshake in the constructors above. Charging that setup to the
+	// assertion budget is what made these integration tests fail on loaded
+	// runners, so setup runs under one bounded overall context and the tight
+	// per-phase budget starts only once the fixture and backend are live.
+	ctx, cancel := context.WithTimeout(overallCtx, 15*time.Second)
+	defer cancel()
 	activeID, requestID := steeringIntegrationUUID(t), steeringIntegrationUUID(t)
 	if err := sendSteeringIntegrationInput(t, ctx, state, loopID, activeID, "active", false); err != nil {
 		t.Fatalf("active input: %v", err)
@@ -555,8 +574,8 @@ func TestSteeringIntegrationPromptRequiredQueuesExactlyOneFallback(t *testing.T)
 }
 
 func TestSteeringIntegrationFallbackFIFOAcrossTurnsDoesNotSteerBehindOlderPending(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	t.Cleanup(cancel)
+	overallCtx, overallCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	t.Cleanup(overallCancel)
 	script := steertest.DefaultScript()
 	script.Prompts = []steertest.PromptScript{
 		{Actions: []steertest.Action{{Kind: steertest.ActionTerminal, Gate: "active-terminal"}}},
@@ -567,11 +586,18 @@ func TestSteeringIntegrationFallbackFIFOAcrossTurnsDoesNotSteerBehindOlderPendin
 	script.Steers = []steertest.SteerScript{{Actions: []steertest.Action{
 		{Kind: steertest.ActionSteerReply, Outcome: steertest.OutcomePromptRequired, Gate: "steer-ack"},
 	}}}
-	base, fixture := newSteeringIntegrationACP(t, ctx, script, acpdriver.HarnessClaudeCode)
+	base, fixture := newSteeringIntegrationACP(t, overallCtx, script, acpdriver.HarnessClaudeCode)
 	counting := &steeringIntegrationCountingAgent{Driver: base}
 	hook := &steeringIntegrationDeliveryHook{}
 	pub := newSteeringIntegrationPublisher()
-	state, loopID := buildSteeringIntegrationBackend(t, ctx, counting, hook, pub)
+	state, loopID := buildSteeringIntegrationBackend(t, overallCtx, counting, hook, pub)
+	// The ACP fixture builds a helper binary and completes the ACP initialize
+	// handshake in the constructors above. Charging that setup to the
+	// assertion budget is what made these integration tests fail on loaded
+	// runners, so setup runs under one bounded overall context and the tight
+	// per-phase budget starts only once the fixture and backend are live.
+	ctx, cancel := context.WithTimeout(overallCtx, 5*time.Second)
+	defer cancel()
 	activeID, firstID, secondID, thirdID := steeringIntegrationUUID(t), steeringIntegrationUUID(t), steeringIntegrationUUID(t), steeringIntegrationUUID(t)
 
 	if err := sendSteeringIntegrationInput(t, ctx, state, loopID, activeID, "active", false); err != nil {
@@ -655,18 +681,25 @@ func TestSteeringIntegrationFallbackFIFOAcrossTurnsDoesNotSteerBehindOlderPendin
 }
 
 func TestSteeringIntegrationCurrentCodexQueuesWithoutExtensionFallback(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	t.Cleanup(cancel)
+	overallCtx, overallCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	t.Cleanup(overallCancel)
 	script := steertest.CodexScript()
 	script.Prompts = []steertest.PromptScript{
 		{Actions: []steertest.Action{{Kind: steertest.ActionTerminal, Gate: "active-terminal"}}},
 		{Actions: []steertest.Action{{Kind: steertest.ActionTerminal, Gate: "fallback-terminal"}}},
 	}
-	base, fixture := newSteeringIntegrationACP(t, ctx, script, acpdriver.HarnessCodex)
+	base, fixture := newSteeringIntegrationACP(t, overallCtx, script, acpdriver.HarnessCodex)
 	counting := &steeringIntegrationCountingAgent{Driver: base}
 	hook := &steeringIntegrationDeliveryHook{}
 	pub := newSteeringIntegrationPublisher()
-	state, loopID := buildSteeringIntegrationBackend(t, ctx, counting, hook, pub)
+	state, loopID := buildSteeringIntegrationBackend(t, overallCtx, counting, hook, pub)
+	// The ACP fixture builds a helper binary and completes the ACP initialize
+	// handshake in the constructors above. Charging that setup to the
+	// assertion budget is what made these integration tests fail on loaded
+	// runners, so setup runs under one bounded overall context and the tight
+	// per-phase budget starts only once the fixture and backend are live.
+	ctx, cancel := context.WithTimeout(overallCtx, 5*time.Second)
+	defer cancel()
 	activeID, requestID := steeringIntegrationUUID(t), steeringIntegrationUUID(t)
 	if err := sendSteeringIntegrationInput(t, ctx, state, loopID, activeID, "active", false); err != nil {
 		t.Fatalf("active input: %v", err)
@@ -718,13 +751,20 @@ func TestSteeringIntegrationCurrentCodexQueuesWithoutExtensionFallback(t *testin
 }
 
 func TestSteeringIntegrationPostWriteUnknownDoesNotFallback(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	t.Cleanup(cancel)
-	base, fixture := newSteeringIntegrationACP(t, ctx, steeringIntegrationScript(steertest.SteeringOutcome("future")), acpdriver.HarnessClaudeCode)
+	overallCtx, overallCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	t.Cleanup(overallCancel)
+	base, fixture := newSteeringIntegrationACP(t, overallCtx, steeringIntegrationScript(steertest.SteeringOutcome("future")), acpdriver.HarnessClaudeCode)
 	counting := &steeringIntegrationCountingAgent{Driver: base}
 	hook := &steeringIntegrationDeliveryHook{}
 	pub := newSteeringIntegrationPublisher()
-	state, loopID := buildSteeringIntegrationBackend(t, ctx, counting, hook, pub)
+	state, loopID := buildSteeringIntegrationBackend(t, overallCtx, counting, hook, pub)
+	// The ACP fixture builds a helper binary and completes the ACP initialize
+	// handshake in the constructors above. Charging that setup to the
+	// assertion budget is what made these integration tests fail on loaded
+	// runners, so setup runs under one bounded overall context and the tight
+	// per-phase budget starts only once the fixture and backend are live.
+	ctx, cancel := context.WithTimeout(overallCtx, 5*time.Second)
+	defer cancel()
 	activeID, requestID := steeringIntegrationUUID(t), steeringIntegrationUUID(t)
 	if err := sendSteeringIntegrationInput(t, ctx, state, loopID, activeID, "active", false); err != nil {
 		t.Fatalf("active input: %v", err)
@@ -768,9 +808,9 @@ func TestSteeringIntegrationPostWriteUnknownDoesNotFallback(t *testing.T) {
 }
 
 func TestSteeringIntegrationAdmissionUnknownIsNonRetryable(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	t.Cleanup(cancel)
-	base, fixture := newSteeringIntegrationACP(t, ctx, steeringIntegrationScript(steertest.OutcomeInjected), acpdriver.HarnessClaudeCode)
+	overallCtx, overallCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	t.Cleanup(overallCancel)
+	base, fixture := newSteeringIntegrationACP(t, overallCtx, steeringIntegrationScript(steertest.OutcomeInjected), acpdriver.HarnessClaudeCode)
 	wrapper := &steeringIntegrationResultAgent{
 		Driver: base,
 		result: driver.SteerResult{Outcome: driver.SteerOutcomeAdmissionUnknown},
@@ -778,7 +818,14 @@ func TestSteeringIntegrationAdmissionUnknownIsNonRetryable(t *testing.T) {
 	}
 	hook := &steeringIntegrationDeliveryHook{}
 	pub := newSteeringIntegrationPublisher()
-	state, loopID := buildSteeringIntegrationBackend(t, ctx, wrapper, hook, pub)
+	state, loopID := buildSteeringIntegrationBackend(t, overallCtx, wrapper, hook, pub)
+	// The ACP fixture builds a helper binary and completes the ACP initialize
+	// handshake in the constructors above. Charging that setup to the
+	// assertion budget is what made these integration tests fail on loaded
+	// runners, so setup runs under one bounded overall context and the tight
+	// per-phase budget starts only once the fixture and backend are live.
+	ctx, cancel := context.WithTimeout(overallCtx, 5*time.Second)
+	defer cancel()
 	activeID, requestID := steeringIntegrationUUID(t), steeringIntegrationUUID(t)
 	if err := sendSteeringIntegrationInput(t, ctx, state, loopID, activeID, "active", false); err != nil {
 		t.Fatalf("active input: %v", err)
@@ -822,12 +869,19 @@ func TestSteeringIntegrationAdmissionUnknownIsNonRetryable(t *testing.T) {
 }
 
 func TestSteeringIntegrationUntrackableFaultHasNoSyntheticTurn(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	t.Cleanup(cancel)
-	base, fixture := newSteeringIntegrationACP(t, ctx, steeringIntegrationScript(steertest.OutcomeStartedNewTurn), acpdriver.HarnessClaudeCode)
+	overallCtx, overallCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	t.Cleanup(overallCancel)
+	base, fixture := newSteeringIntegrationACP(t, overallCtx, steeringIntegrationScript(steertest.OutcomeStartedNewTurn), acpdriver.HarnessClaudeCode)
 	hook := &steeringIntegrationDeliveryHook{}
 	pub := newSteeringIntegrationPublisher()
-	state, loopID := buildSteeringIntegrationBackend(t, ctx, base, hook, pub)
+	state, loopID := buildSteeringIntegrationBackend(t, overallCtx, base, hook, pub)
+	// The ACP fixture builds a helper binary and completes the ACP initialize
+	// handshake in the constructors above. Charging that setup to the
+	// assertion budget is what made these integration tests fail on loaded
+	// runners, so setup runs under one bounded overall context and the tight
+	// per-phase budget starts only once the fixture and backend are live.
+	ctx, cancel := context.WithTimeout(overallCtx, 5*time.Second)
+	defer cancel()
 	activeID, requestID := steeringIntegrationUUID(t), steeringIntegrationUUID(t)
 	if err := sendSteeringIntegrationInput(t, ctx, state, loopID, activeID, "active", false); err != nil {
 		t.Fatalf("active input: %v", err)
@@ -868,8 +922,8 @@ func TestSteeringIntegrationUntrackableFaultHasNoSyntheticTurn(t *testing.T) {
 }
 
 func TestSteeringIntegrationTwoMessagesFoldIntoOneTurn(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	t.Cleanup(cancel)
+	overallCtx, overallCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	t.Cleanup(overallCancel)
 	script := steertest.DefaultScript()
 	script.Prompts = []steertest.PromptScript{{Actions: []steertest.Action{
 		{Kind: steertest.ActionTerminal, Gate: "active-terminal"},
@@ -878,10 +932,17 @@ func TestSteeringIntegrationTwoMessagesFoldIntoOneTurn(t *testing.T) {
 		{Actions: []steertest.Action{{Kind: steertest.ActionSteerReply, Outcome: steertest.OutcomeInjected, Gate: "steer-1"}}},
 		{Actions: []steertest.Action{{Kind: steertest.ActionSteerReply, Outcome: steertest.OutcomeInjected, Gate: "steer-2"}}},
 	}
-	base, fixture := newSteeringIntegrationACP(t, ctx, script, acpdriver.HarnessClaudeCode)
+	base, fixture := newSteeringIntegrationACP(t, overallCtx, script, acpdriver.HarnessClaudeCode)
 	hook := &steeringIntegrationDeliveryHook{}
 	pub := newSteeringIntegrationPublisher()
-	state, loopID := buildSteeringIntegrationBackend(t, ctx, base, hook, pub)
+	state, loopID := buildSteeringIntegrationBackend(t, overallCtx, base, hook, pub)
+	// The ACP fixture builds a helper binary and completes the ACP initialize
+	// handshake in the constructors above. Charging that setup to the
+	// assertion budget is what made these integration tests fail on loaded
+	// runners, so setup runs under one bounded overall context and the tight
+	// per-phase budget starts only once the fixture and backend are live.
+	ctx, cancel := context.WithTimeout(overallCtx, 5*time.Second)
+	defer cancel()
 	activeID, firstID, secondID := steeringIntegrationUUID(t), steeringIntegrationUUID(t), steeringIntegrationUUID(t)
 	if err := sendSteeringIntegrationInput(t, ctx, state, loopID, activeID, "active", false); err != nil {
 		t.Fatalf("active input: %v", err)
@@ -947,9 +1008,9 @@ func TestSteeringIntegrationTwoMessagesFoldIntoOneTurn(t *testing.T) {
 }
 
 func TestSteeringIntegrationLateAcknowledgementIsIgnored(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	t.Cleanup(cancel)
-	base, fixture := newSteeringIntegrationACP(t, ctx, steeringIntegrationScript(steertest.OutcomeInjected), acpdriver.HarnessClaudeCode)
+	overallCtx, overallCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	t.Cleanup(overallCancel)
+	base, fixture := newSteeringIntegrationACP(t, overallCtx, steeringIntegrationScript(steertest.OutcomeInjected), acpdriver.HarnessClaudeCode)
 	wrapper := &steeringIntegrationLateAckAgent{
 		Driver:  base,
 		started: make(chan struct{}, 1),
@@ -957,7 +1018,14 @@ func TestSteeringIntegrationLateAcknowledgementIsIgnored(t *testing.T) {
 	}
 	hook := &steeringIntegrationDeliveryHook{signals: make(chan string, 32)}
 	pub := newSteeringIntegrationPublisher()
-	state, loopID := buildSteeringIntegrationBackend(t, ctx, wrapper, hook, pub)
+	state, loopID := buildSteeringIntegrationBackend(t, overallCtx, wrapper, hook, pub)
+	// The ACP fixture builds a helper binary and completes the ACP initialize
+	// handshake in the constructors above. Charging that setup to the
+	// assertion budget is what made these integration tests fail on loaded
+	// runners, so setup runs under one bounded overall context and the tight
+	// per-phase budget starts only once the fixture and backend are live.
+	ctx, cancel := context.WithTimeout(overallCtx, 5*time.Second)
+	defer cancel()
 	activeID, requestID := steeringIntegrationUUID(t), steeringIntegrationUUID(t)
 	if err := sendSteeringIntegrationInput(t, ctx, state, loopID, activeID, "active", false); err != nil {
 		t.Fatalf("active input: %v", err)

@@ -21,10 +21,10 @@ func TestSteeringIntegrationACPInjectedObservationOrder(t *testing.T) {
 		{Kind: steertest.ActionSteerReply, Outcome: steertest.OutcomeInjected, Gate: "steer-ack"},
 	}}}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	t.Cleanup(cancel)
+	overallCtx, overallCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	t.Cleanup(overallCancel)
 	fixture := steertest.New(t, script)
-	d, err := New(ctx, Config{
+	d, err := New(overallCtx, Config{
 		Harness:       HarnessClaudeCode,
 		Executable:    fixture.Executable(),
 		Env:           fixture.Env(),
@@ -36,6 +36,11 @@ func TestSteeringIntegrationACPInjectedObservationOrder(t *testing.T) {
 		t.Fatalf("New() error = %v", err)
 	}
 	t.Cleanup(func() { _ = d.Close() })
+	if _, err := fixture.WaitForNth(overallCtx, steertest.EventNewSession, 0); err != nil {
+		t.Fatalf("ACP fixture session readiness: %v; transcript=%s", err, fixture.Transcript())
+	}
+	ctx, cancel := context.WithTimeout(overallCtx, 5*time.Second)
+	defer cancel()
 
 	stream, err := d.Spawn(ctx, driver.Turn{
 		StartNew: true,
@@ -198,8 +203,8 @@ func TestSteeringIntegrationACPOutcomeNormalization(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			t.Cleanup(cancel)
+			overallCtx, overallCancel := context.WithTimeout(context.Background(), 30*time.Second)
+			t.Cleanup(overallCancel)
 			script := steertest.DefaultScript()
 			script.Prompts = []steertest.PromptScript{{Actions: []steertest.Action{
 				{Kind: steertest.ActionTerminal, Gate: "prompt-terminal"},
@@ -207,7 +212,14 @@ func TestSteeringIntegrationACPOutcomeNormalization(t *testing.T) {
 			script.Steers = []steertest.SteerScript{{Actions: []steertest.Action{
 				{Kind: steertest.ActionSteerReply, Outcome: tt.wire, Gate: "steer-ack"},
 			}}}
-			d, fixture, stream := newSteeringIntegrationACPDriver(t, ctx, script, HarnessClaudeCode)
+			d, fixture, stream := newSteeringIntegrationACPDriver(t, overallCtx, script, HarnessClaudeCode)
+			// The ACP fixture builds a helper binary and completes the ACP initialize
+			// handshake in the constructor above. Charging that setup to the
+			// assertion budget is what made these integration tests fail on loaded
+			// runners, so setup runs under one bounded overall context and the tight
+			// per-phase budget starts only once the fixture and driver are live.
+			ctx, cancel := context.WithTimeout(overallCtx, 5*time.Second)
+			defer cancel()
 			ordered, ok := stream.(driver.OrderedStream)
 			if !ok {
 				t.Fatal("Claude Spawn() stream does not implement OrderedStream")
@@ -261,13 +273,20 @@ func TestSteeringIntegrationACPOutcomeNormalization(t *testing.T) {
 }
 
 func TestSteeringIntegrationACPCodexCurrentProfileHasNoExtensionFallback(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	t.Cleanup(cancel)
+	overallCtx, overallCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	t.Cleanup(overallCancel)
 	script := steertest.CodexScript()
 	script.Prompts = []steertest.PromptScript{{Actions: []steertest.Action{
 		{Kind: steertest.ActionTerminal, Gate: "prompt-terminal"},
 	}}}
-	d, fixture, stream := newSteeringIntegrationACPDriver(t, ctx, script, HarnessCodex)
+	d, fixture, stream := newSteeringIntegrationACPDriver(t, overallCtx, script, HarnessCodex)
+	// The ACP fixture builds a helper binary and completes the ACP initialize
+	// handshake in the constructor above. Charging that setup to the
+	// assertion budget is what made these integration tests fail on loaded
+	// runners, so setup runs under one bounded overall context and the tight
+	// per-phase budget starts only once the fixture and driver are live.
+	ctx, cancel := context.WithTimeout(overallCtx, 5*time.Second)
+	defer cancel()
 	if _, ok := stream.(driver.OrderedStream); ok {
 		t.Fatal("current Codex Spawn() stream implements OrderedStream; want legacy Events projection")
 	}
@@ -303,8 +322,8 @@ func TestSteeringIntegrationACPCodexCurrentProfileHasNoExtensionFallback(t *test
 }
 
 func TestSteeringIntegrationACPLateAcknowledgementIsIgnored(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	t.Cleanup(cancel)
+	overallCtx, overallCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	t.Cleanup(overallCancel)
 	script := steertest.DefaultScript()
 	script.Prompts = []steertest.PromptScript{{Actions: []steertest.Action{
 		{Kind: steertest.ActionTerminal, Gate: "prompt-terminal"},
@@ -312,7 +331,14 @@ func TestSteeringIntegrationACPLateAcknowledgementIsIgnored(t *testing.T) {
 	script.Steers = []steertest.SteerScript{{Actions: []steertest.Action{
 		{Kind: steertest.ActionSteerReply, Outcome: steertest.OutcomeInjected, Gate: "late-ack"},
 	}}}
-	d, fixture, stream := newSteeringIntegrationACPDriver(t, ctx, script, HarnessClaudeCode)
+	d, fixture, stream := newSteeringIntegrationACPDriver(t, overallCtx, script, HarnessClaudeCode)
+	// The ACP fixture builds a helper binary and completes the ACP initialize
+	// handshake in the constructor above. Charging that setup to the
+	// assertion budget is what made these integration tests fail on loaded
+	// runners, so setup runs under one bounded overall context and the tight
+	// per-phase budget starts only once the fixture and driver are live.
+	ctx, cancel := context.WithTimeout(overallCtx, 5*time.Second)
+	defer cancel()
 	ordered, ok := stream.(driver.OrderedStream)
 	if !ok {
 		t.Fatal("Claude Spawn() stream does not implement OrderedStream")

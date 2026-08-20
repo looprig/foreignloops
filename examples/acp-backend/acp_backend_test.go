@@ -3,9 +3,12 @@
 package acpbackend_test
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
+	"net"
 	"os"
 	"sync"
 	"testing"
@@ -126,8 +129,87 @@ func TestExampleACPBackendLifecycle(t *testing.T) {
 	}
 }
 
+func TestScriptedACPRegistersInitializeBeforeTransportStarts(t *testing.T) {
+	server, client := net.Pipe()
+	t.Cleanup(func() {
+		_ = server.Close()
+		_ = client.Close()
+	})
+	if err := client.SetDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatalf("set client deadline: %v", err)
+	}
+
+	params, err := json.Marshal(protocol.InitializeRequest{ProtocolVersion: protocol.CurrentProtocolVersion})
+	if err != nil {
+		t.Fatalf("marshal initialize params: %v", err)
+	}
+	request, err := json.Marshal(&protocol.Request{
+		ID:     protocol.NewNumberID(1),
+		Method: string(protocol.MethodInitialize),
+		Params: params,
+	})
+	if err != nil {
+		t.Fatalf("marshal initialize request: %v", err)
+	}
+	request = append(request, '\n')
+
+	writeStarted := make(chan struct{})
+	writeResult := make(chan error, 1)
+	go func() {
+		close(writeStarted)
+		_, err := client.Write(request)
+		writeResult <- err
+	}()
+	<-writeStarted
+
+	conn := newScriptedACPConn(server, server)
+	t.Cleanup(func() { _ = conn.Close() })
+
+	line, err := bufio.NewReader(client).ReadBytes('\n')
+	if err != nil {
+		t.Fatalf("read initialize response: %v", err)
+	}
+	envelope, err := protocol.ParseEnvelope(line[:len(line)-1])
+	if err != nil {
+		t.Fatalf("parse initialize response: %v", err)
+	}
+	if envelope.Response == nil {
+		t.Fatalf("initialize reply = %#v, want response", envelope)
+	}
+	if envelope.Response.Error != nil {
+		t.Fatalf("initialize response error = %v", envelope.Response.Error)
+	}
+	var response protocol.InitializeResponse
+	if err := json.Unmarshal(envelope.Response.Result, &response); err != nil {
+		t.Fatalf("decode initialize response: %v", err)
+	}
+	if response.ProtocolVersion != protocol.CurrentProtocolVersion {
+		t.Fatalf("protocol version = %d, want %d", response.ProtocolVersion, protocol.CurrentProtocolVersion)
+	}
+	if err := <-writeResult; err != nil {
+		t.Fatalf("write initialize request: %v", err)
+	}
+}
+
 func serveScriptedACP() int {
-	conn := protocol.NewConn(os.Stdin, os.Stdout, protocol.ConnOptions{})
+	conn := newScriptedACPConn(os.Stdin, os.Stdout)
+	<-conn.Done()
+	return 0
+}
+
+type registrationGateReader struct {
+	source     io.Reader
+	registered <-chan struct{}
+}
+
+func (r registrationGateReader) Read(p []byte) (int, error) {
+	<-r.registered
+	return r.source.Read(p)
+}
+
+func newScriptedACPConn(source io.Reader, destination io.Writer) *protocol.Conn {
+	registered := make(chan struct{})
+	conn := protocol.NewConn(registrationGateReader{source: source, registered: registered}, destination, protocol.ConnOptions{})
 	clientConn := protocol.NewClientConn(conn)
 	conn.Handle(string(protocol.MethodInitialize), func(_ context.Context, _ string, raw json.RawMessage) (any, error) {
 		var request protocol.InitializeRequest
@@ -174,8 +256,8 @@ func serveScriptedACP() int {
 		return protocol.PromptResponse{StopReason: protocol.StopReasonEndTurn}, nil
 	})
 	conn.HandleNotify(string(protocol.MethodSessionCancel), func(context.Context, string, json.RawMessage) {})
-	<-conn.Done()
-	return 0
+	close(registered)
+	return conn
 }
 
 type recordingPublisher struct{}
